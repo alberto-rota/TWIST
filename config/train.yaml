@@ -1,0 +1,137 @@
+# TWIST — Phase 1: Kubric (CT3Kubric) pretraining — dataset config.
+#
+# Written in W&B-sweep format: every parameter is `{value: ...}`.
+#   * `python train.py`            reads the `value`s.
+#   * `python train.py --KEY=val`  overrides any field (dotted keys too, e.g.
+#                                  --DATASETS.KUBRIC.MAX_POINTS=512).
+#   * `wandb agent ...`            sweeps them (see config/sweep.yaml).
+#
+# Dataset identity (root dir, reader class) + default sampling live in
+# dataset/wrappers.py DATASET_DEFAULTS; only override what an experiment needs.
+#
+# This is a single-stage run (= stage 0 of the schedule). For multi-phase
+# training with cross-stage resume, use a STAGES list -- see config/schedule.yaml.
+
+program: train.py
+project: twist
+entity: alberto-rota
+
+parameters:
+
+  ### RUN
+  BATCH_SIZE:
+    value: 4            # clips per batch
+  EPOCHS:
+    value: 50
+  WORKERS:
+    value: 8            # DataLoader workers
+  PIN_MEMORY:
+    value: true
+  NO_WANDB:
+    value: false
+  WANDB_PROJECT:
+    value: twist
+  SEED:
+    value: 42
+
+  ### TRAINING (engine) — optimizer / schedules / logging
+  LR:
+    value: 3.0e-4          # base LR for the model (non-encoder) param group
+  WEIGHT_DECAY:
+    value: 1.0e-4
+  OPTIMIZER:
+    value: adamw           # adamw | adam | sgd
+  GRAD_CLIP:
+    value: 1.0             # global grad-norm clip (0 disables)
+  AMP:
+    value: true            # bf16 on A100 (auto fp16+scaler elsewhere; off on CPU)
+  LR_SCHEDULER:
+    value: cosine          # cosine | none
+  WARMUP_EPOCHS:
+    value: 2
+  MIN_LR_RATIO:
+    value: 0.05            # cosine floor (fraction of base LR)
+  KL_WEIGHT_START:
+    value: 0.0             # anneal KL weight 0 -> MODEL.LOSS.KL_WEIGHT ...
+  KL_ANNEAL_EPOCHS:
+    value: 10              # ... over this many epochs (0 => constant target)
+  TEACHER_FORCING_EPOCHS:
+    value: 5               # feed GT positions for the first N epochs (curriculum)
+  VAL_EVERY:
+    value: 1               # validate every N epochs
+  LOG_EVERY:
+    value: 20              # wandb per-step log interval (train steps)
+  VIZ_EVERY:
+    value: 5               # log a pred-vs-GT wandb.Video every N epochs (0 off)
+  VIZ_FRAMES:
+    value: 24              # trim the logged gif to the first N frames (short clip; 0 = full)
+  VIZ_MAX_POINTS:
+    value: 48              # subsample to N tracks in the gif (legibility)
+  VIZ_DPI:
+    value: 56              # gif render resolution (low-res = light to upload / quick to scan)
+  VIZ_FPS:
+    value: 8               # gif playback rate
+  EARLY_STOP_PATIENCE:
+    value: 0               # stop after N epochs without val-EPE improvement (0 off)
+
+  ### MODEL — observation-corrected state-space tracker (see models/)
+  MODEL:
+    value:
+      MODEL_CLASS: TrackerWorldModel
+      MODEL_MODULE: models
+      HIDDEN_DIM: 256            # GRU dynamics-state width
+      TOKEN_DIM: 256             # particle token width
+      RGB_ENCODER:
+        ENCODER: facebook/dinov3-vitl16-pretrain-lvd1689m  # DINOv3 ViT-L/16 (dim 1024, patch 16); or "cnn"
+        IMAGE_SIZE: 256          # keep == DATASETS.KUBRIC.TARGET_SIZE
+        FREEZE_BACKBONE: true
+        RGB_ENCODER_LR: 0.0      # 0.0 => frozen (engine reads this for param groups)
+      OBSERVATION:               # local cost-volume correction
+        K: 7                     # KxK feature window
+        RADIUS_PX: 24.0          # window half-extent (pixels)
+        HEADS: 4
+      TRANSITION:                # frame-free dynamics prior
+        DEPTH: 2                 # inter-point self-attention blocks (rigidity)
+        HEADS: 4
+      HEADS:
+        UNCERTAINTY: true        # predict per-point aleatoric log-variance
+      LOSS:
+        POS_WEIGHT: 10.0         # position dominates (its per-point value is small)
+        VIS_WEIGHT: 0.5          # visibility BCE
+        KL_WEIGHT: 0.05          # KL(posterior||prior) — engine anneals this up
+        KL_FREE_BITS: 0.5
+        KL_BALANCE_ALPHA: 0.8    # pull prior toward posterior harder (Dreamer-style)
+        HUBER_DELTA: 0.2         # normalized units
+        UNC_WEIGHT: 0.02
+
+  ### DATA
+  DATASETS:
+    value:
+      KUBRIC:
+        # --- train / val split (sequence-level) ---
+        VAL_FRACTION: 0.1            # held out for validation
+        SPLIT_SEED: 42              # deterministic split
+        # VAL_SEQUENCES: ["0000","0001"]   # or pin an explicit split instead
+
+        # --- temporal sampling ---
+        CLIP_LEN: 24                # output frames per clip (0/null -> whole sequence)
+        FRAME_STRIDE: 1             # keep every Nth frame
+        CLIP_STRIDE: null           # null -> non-overlapping clips
+        MAX_CLIPS_PER_VIDEO: null   # cap clips per sequence
+
+        # --- spatial sampling density (N tracked points) ---
+        MAX_POINTS: 256
+        POINT_SAMPLE_MODE: even     # even | random | grid | first
+        QUERY_FRAME: 0              # frame that defines the query points
+        REQUIRE_VISIBLE_AT_QUERY: true
+        MIN_VISIBLE_FRAMES: 1
+
+        # --- geometry ---
+        TARGET_SIZE: [256, 256]     # resize frames (+ scale coords); null keeps 512
+        # CROP: [0, 0, 512, 512]    # optional (x0,y0,x1,y1) before resize
+
+        # --- io ---
+        LOAD_FRAMES: true
+        LOAD_DEPTHS: false
+        FRAMES_AS_FLOAT: false
+        MARK_OFFSCREEN_INVISIBLE: true
