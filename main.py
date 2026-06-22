@@ -19,6 +19,8 @@ import os
 import time
 from typing import Any, Dict, Optional
 
+import torch.distributed as dist
+
 from utilities.config import (
     build_dataloaders,
     create_datasets_from_config,
@@ -49,8 +51,9 @@ def _build_parser(mode: str) -> argparse.ArgumentParser:
                    help="continue an existing run at its first unfinished stage")
     p.add_argument("--start-stage", type=int, default=None,
                    help="explicitly start the schedule at this stage index")
-    # accepted for parity with the eventual trainer; no effect on the data path
-    p.add_argument("--single", "--singlegpu", action="store_true", help="force single-GPU")
+    p.add_argument("--single", "--singlegpu", action="store_true", help="force single-GPU (disable DDP even if torchrun sets RANK)")
+    p.add_argument("--ddp", action="store_true",
+                   help="enable DistributedDataParallel; requires launching with torchrun")
     return p
 
 
@@ -111,13 +114,13 @@ def run_pipeline(mode: str = "train", config: Optional[Dict[str, Any]] = None) -
 
     resume_run = None
     start_stage = None
+    force_single = False
     if config is not None:
         cfg = load_and_process_config(config=config)
         max_batches = 2
     else:
         args, unknown = _build_parser(mode).parse_known_args()
         cfg_path = _resolve_config_path(args.config_file or args.config, mode)
-        logger.info(f"config: {cfg_path}")
         cfg = load_and_process_config(
             config_path=cfg_path, unknown_args=unknown, boot_mode=args.boot
         )
@@ -126,6 +129,34 @@ def run_pipeline(mode: str = "train", config: Optional[Dict[str, Any]] = None) -
         max_batches = args.max_batches
         resume_run = args.resume_run
         start_stage = args.start_stage
+        force_single = getattr(args, "single", False)
+
+    # ---------------------------------------------------------------------- #
+    # DDP setup: activate when torchrun sets RANK env var (or --ddp was passed)
+    # unless --single/--singlegpu was explicitly requested.
+    # ---------------------------------------------------------------------- #
+    import torch
+
+    is_ddp = ("RANK" in os.environ) and not force_single
+    rank = 0
+    world_size = 1
+    local_rank = 0
+    if is_ddp:
+        dist.init_process_group(backend="nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
+        cfg.RANK = rank
+        cfg.WORLD_SIZE = world_size
+        cfg.LOCAL_RANK = local_rank
+        if rank == 0:
+            logger.info(f"DDP enabled: world_size={world_size}, backend=nccl")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    is_main = rank == 0
 
     # A run is identified by EXPERIMENT_NAME; --resume-run points at an existing one.
     if resume_run:
@@ -141,43 +172,57 @@ def run_pipeline(mode: str = "train", config: Optional[Dict[str, Any]] = None) -
     else:
         start = 0
 
-    done = set(load_run_state(run_dir).get("completed", []))
-    logger.info(f"=== TWIST [{mode}] :: {cfg.get('EXPERIMENT_NAME', 'run')}  ({len(stages)} stage(s)) ===")
-    logger.info(f"run dir: {run_dir}")
-    for i, s in enumerate(stages):
-        flag = "done" if i in done else ("-> start" if i == start else "")
-        logger.info(f"  stage {i}: {s.get('NAME', f'stage{i}')} {('['+flag+']') if flag else ''}")
+    if is_main:
+        done = set(load_run_state(run_dir).get("completed", []))
+        logger.info(f"=== TWIST [{mode}] :: {cfg.get('EXPERIMENT_NAME', 'run')}  ({len(stages)} stage(s)) ===")
+        logger.info(f"run dir: {run_dir}")
+        for i, s in enumerate(stages):
+            flag = "done" if i in done else ("-> start" if i == start else "")
+            logger.info(f"  stage {i}: {s.get('NAME', f'stage{i}')} {('['+flag+']') if flag else ''}")
     if start >= len(stages):
-        logger.info(f"all {len(stages)} stage(s) already complete -- nothing to do")
+        if is_main:
+            logger.info(f"all {len(stages)} stage(s) already complete -- nothing to do")
+        if is_ddp:
+            dist.destroy_process_group()
         return {"config": cfg, "run_dir": str(run_dir), "stages": [], "loaders": None}
 
-    import torch
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # One W&B run for the whole schedule (reused if a sweep already opened one).
-    wandb_run, owns_wandb = init_wandb(cfg, run_dir)
+    # One W&B run for the whole schedule, rank-0 only (reused if a sweep already opened one).
+    wandb_run, owns_wandb = (init_wandb(cfg, run_dir) if is_main else (None, False))
 
     last = None
     try:
         for i in range(start, len(stages)):
             scfg = resolve_stage_config(cfg, i)
-            logger.info(f"--- stage {i + 1}/{len(stages)} :: {scfg.STAGE_NAME} ---")
+            if is_main:
+                logger.info(f"--- stage {i + 1}/{len(stages)} :: {scfg.STAGE_NAME} ---")
             datasets = create_datasets_from_config(scfg)
-            loaders = build_dataloaders(scfg, datasets)
-            _dryrun_split(loaders, "train", max_batches)
+            loaders = build_dataloaders(scfg, datasets, rank=rank, world_size=world_size)
+            if is_main:
+                _dryrun_split(loaders, "train", max_batches)
 
             model = create_model_from_config(scfg, device)
             loss_fn = create_loss_from_config(scfg, device)
+
+            # Wrap with DDP after moving to device (done inside create_model_from_config).
+            if is_ddp:
+                from torch.nn.parallel import DistributedDataParallel as DDP
+                model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+
             engine = Engine(
                 scfg, model, loss_fn, loaders, device, run_dir,
                 stage_idx=i, stage_name=scfg.STAGE_NAME, wandb_run=wandb_run,
+                rank=rank, world_size=world_size,
             )
             metrics = engine.fit()
             last = {"config": scfg, "datasets": datasets, "loaders": loaders,
                     "model": model, "loss_fn": loss_fn, "device": str(device),
                     "metrics": metrics}
     finally:
-        finish_wandb(wandb_run, owns_wandb)
+        if is_main:
+            finish_wandb(wandb_run, owns_wandb)
+        if is_ddp:
+            dist.destroy_process_group()
 
-    logger.info(f"=== run '{cfg.get('EXPERIMENT_NAME', 'run')}' done: all {len(stages)} stage(s) trained ===")
+    if is_main:
+        logger.info(f"=== run '{cfg.get('EXPERIMENT_NAME', 'run')}' done: all {len(stages)} stage(s) trained ===")
     return {"config": cfg, "run_dir": str(run_dir), "stages": stages, **(last or {})}

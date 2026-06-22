@@ -367,14 +367,25 @@ def _collate_for(dataset):
     return None if all(is_fixed_shape(s) for s in sets) else pad_collate
 
 
-def build_dataloaders(config: "DotMap", datasets: Dict[str, Any]) -> Dict[str, Any]:
+def build_dataloaders(
+    config: "DotMap",
+    datasets: Dict[str, Any],
+    rank: int = 0,
+    world_size: int = 1,
+) -> Dict[str, Any]:
     """Wrap the datasets dict in ``DataLoader``s.
 
     Train shuffles and drops the last partial batch; val/test do neither.
     Picks the padding collate automatically for variable-length clips.
+
+    When ``world_size > 1`` (DDP), ``DistributedSampler`` is used instead of
+    random shuffle so each rank sees a disjoint subset of the data.
     """
+    from torch.utils.data.distributed import DistributedSampler
+
     batch_size = int(config.get("BATCH_SIZE", 4))
     workers = int(datasets.get("workers", config.get("WORKERS", 4)))
+    is_ddp = world_size > 1
     loaders: Dict[str, Any] = {}
 
     specs = [("train", "Training", True), ("val", "Validation", False), ("test", "Test", False)]
@@ -383,16 +394,31 @@ def build_dataloaders(config: "DotMap", datasets: Dict[str, Any]) -> Dict[str, A
         if ds is None or len(ds) == 0:
             loaders[key] = None
             continue
-        loaders[key] = DataLoader(
-            ds,
-            batch_size=batch_size,
-            shuffle=is_train,
-            num_workers=workers,
-            drop_last=is_train and len(ds) >= batch_size,
-            pin_memory=config.get("PIN_MEMORY", False),
-            persistent_workers=workers > 0,
-            collate_fn=_collate_for(ds),
-        )
+        if is_ddp:
+            sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank,
+                                        shuffle=is_train, drop_last=is_train)
+            loaders[key] = DataLoader(
+                ds,
+                batch_size=batch_size,
+                sampler=sampler,
+                shuffle=False,       # mutually exclusive with sampler
+                num_workers=workers,
+                drop_last=False,     # DistributedSampler handles drop_last
+                pin_memory=config.get("PIN_MEMORY", False),
+                persistent_workers=workers > 0,
+                collate_fn=_collate_for(ds),
+            )
+        else:
+            loaders[key] = DataLoader(
+                ds,
+                batch_size=batch_size,
+                shuffle=is_train,
+                num_workers=workers,
+                drop_last=is_train and len(ds) >= batch_size,
+                pin_memory=config.get("PIN_MEMORY", False),
+                persistent_workers=workers > 0,
+                collate_fn=_collate_for(ds),
+            )
     return loaders
 
 

@@ -109,8 +109,10 @@ def build_optimizer(model: nn.Module, config: Any) -> torch.optim.Optimizer:
     enc_lr = float(enc_cfg.get("RGB_ENCODER_LR", 0.0) or 0.0)
     wd = float(config.get("WEIGHT_DECAY", 1.0e-4))
 
+    # Unwrap DDP so parameter names don't carry the "module." prefix.
+    m = getattr(model, "module", model)
     enc_params, rest_params = [], []
-    for name, p in model.named_parameters():
+    for name, p in m.named_parameters():
         if not p.requires_grad:
             continue
         (enc_params if name.startswith("encoder.") else rest_params).append(p)
@@ -153,6 +155,17 @@ def _prev_stage_checkpoint(run_dir: Path, idx: int) -> Optional[Path]:
 
 
 # --------------------------------------------------------------------------- #
+# DDP helpers
+# --------------------------------------------------------------------------- #
+def _get_sampler(loader: Optional[DataLoader]):
+    """Return the loader's sampler if it has ``set_epoch`` (DistributedSampler), else None."""
+    if loader is None:
+        return None
+    sampler = getattr(loader, "sampler", None)
+    return sampler if hasattr(sampler, "set_epoch") else None
+
+
+# --------------------------------------------------------------------------- #
 # Engine
 # --------------------------------------------------------------------------- #
 class Engine:
@@ -169,6 +182,8 @@ class Engine:
         stage_idx: int = 0,
         stage_name: str = "stage0",
         wandb_run: Any = None,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> None:
         self.config = config
         self.model = model
@@ -179,6 +194,11 @@ class Engine:
         self.stage_idx = int(stage_idx)
         self.stage_name = str(stage_name)
         self.wandb = wandb_run
+        self._rank = rank
+        self._world_size = world_size
+        self._is_ddp = world_size > 1
+        # DistributedSamplers need set_epoch() each epoch for correct shuffling.
+        self._train_sampler = _get_sampler(loaders.get("train"))
 
         self.epochs = int(config.get("EPOCHS", 1))
         self.grad_clip = float(config.get("GRAD_CLIP", 1.0))
@@ -222,6 +242,27 @@ class Engine:
         self.start_epoch = 0
         self._bad_epochs = 0
         self.history: list = []   # per-epoch metric records (for notebooks / debugging)
+
+    # -- DDP helpers --------------------------------------------------------- #
+    def _is_main_process(self) -> bool:
+        return self._rank == 0
+
+    def _unwrap_model(self) -> nn.Module:
+        """Return the underlying module, stripping any DDP wrapper."""
+        return self.model.module if self._is_ddp else self.model
+
+    def _all_reduce_dict(self, d: Dict[str, float]) -> Dict[str, float]:
+        """Average a metrics dict across all DDP ranks. Safe against NaN values."""
+        if not self._is_ddp:
+            return d
+        import torch.distributed as dist
+        keys = sorted(d.keys())
+        # Replace NaN with 0 before reduce (NaN poisons all_reduce).
+        t = torch.tensor([d[k] if d[k] == d[k] else 0.0 for k in keys],
+                         dtype=torch.float64, device=self.device)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        t /= self._world_size
+        return {k: t[i].item() for i, k in enumerate(keys)}
 
     # -- schedules ----------------------------------------------------------- #
     def _lr_mult(self, epoch: int) -> float:
@@ -278,6 +319,8 @@ class Engine:
         loader = self.loaders.get("train")
         if loader is None:
             return {}
+        if self._train_sampler is not None:
+            self._train_sampler.set_epoch(epoch)
         self.model.train()
         if getattr(self.model, "encoder", None) is not None and getattr(self.model.encoder, "frozen", False):
             self.model.encoder.eval()                    # keep the frozen backbone in eval
@@ -331,7 +374,7 @@ class Engine:
             if grad_norm == grad_norm:                   # finite (GradScaler overflow steps -> NaN, skipped)
                 gn_sum += grad_norm; gn_cnt += 1
             n += 1
-            if self.wandb is not None and self.log_every and step % self.log_every == 0:
+            if self._is_main_process() and self.wandb is not None and self.log_every and step % self.log_every == 0:
                 self.wandb.log({
                     "train/step_loss": float(total.detach()),
                     "train/step_epe": float(parts["epe"]),
@@ -349,7 +392,7 @@ class Engine:
                 })
         out = {k: v / max(n, 1) for k, v in agg.items()}
         out["grad_norm"] = gn_sum / gn_cnt if gn_cnt else float("nan")
-        return out
+        return self._all_reduce_dict(out)
 
     def _grad_norm(self) -> float:
         """Global L2 norm of model gradients (assumes grads are already unscaled).
@@ -385,7 +428,8 @@ class Engine:
                 if v == v:                               # drop NaN
                     agg[k] = agg.get(k, 0.0) + v
                     cnt[k] = cnt.get(k, 0) + 1
-        return {k: (agg[k] / cnt[k] if cnt.get(k) else float("nan")) for k in agg}
+        local = {k: (agg[k] / cnt[k] if cnt.get(k) else float("nan")) for k in agg}
+        return self._all_reduce_dict(local)
 
     # -- qualitative video --------------------------------------------------- #
     @torch.no_grad()
@@ -396,6 +440,8 @@ class Engine:
         the filter's true tracking quality — including on a *train* batch, which
         makes train-time progress and overfit/instability visible as it happens.
         """
+        if not self._is_main_process():
+            return
         loader = self.loaders.get(split) or self.loaders.get("val") or self.loaders.get("train")
         if loader is None or self.wandb is None:
             return
@@ -405,9 +451,11 @@ class Engine:
             from utilities.visualization import render_comparison_frames
             batch = next(iter(loader))
             frames, queries, tgt = self._prep(batch)
-            self.model.eval()
+            # Use the unwrapped model to avoid DDP sync on a single-rank forward pass.
+            model = self._unwrap_model()
+            model.eval()
             with self._autocast():
-                out = self.model(frames, queries, point_mask=tgt.get("point_mask"))
+                out = model(frames, queries, point_mask=tgt.get("point_mask"))
             # Render only the first clip, trimmed to a short, low-res sub-sequence
             # so the gif stays light to upload and quick to eyeball.
             tf = min(self.viz_frames, frames.shape[1]) if self.viz_frames > 0 else frames.shape[1]
@@ -428,7 +476,7 @@ class Engine:
         cfg = self.config.toDict() if hasattr(self.config, "toDict") else dict(self.config)
         return {
             "epoch": epoch,
-            "model": self.model.state_dict(),
+            "model": self._unwrap_model().state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scaler": self.scaler.state_dict(),
             "best_metric": self.best_metric,
@@ -441,11 +489,12 @@ class Engine:
     def _maybe_resume(self) -> None:
         """In-stage resume from ``last.pt``; else carry the previous stage's weights."""
         last = self.dir / "last.pt"
+        m = self._unwrap_model()   # load into the underlying module (no "module." prefix)
         if last.exists():
             ck = torch.load(last, map_location=self.device, weights_only=False)
             # strict=False so a minor architecture change (e.g. the added gate head)
             # resumes from a compatible checkpoint instead of hard-failing.
-            missing, unexpected = self.model.load_state_dict(ck["model"], strict=False)
+            missing, unexpected = m.load_state_dict(ck["model"], strict=False)
             if missing or unexpected:
                 logger.warning(f"resumed last.pt with strict=False "
                                f"(missing={len(missing)}, unexpected={len(unexpected)})")
@@ -461,7 +510,7 @@ class Engine:
         prev = _prev_stage_checkpoint(self.run_dir, self.stage_idx)
         if prev is not None:
             ck = torch.load(prev, map_location=self.device, weights_only=False)
-            missing, unexpected = self.model.load_state_dict(ck["model"], strict=False)
+            missing, unexpected = m.load_state_dict(ck["model"], strict=False)
             logger.info(f"carried weights from {prev.parent.name}/{prev.name} "
                         f"(missing={len(missing)}, unexpected={len(unexpected)})")
 
@@ -469,13 +518,19 @@ class Engine:
     def fit(self) -> Dict[str, float]:
         self._maybe_resume()
         if self.start_epoch >= self.epochs:
-            logger.info(f"stage {self.stage_idx} already at epoch {self.start_epoch}/{self.epochs}; nothing to train")
-            mark_stage_complete(self.run_dir, self.stage_idx, self.stage_name)  # idempotent; covers a crash post-final-epoch
+            if self._is_main_process():
+                logger.info(f"stage {self.stage_idx} already at epoch {self.start_epoch}/{self.epochs}; nothing to train")
+                mark_stage_complete(self.run_dir, self.stage_idx, self.stage_name)
+            if self._is_ddp:
+                import torch.distributed as dist
+                dist.barrier()
             return {"epe": self.best_metric}
 
         has_val = self.loaders.get("val") is not None
-        logger.info(f"training stage {self.stage_idx} '{self.stage_name}' for {self.epochs} epochs "
-                    f"(amp={self.amp}/{self.amp_dtype if self.amp else '-'}, device={self.device.type})")
+        if self._is_main_process():
+            logger.info(f"training stage {self.stage_idx} '{self.stage_name}' for {self.epochs} epochs "
+                        f"(amp={self.amp}/{self.amp_dtype if self.amp else '-'}, device={self.device.type}, "
+                        f"world_size={self._world_size})")
         last_val: Dict[str, float] = {}
         for epoch in range(self.start_epoch, self.epochs):
             lr0, kw, tf_prob = self._apply_schedules(epoch)
@@ -497,30 +552,38 @@ class Engine:
                                  **{f"train_{k}": v for k, v in tr.items()},
                                  **{f"val_{k}": v for k, v in val.items()}})
             self._log_console(epoch, lr0, kw, tf_prob, tr, val)
-            if self.wandb is not None:
+            if self._is_main_process() and self.wandb is not None:
                 row = {"epoch": epoch, "stage": self.stage_idx, "lr": lr0,
                        "kl_weight": kw, "tf_prob": tf_prob,
                        **{f"train/{k}": v for k, v in tr.items()},
                        **{f"val/{k}": v for k, v in val.items()}}
                 self.wandb.log(row)
             if self.viz_every and (epoch % self.viz_every == 0 or epoch == self.epochs - 1):
-                self._log_video(epoch, split="val")     # qualitative val gif
+                self._log_video(epoch, split="val")     # qualitative val gif (rank-0 only)
                 self._log_video(epoch, split="train")   # ... and a train-batch gif
 
-            torch.save(self._ckpt(epoch), self.dir / "last.pt")
-            if improved:
-                torch.save(self._ckpt(epoch), self.dir / "best.pt")
+            if self._is_main_process():
+                torch.save(self._ckpt(epoch), self.dir / "last.pt")
+                if improved:
+                    torch.save(self._ckpt(epoch), self.dir / "best.pt")
 
             if self.patience and self._bad_epochs >= self.patience:
-                logger.info(f"early stop: no improvement for {self.patience} epochs")
+                if self._is_main_process():
+                    logger.info(f"early stop: no improvement for {self.patience} epochs")
                 break
 
-        mark_stage_complete(self.run_dir, self.stage_idx, self.stage_name)
-        logger.info(f"stage {self.stage_idx} '{self.stage_name}' complete -- best epe={self.best_metric:.3f}px "
-                    f"(checkpoints in {self.dir})")
+        if self._is_main_process():
+            mark_stage_complete(self.run_dir, self.stage_idx, self.stage_name)
+            logger.info(f"stage {self.stage_idx} '{self.stage_name}' complete -- best epe={self.best_metric:.3f}px "
+                        f"(checkpoints in {self.dir})")
+        if self._is_ddp:
+            import torch.distributed as dist
+            dist.barrier()  # all ranks wait before returning (next stage must see completion marker)
         return last_val or {"epe": self.best_metric}
 
     def _log_console(self, epoch, lr, kw, tf_prob, tr, val) -> None:
+        if not self._is_main_process():
+            return
         line = f"[stage{self.stage_idx} {self.stage_name}] epoch {epoch + 1}/{self.epochs}"
         if tr:
             line += (f"  train: loss={tr.get('loss', float('nan')):.3f} epe={tr.get('epe', float('nan')):.2f}px "
