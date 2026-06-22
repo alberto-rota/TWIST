@@ -14,18 +14,10 @@
 
 program: train.py
 project: twist
-entity: alberto-rota
+entity: alberto_rota
 
 parameters:
 
-  ### RUN
-  EXPERIMENT_NAME:
-    value: twist_pretrain_v2   # run identity -> $RESULTS_DIR/<name>/.
-                       # A *new* name starts a FRESH run (epoch 0); re-launching the
-                       # SAME name resumes from last.pt. Rename to train from scratch.
-                       # v2: collapse-fix architecture (constant-velocity prior +
-                       # cost-volume soft-argmax observation) — state_dict changed,
-                       # so do NOT resume twist_pretrain's checkpoint.
   BATCH_SIZE:
     value: 4            # clips per batch (A100-40 fits this comfortably with frozen DINOv3)
   EPOCHS:
@@ -55,7 +47,7 @@ parameters:
   LR_SCHEDULER:
     value: cosine          # cosine | none
   WARMUP_EPOCHS:
-    value: 3
+    value: 1
   MIN_LR_RATIO:
     value: 0.05            # cosine floor (fraction of base LR)
   KL_WEIGHT_START:
@@ -75,9 +67,9 @@ parameters:
     value: 20              # wandb per-step log interval (train steps): decomposed
                            # losses (pos/vis/kl/unc), EPE, grad-norm, gate, lr, tf_prob
   VIZ_EVERY:
-    value: 2               # log pred-vs-GT wandb.Video (both train & val) every N epochs (0 off)
+    value: 1               # log pred-vs-GT wandb.Video (both train & val) every N epochs (0 off)
   VIZ_FRAMES:
-    value: 24              # trim the logged gif to the first N frames (short clip; 0 = full)
+    value: 48              # trim the logged gif to the first N frames (short clip; 0 = full)
   VIZ_MAX_POINTS:
     value: 48              # subsample to N tracks in the gif (legibility)
   VIZ_DPI:
@@ -128,34 +120,34 @@ parameters:
   ### DATA
   DATASETS:
     value:
-      KUBRIC:
-        # --- train / val split (sequence-level) ---
-        VAL_FRACTION: 0.1            # held out for validation
-        SPLIT_SEED: 42              # deterministic split
-        # VAL_SEQUENCES: ["0000","0001"]   # or pin an explicit split instead
+      # KUBRIC:
+      #   # --- train / val split (sequence-level) ---
+      #   VAL_FRACTION: 0.1            # held out for validation
+      #   SPLIT_SEED: 42              # deterministic split
+      #   # VAL_SEQUENCES: ["0000","0001"]   # or pin an explicit split instead
 
-        # --- temporal sampling ---
-        CLIP_LEN: 24                # output frames per clip (0/null -> whole sequence)
-        FRAME_STRIDE: 1             # keep every Nth frame
-        CLIP_STRIDE: null           # null -> non-overlapping clips
-        MAX_CLIPS_PER_VIDEO: null   # cap clips per sequence
+      #   # --- temporal sampling ---
+      #   CLIP_LEN: 24                # output frames per clip (0/null -> whole sequence)
+      #   FRAME_STRIDE: 1             # keep every Nth frame
+      #   CLIP_STRIDE: null           # null -> non-overlapping clips
+      #   MAX_CLIPS_PER_VIDEO: null   # cap clips per sequence
 
-        # --- spatial sampling density (N tracked points) ---
-        MAX_POINTS: 256
-        POINT_SAMPLE_MODE: even     # even | random | grid | first
-        QUERY_FRAME: 0              # frame that defines the query points
-        REQUIRE_VISIBLE_AT_QUERY: true
-        MIN_VISIBLE_FRAMES: 1
+      #   # --- spatial sampling density (N tracked points) ---
+      #   MAX_POINTS: 256
+      #   POINT_SAMPLE_MODE: even     # even | random | grid | first
+      #   QUERY_FRAME: 0              # frame that defines the query points
+      #   REQUIRE_VISIBLE_AT_QUERY: true
+      #   MIN_VISIBLE_FRAMES: 1
 
-        # --- geometry ---
-        TARGET_SIZE: [256, 256]     # resize frames (+ scale coords); null keeps 512
-        # CROP: [0, 0, 512, 512]    # optional (x0,y0,x1,y1) before resize
+      #   # --- geometry ---
+      #   TARGET_SIZE: [256, 256]     # resize frames (+ scale coords); null keeps 512
+      #   # CROP: [0, 0, 512, 512]    # optional (x0,y0,x1,y1) before resize
 
-        # --- io ---
-        LOAD_FRAMES: true
-        LOAD_DEPTHS: false
-        FRAMES_AS_FLOAT: false
-        MARK_OFFSCREEN_INVISIBLE: true
+      #   # --- io ---
+      #   LOAD_FRAMES: true
+      #   LOAD_DEPTHS: false
+      #   FRAMES_AS_FLOAT: false
+      #   MARK_OFFSCREEN_INVISIBLE: true
 
       # Long-horizon synthetic phase, trained jointly with Kubric. Identity
       # (root dir, shared reader, GT tracks) lives in dataset/wrappers.py; the
@@ -182,7 +174,7 @@ parameters:
         MIN_VISIBLE_FRAMES: 1
 
         # --- geometry ---
-        TARGET_SIZE: [256, 256]     # == KUBRIC; resize frames (+ scale coords)
+        TARGET_SIZE: [448, 448]     # == KUBRIC; resize frames (+ scale coords)
 
         # --- io ---
         LOAD_FRAMES: true
