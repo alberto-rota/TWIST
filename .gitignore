@@ -8,3 +8,15 @@ wheels/
 
 # Virtual environments
 .venv
+
+DATA/
+co-tracker/
+.env
+.sbatch_scripts/
+# Run artifacts
+results/
+weights/
+logs/
+wandb/
+*.ipynb_checkpoints
+workshops/
