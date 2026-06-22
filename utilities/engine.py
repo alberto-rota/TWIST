@@ -14,9 +14,10 @@ Design (a lean version of the unreflectanything engine):
   elsewhere, disabled on CPU.
 * **Schedules** — cosine LR with linear warmup; KL weight annealed from
   ``KL_WEIGHT_START`` up to ``MODEL.LOSS.KL_WEIGHT`` over ``KL_ANNEAL_EPOCHS``;
-  teacher forcing for the first ``TEACHER_FORCING_EPOCHS`` epochs (curriculum:
-  feed GT positions early, then let the filter run free). All are pure functions
-  of the epoch, so they are correct after a resume with no extra state.
+  **scheduled sampling** — a per-point teacher-forcing probability annealed
+  linearly 1->0 over ``TEACHER_FORCING_EPOCHS`` (feed GT positions often early,
+  then let the filter run on its own predictions; no hard cliff). All are pure
+  functions of the epoch, so they are correct after a resume with no extra state.
 * **Checkpoints** — ``last.pt`` every epoch and ``best.pt`` on the best monitored
   metric (val EPE), written under ``<run_dir>/stage{idx}_{name}/``. A rerun of the
   same stage resumes from ``last.pt`` (model + optimizer + scaler + epoch); a fresh
@@ -238,15 +239,22 @@ class Engine:
         frac = min(1.0, epoch / self.kl_anneal)
         return self.kl_start + (self.kl_target - self.kl_start) * frac
 
-    def _apply_schedules(self, epoch: int) -> Tuple[float, float, bool]:
+    def _tf_prob(self, epoch: int) -> float:
+        """Scheduled-sampling teacher-forcing probability: linear 1->0 over
+        ``TEACHER_FORCING_EPOCHS`` epochs, then 0 (pure free-running)."""
+        if self.tf_epochs <= 0:
+            return 0.0
+        return max(0.0, 1.0 - epoch / self.tf_epochs)
+
+    def _apply_schedules(self, epoch: int) -> Tuple[float, float, float]:
         mult = self._lr_mult(epoch)
         for g, base in zip(self.optimizer.param_groups, self.base_lrs):
             g["lr"] = base * mult
         kw = self._kl_weight(epoch)
         self.loss_fn.kl_weight = kw
-        tf = epoch < self.tf_epochs
+        tf_prob = self._tf_prob(epoch)
         lr0 = self.optimizer.param_groups[0]["lr"] if self.optimizer.param_groups else 0.0
-        return lr0, kw, tf
+        return lr0, kw, tf_prob
 
     # -- batch prep ---------------------------------------------------------- #
     def _prep(self, batch: Dict[str, Any]):
@@ -266,16 +274,18 @@ class Engine:
         return torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.amp)
 
     # -- train / validate ---------------------------------------------------- #
-    def train_epoch(self, epoch: int, teacher_forcing: bool) -> Dict[str, float]:
+    def train_epoch(self, epoch: int, tf_prob: float) -> Dict[str, float]:
         loader = self.loaders.get("train")
         if loader is None:
             return {}
         self.model.train()
         if getattr(self.model, "encoder", None) is not None and getattr(self.model.encoder, "frozen", False):
             self.model.encoder.eval()                    # keep the frozen backbone in eval
-        agg = {"loss": 0.0, "pos": 0.0, "unc": 0.0, "vis": 0.0, "kl": 0.0, "epe": 0.0,
-               "w_pos": 0.0, "w_unc": 0.0, "w_vis": 0.0, "w_kl": 0.0}
+        agg = {"loss": 0.0, "pos": 0.0, "prior": 0.0, "unc": 0.0, "vis": 0.0, "kl": 0.0, "epe": 0.0,
+               "w_pos": 0.0, "w_prior": 0.0, "w_unc": 0.0, "w_vis": 0.0, "w_kl": 0.0,
+               "gate": 0.0, "motion_ratio": 0.0}
         n = 0
+        gn_sum, gn_cnt = 0.0, 0   # grad-norm aggregated separately (skip non-finite overflow steps)
         for step, batch in enumerate(loader):
             if self.max_steps and step >= self.max_steps:
                 break
@@ -283,32 +293,77 @@ class Engine:
             self.optimizer.zero_grad(set_to_none=True)
             with self._autocast():
                 out = self.model(frames, queries, point_mask=tgt.get("point_mask"),
-                                 teacher_forcing=teacher_forcing,
-                                 gt_tracks=tgt["tracks"] if teacher_forcing else None)
+                                 tf_prob=tf_prob,
+                                 gt_tracks=tgt["tracks"] if tf_prob > 0.0 else None)
                 total, parts = self.loss_fn(out, tgt)
+            grad_norm = 0.0
             if self.use_scaler:
                 self.scaler.scale(total).backward()
+                self.scaler.unscale_(self.optimizer)
+                grad_norm = self._grad_norm()
                 if self.grad_clip > 0:
-                    self.scaler.unscale_(self.optimizer)
                     nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 total.backward()
+                grad_norm = self._grad_norm()
                 if self.grad_clip > 0:
                     nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
                 self.optimizer.step()
 
+            # mean Kalman gate (diagnostic: now free to learn a low gain where the
+            # observation is noisier than the motion; not pinned open as before)
+            gate = float(torch.sigmoid(out["gate_logits"]).mean().detach()) if "gate_logits" in out else float("nan")
+            # train motion_ratio: how far the model's OWN predictions travel vs GT
+            # (inflated while tf_prob>0 since the state is GT-fed; judge once tf->0).
+            with torch.no_grad():
+                c = out["coords"].float()
+                pd = torch.linalg.norm(c - c[:, :1], dim=-1)
+                gd = torch.linalg.norm(tgt["tracks"] - tgt["tracks"][:, :1], dim=-1)
+                vm = tgt["visibility"].bool()
+                motion_ratio = float((pd[vm].mean() / gd[vm].mean().clamp_min(1e-6))) if vm.any() else float("nan")
             agg["loss"] += float(total.detach())
-            for k in ("pos", "unc", "vis", "kl", "epe", "w_pos", "w_unc", "w_vis", "w_kl"):
+            for k in ("pos", "prior", "unc", "vis", "kl", "epe", "w_pos", "w_prior", "w_unc", "w_vis", "w_kl"):
                 agg[k] += float(parts[k])
+            agg["gate"] += gate
+            agg["motion_ratio"] += motion_ratio
+            if grad_norm == grad_norm:                   # finite (GradScaler overflow steps -> NaN, skipped)
+                gn_sum += grad_norm; gn_cnt += 1
             n += 1
             if self.wandb is not None and self.log_every and step % self.log_every == 0:
-                self.wandb.log({"train/step_loss": float(total.detach()),
-                                "train/step_epe": float(parts["epe"]),
-                                "lr": self.optimizer.param_groups[0]["lr"],
-                                "kl_weight": self.loss_fn.kl_weight})
-        return {k: v / max(n, 1) for k, v in agg.items()}
+                self.wandb.log({
+                    "train/step_loss": float(total.detach()),
+                    "train/step_epe": float(parts["epe"]),
+                    "train/step_pos": float(parts["pos"]),
+                    "train/step_prior": float(parts["prior"]),
+                    "train/step_vis": float(parts["vis"]),
+                    "train/step_kl": float(parts["kl"]),
+                    "train/step_unc": float(parts["unc"]),
+                    "train/step_grad_norm": grad_norm,
+                    "train/step_gate": gate,
+                    "train/step_motion_ratio": motion_ratio,
+                    "lr": self.optimizer.param_groups[0]["lr"],
+                    "kl_weight": self.loss_fn.kl_weight,
+                    "tf_prob": tf_prob,
+                })
+        out = {k: v / max(n, 1) for k, v in agg.items()}
+        out["grad_norm"] = gn_sum / gn_cnt if gn_cnt else float("nan")
+        return out
+
+    def _grad_norm(self) -> float:
+        """Global L2 norm of model gradients (assumes grads are already unscaled).
+
+        Returns NaN if non-finite (a GradScaler overflow step on the fp16 path leaves
+        inf/NaN grads here, even though ``scaler.step`` then skips the update) so the
+        spurious value is dropped from the epoch aggregate rather than poisoning it.
+        """
+        total = 0.0
+        for p in self.model.parameters():
+            if p.grad is not None:
+                total += float(p.grad.detach().norm(2)) ** 2
+        g = total ** 0.5
+        return g if math.isfinite(g) else float("nan")
 
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
@@ -316,27 +371,32 @@ class Engine:
         if loader is None:
             return {}
         self.model.eval()
-        agg = {"loss": 0.0, "epe": 0.0, "delta_avg": 0.0,
-               "occlusion_accuracy": 0.0, "average_jaccard": 0.0}
-        cnt = {k: 0 for k in agg}
+        agg: Dict[str, float] = {"loss": 0.0}
+        cnt: Dict[str, int] = {"loss": 0}
         for batch in loader:
             frames, queries, tgt = self._prep(batch)
             with self._autocast():
-                out = self.model(frames, queries, point_mask=tgt.get("point_mask"),
-                                 teacher_forcing=False)
+                out = self.model(frames, queries, point_mask=tgt.get("point_mask"))
                 total, _ = self.loss_fn(out, tgt)
             m = tracking_metrics(out["coords"], tgt["tracks"], out["vis_logits"],
                                  tgt["visibility"], tgt.get("time_mask"), tgt.get("point_mask"))
             agg["loss"] += float(total.detach()); cnt["loss"] += 1
-            for k in ("epe", "delta_avg", "occlusion_accuracy", "average_jaccard"):
-                if m[k] == m[k]:                         # drop NaN
-                    agg[k] += m[k]; cnt[k] += 1
-        return {k: (agg[k] / cnt[k] if cnt[k] else float("nan")) for k in agg}
+            for k, v in m.items():                       # epe, delta_avg, OA, AJ, per-threshold deltas
+                if v == v:                               # drop NaN
+                    agg[k] = agg.get(k, 0.0) + v
+                    cnt[k] = cnt.get(k, 0) + 1
+        return {k: (agg[k] / cnt[k] if cnt.get(k) else float("nan")) for k in agg}
 
     # -- qualitative video --------------------------------------------------- #
     @torch.no_grad()
-    def _log_video(self, epoch: int) -> None:
-        loader = self.loaders.get("val") or self.loaders.get("train")
+    def _log_video(self, epoch: int, split: str = "val") -> None:
+        """Log a short, low-res pred-vs-GT gif for ``split`` (``"val"`` | ``"train"``).
+
+        Always runs the model free-running (no teacher forcing) so the gif shows
+        the filter's true tracking quality — including on a *train* batch, which
+        makes train-time progress and overfit/instability visible as it happens.
+        """
+        loader = self.loaders.get(split) or self.loaders.get("val") or self.loaders.get("train")
         if loader is None or self.wandb is None:
             return
         try:
@@ -356,9 +416,9 @@ class Engine:
                 batch["frames"][0, :tf], tgt["tracks"][0, :tf].cpu(), out["coords"][0, :tf].cpu(),
                 gt_visibility=tgt["visibility"][0, :tf].cpu(), pred_visibility=pred_vis.cpu(),
                 max_points=self.viz_max_points, dpi=self.viz_dpi,
-                title=f"{self.stage_name} ep{epoch}",
+                title=f"{self.stage_name} {split} ep{epoch}",
             )
-            self.wandb.log({"val/tracks": wandb.Video(arr, fps=self.viz_fps, format="gif"),
+            self.wandb.log({f"{split}/tracks": wandb.Video(arr, fps=self.viz_fps, format="gif"),
                             "epoch": epoch})
         except Exception as e:  # noqa: BLE001
             logger.warning(f"video logging skipped ({e})")
@@ -383,7 +443,12 @@ class Engine:
         last = self.dir / "last.pt"
         if last.exists():
             ck = torch.load(last, map_location=self.device, weights_only=False)
-            self.model.load_state_dict(ck["model"])
+            # strict=False so a minor architecture change (e.g. the added gate head)
+            # resumes from a compatible checkpoint instead of hard-failing.
+            missing, unexpected = self.model.load_state_dict(ck["model"], strict=False)
+            if missing or unexpected:
+                logger.warning(f"resumed last.pt with strict=False "
+                               f"(missing={len(missing)}, unexpected={len(unexpected)})")
             try:
                 self.optimizer.load_state_dict(ck["optimizer"])
                 self.scaler.load_state_dict(ck["scaler"])
@@ -413,8 +478,8 @@ class Engine:
                     f"(amp={self.amp}/{self.amp_dtype if self.amp else '-'}, device={self.device.type})")
         last_val: Dict[str, float] = {}
         for epoch in range(self.start_epoch, self.epochs):
-            lr0, kw, tf = self._apply_schedules(epoch)
-            tr = self.train_epoch(epoch, teacher_forcing=tf)
+            lr0, kw, tf_prob = self._apply_schedules(epoch)
+            tr = self.train_epoch(epoch, tf_prob=tf_prob)
             do_val = has_val and (epoch % self.val_every == 0 or epoch == self.epochs - 1)
             val = self.validate() if do_val else {}
             if val:
@@ -428,17 +493,19 @@ class Engine:
             else:
                 self._bad_epochs += 1
 
-            self.history.append({"epoch": epoch, "lr": lr0, "kl_weight": kw,
+            self.history.append({"epoch": epoch, "lr": lr0, "kl_weight": kw, "tf_prob": tf_prob,
                                  **{f"train_{k}": v for k, v in tr.items()},
                                  **{f"val_{k}": v for k, v in val.items()}})
-            self._log_console(epoch, lr0, kw, tf, tr, val)
+            self._log_console(epoch, lr0, kw, tf_prob, tr, val)
             if self.wandb is not None:
-                row = {"epoch": epoch, "stage": self.stage_idx, "lr": lr0, "kl_weight": kw,
+                row = {"epoch": epoch, "stage": self.stage_idx, "lr": lr0,
+                       "kl_weight": kw, "tf_prob": tf_prob,
                        **{f"train/{k}": v for k, v in tr.items()},
                        **{f"val/{k}": v for k, v in val.items()}}
                 self.wandb.log(row)
             if self.viz_every and (epoch % self.viz_every == 0 or epoch == self.epochs - 1):
-                self._log_video(epoch)
+                self._log_video(epoch, split="val")     # qualitative val gif
+                self._log_video(epoch, split="train")   # ... and a train-batch gif
 
             torch.save(self._ckpt(epoch), self.dir / "last.pt")
             if improved:
@@ -453,15 +520,16 @@ class Engine:
                     f"(checkpoints in {self.dir})")
         return last_val or {"epe": self.best_metric}
 
-    def _log_console(self, epoch, lr, kw, tf, tr, val) -> None:
-        def fmt(d, keys):
-            return "  ".join(f"{k}={d[k]:.3f}" for k in keys if k in d)
+    def _log_console(self, epoch, lr, kw, tf_prob, tr, val) -> None:
         line = f"[stage{self.stage_idx} {self.stage_name}] epoch {epoch + 1}/{self.epochs}"
         if tr:
-            line += f"  train: loss={tr.get('loss', float('nan')):.3f} epe={tr.get('epe', float('nan')):.2f}px"
+            line += (f"  train: loss={tr.get('loss', float('nan')):.3f} epe={tr.get('epe', float('nan')):.2f}px "
+                     f"mr={tr.get('motion_ratio', float('nan')):.2f} gate={tr.get('gate', float('nan')):.2f} "
+                     f"|g|={tr.get('grad_norm', float('nan')):.2f}")
         if val:
             line += (f"  val: loss={val.get('loss', float('nan')):.3f} epe={val.get('epe', float('nan')):.2f}px "
+                     f"mr={val.get('motion_ratio', float('nan')):.2f} stuck={val.get('stuck_frac', float('nan')):.2f} "
                      f"δ={val.get('delta_avg', float('nan')):.3f} OA={val.get('occlusion_accuracy', float('nan')):.3f} "
                      f"AJ={val.get('average_jaccard', float('nan')):.3f}")
-        line += f"  lr={lr:.2e} kl_w={kw:.3f}{' TF' if tf else ''}  best_epe={self.best_metric:.2f}"
+        line += f"  lr={lr:.2e} kl_w={kw:.3f} tf={tf_prob:.2f}  best_epe={self.best_metric:.2f}"
         logger.info(line)

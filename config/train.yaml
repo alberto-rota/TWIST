@@ -1,4 +1,4 @@
-# TWIST — Phase 1: Kubric (CT3Kubric) pretraining — dataset config.
+# TWIST — synthetic pretraining (CT3Kubric + PointOdyssey) — dataset config.
 #
 # Written in W&B-sweep format: every parameter is `{value: ...}`.
 #   * `python train.py`            reads the `value`s.
@@ -19,8 +19,15 @@ entity: alberto-rota
 parameters:
 
   ### RUN
+  EXPERIMENT_NAME:
+    value: twist_pretrain_v2   # run identity -> $RESULTS_DIR/<name>/.
+                       # A *new* name starts a FRESH run (epoch 0); re-launching the
+                       # SAME name resumes from last.pt. Rename to train from scratch.
+                       # v2: collapse-fix architecture (constant-velocity prior +
+                       # cost-volume soft-argmax observation) — state_dict changed,
+                       # so do NOT resume twist_pretrain's checkpoint.
   BATCH_SIZE:
-    value: 4            # clips per batch
+    value: 8            # clips per batch (A100-40 fits this comfortably with frozen DINOv3)
   EPOCHS:
     value: 50
   WORKERS:
@@ -48,7 +55,7 @@ parameters:
   LR_SCHEDULER:
     value: cosine          # cosine | none
   WARMUP_EPOCHS:
-    value: 2
+    value: 3
   MIN_LR_RATIO:
     value: 0.05            # cosine floor (fraction of base LR)
   KL_WEIGHT_START:
@@ -56,13 +63,19 @@ parameters:
   KL_ANNEAL_EPOCHS:
     value: 10              # ... over this many epochs (0 => constant target)
   TEACHER_FORCING_EPOCHS:
-    value: 5               # feed GT positions for the first N epochs (curriculum)
+    value: 3               # scheduled-sampling window: per-point GT-feed prob anneals
+                           # 1 -> 0 linearly over these epochs, then pure free-running
+                           # (no hard cliff -> no train/val gap; teaches error recovery).
+                           # Short: GT-fed state makes "stay put" near-optimal, which
+                           # was a prop under the static collapse; free-run early so the
+                           # model must accumulate real motion under its own dynamics.
   VAL_EVERY:
     value: 1               # validate every N epochs
   LOG_EVERY:
-    value: 20              # wandb per-step log interval (train steps)
+    value: 20              # wandb per-step log interval (train steps): decomposed
+                           # losses (pos/vis/kl/unc), EPE, grad-norm, gate, lr, tf_prob
   VIZ_EVERY:
-    value: 5               # log a pred-vs-GT wandb.Video every N epochs (0 off)
+    value: 2               # log pred-vs-GT wandb.Video (both train & val) every N epochs (0 off)
   VIZ_FRAMES:
     value: 24              # trim the logged gif to the first N frames (short clip; 0 = full)
   VIZ_MAX_POINTS:
@@ -83,16 +96,23 @@ parameters:
       TOKEN_DIM: 256             # particle token width
       RGB_ENCODER:
         ENCODER: facebook/dinov3-vitl16-pretrain-lvd1689m  # DINOv3 ViT-L/16 (dim 1024, patch 16); or "cnn"
-        IMAGE_SIZE: 256          # keep == DATASETS.KUBRIC.TARGET_SIZE
+        IMAGE_SIZE: 256          # encoder's internal square resize -> 16x16 feature grid (16px/cell).
+                                 # QUALITY LEVER: 512 -> 32x32 grid (8px/cell) ~doubles localization
+                                 # precision (verified) at ~2.5x encoder cost; bump once collapse is
+                                 # confirmed broken. Independent of DATASETS.*.TARGET_SIZE (256).
         FREEZE_BACKBONE: true
         RGB_ENCODER_LR: 0.0      # 0.0 => frozen (engine reads this for param groups)
-      OBSERVATION:               # local cost-volume correction
-        K: 7                     # KxK feature window
+      OBSERVATION:               # local cost-volume soft-argmax localizer
+        K: 9                     # KxK feature window (denser sampling for the soft-argmax)
         RADIUS_PX: 24.0          # window half-extent (pixels)
         HEADS: 4
-      TRANSITION:                # frame-free dynamics prior
+        MAX_CORR: 0.0            # optional zero-init learned sub-cell residual (0 = pure soft-argmax)
+      TRANSITION:                # frame-free constant-velocity dynamics prior
         DEPTH: 2                 # inter-point self-attention blocks (rigidity)
         HEADS: 4
+        MAX_STEP: 0.12           # max learned residual displacement (normalized ~= 15px);
+                                 # prior = pos + last_velocity + this. Keeps the prior
+                                 # inside the observation window instead of saturating to ~87px.
       HEADS:
         UNCERTAINTY: true        # predict per-point aleatoric log-variance
       LOSS:
@@ -102,7 +122,8 @@ parameters:
         KL_FREE_BITS: 0.5
         KL_BALANCE_ALPHA: 0.8    # pull prior toward posterior harder (Dreamer-style)
         HUBER_DELTA: 0.2         # normalized units
-        UNC_WEIGHT: 0.02
+        UNC_WEIGHT: 0.0          # heteroscedastic NLL OFF (it drove total<0 and gamed confidence on the static solution)
+        PRIOR_WEIGHT: 0.5        # direct GT supervision of the prior mean (was implicit via KL only -> prior ran away)
 
   ### DATA
   DATASETS:
@@ -129,6 +150,39 @@ parameters:
         # --- geometry ---
         TARGET_SIZE: [256, 256]     # resize frames (+ scale coords); null keeps 512
         # CROP: [0, 0, 512, 512]    # optional (x0,y0,x1,y1) before resize
+
+        # --- io ---
+        LOAD_FRAMES: true
+        LOAD_DEPTHS: false
+        FRAMES_AS_FLOAT: false
+        MARK_OFFSCREEN_INVISIBLE: true
+
+      # Long-horizon synthetic phase, trained jointly with Kubric. Identity
+      # (root dir, shared reader, GT tracks) lives in dataset/wrappers.py; the
+      # on-disk clips are 48-frame, ~400-point, native 540x960. We deliberately
+      # override CLIP_LEN / MAX_POINTS / TARGET_SIZE to MATCH the Kubric block:
+      # shuffling a ConcatDataset mixes both datasets in one batch, and the
+      # default (stacking) collate needs every clip to share the same (T,N,H,W).
+      POINTODYSSEY:
+        # --- train / val split (sequence-level) ---
+        VAL_FRACTION: 0.1            # held out for validation
+        SPLIT_SEED: 42              # deterministic split
+
+        # --- temporal sampling ---
+        CLIP_LEN: 24                # == KUBRIC (each stored 48f clip -> 2 sub-clips)
+        FRAME_STRIDE: 1             # keep every Nth frame
+        CLIP_STRIDE: null           # null -> non-overlapping clips
+        MAX_CLIPS_PER_VIDEO: null   # cap clips per sequence
+
+        # --- spatial sampling density (N tracked points) ---
+        MAX_POINTS: 256             # == KUBRIC (subsampled from ~400 stored)
+        POINT_SAMPLE_MODE: even     # even | random | grid | first
+        QUERY_FRAME: 0              # frame that defines the query points
+        REQUIRE_VISIBLE_AT_QUERY: true
+        MIN_VISIBLE_FRAMES: 1
+
+        # --- geometry ---
+        TARGET_SIZE: [256, 256]     # == KUBRIC; resize frames (+ scale coords)
 
         # --- io ---
         LOAD_FRAMES: true

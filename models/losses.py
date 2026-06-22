@@ -50,7 +50,8 @@ class TrackerLoss(nn.Module):
         kl_free_bits: float = 0.5,
         kl_balance_alpha: float = 0.8,
         huber_delta: float = 0.2,    # normalized units; large enough to stay ~quadratic
-        unc_weight: float = 0.02,
+        unc_weight: float = 0.0,     # heteroscedastic NLL (0 disables; it drove total<0 + gamed confidence)
+        prior_weight: float = 0.5,   # direct GT supervision of the dynamics-prior mean
     ) -> None:
         super().__init__()
         self.pos_weight = pos_weight
@@ -60,6 +61,7 @@ class TrackerLoss(nn.Module):
         self.kl_balance_alpha = kl_balance_alpha
         self.huber_delta = huber_delta
         self.unc_weight = unc_weight
+        self.prior_weight = prior_weight
 
     def forward(self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
                 ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -95,7 +97,14 @@ class TrackerLoss(nn.Module):
         log_b = 0.5 * coord_logvar.mean(-1)             # (B,T,N) log-scale
         unc = huber.detach() * torch.exp(-log_b) + log_b
         unc_reg = masked_mean(unc, valid)               # heteroscedastic NLL (can be < 0)
-        pos_loss = pos_reg + self.unc_weight * unc_reg
+        # Direct GT supervision of the dynamics-prior mean. The prior previously got
+        # a position gradient ONLY through KL(post||prior) -- killed by free bits and
+        # pointing at the (possibly degenerate) posterior, not GT -- so it was free to
+        # saturate to ~+87px/step. Anchoring it to GT motion (where visible) makes it a
+        # competent constant-velocity smoother and removes the +prior/-obs cancellation.
+        huber_prior = F.huber_loss(mu_p, gt_n, reduction="none", delta=self.huber_delta).sum(-1)
+        prior_reg = masked_mean(huber_prior, valid)
+        pos_loss = pos_reg + self.unc_weight * unc_reg + self.prior_weight * prior_reg
 
         # --- visibility BCE (over all real points) ---
         bce = F.binary_cross_entropy_with_logits(vis_logits, gt_vis, reduction="none")
@@ -119,11 +128,13 @@ class TrackerLoss(nn.Module):
         # can be < 0 is the heteroscedastic uncertainty NLL (``unc`` / ``w_unc``).
         parts = {
             "pos": float(pos_reg.detach()),
+            "prior": float(prior_reg.detach()),
             "unc": float(unc_reg.detach()),
             "vis": float(vis_loss.detach()),
             "kl": float(kl_loss.detach()),
             "epe": float(epe),
             "w_pos": float((self.pos_weight * pos_reg).detach()),
+            "w_prior": float((self.pos_weight * self.prior_weight * prior_reg).detach()),
             "w_unc": float((self.pos_weight * self.unc_weight * unc_reg).detach()),
             "w_vis": float((self.vis_weight * vis_loss).detach()),
             "w_kl": float((self.kl_weight * kl_loss).detach()),
