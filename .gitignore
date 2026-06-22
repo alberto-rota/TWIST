@@ -13,6 +13,7 @@ DATA/
 co-tracker/
 .env
 .sbatch_scripts/
+assets/
 # Run artifacts
 results/
 weights/

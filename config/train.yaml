@@ -27,7 +27,7 @@ parameters:
                        # cost-volume soft-argmax observation) — state_dict changed,
                        # so do NOT resume twist_pretrain's checkpoint.
   BATCH_SIZE:
-    value: 8            # clips per batch (A100-40 fits this comfortably with frozen DINOv3)
+    value: 4            # clips per batch (A100-40 fits this comfortably with frozen DINOv3)
   EPOCHS:
     value: 50
   WORKERS:
