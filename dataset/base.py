@@ -64,6 +64,9 @@ class BaseTracksDataset(torch.utils.data.Dataset):
         own raw span, i.e. non-overlapping). Smaller -> overlapping clips.
     max_clips_per_video : int | None
         Cap clips taken from each sequence.
+    max_clips : int | None
+        Cap the *total* number of clips this reader yields (applied after
+        ``max_clips_per_video`` / ``max_sequences``). ``None`` -> no cap.
     max_points : int | None
         Number of tracked points ``N`` to sample per clip. ``None`` -> keep all.
     point_sample_mode : str
@@ -95,6 +98,7 @@ class BaseTracksDataset(torch.utils.data.Dataset):
         frame_stride: int = 1,
         clip_stride: Optional[int] = None,
         max_clips_per_video: Optional[int] = None,
+        max_clips: Optional[int] = None,
         max_points: Optional[int] = None,
         point_sample_mode: str = "even",
         query_frame: int = 0,
@@ -115,6 +119,7 @@ class BaseTracksDataset(torch.utils.data.Dataset):
         self.clip_len = clip_len
         self.clip_stride = clip_stride
         self.max_clips_per_video = max_clips_per_video
+        self.max_clips = max_clips
         self.max_points = max_points
         self.point_sample_mode = point_sample_mode
         self.query_frame = int(query_frame)

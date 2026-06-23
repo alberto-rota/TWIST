@@ -79,6 +79,7 @@ class CoTrackerTracksDataset(BaseTracksDataset):
         frame_stride: int = 1,
         clip_stride: Optional[int] = None,
         max_clips_per_video: Optional[int] = None,
+        max_clips: Optional[int] = None,
         max_points: Optional[int] = None,
         point_sample_mode: str = "even",
         query_frame: int = 0,
@@ -100,6 +101,7 @@ class CoTrackerTracksDataset(BaseTracksDataset):
             frame_stride=frame_stride,
             clip_stride=clip_stride,
             max_clips_per_video=max_clips_per_video,
+            max_clips=max_clips,
             max_points=max_points,
             point_sample_mode=point_sample_mode,
             query_frame=query_frame,
@@ -183,6 +185,8 @@ class CoTrackerTracksDataset(BaseTracksDataset):
             keep = list(dict.fromkeys(en["video"] for en in entries))[: int(self.max_sequences)]
             keepset = set(keep)
             entries = [en for en in entries if en["video"] in keepset]
+        if self.max_clips is not None:
+            entries = entries[: int(self.max_clips)]  # total-clip cap (first videos, in order)
         return entries
 
     # ------------------------------------------------------------------ #

@@ -43,7 +43,10 @@ def _build_parser(mode: str) -> argparse.ArgumentParser:
     p.add_argument("config_file", nargs="?", default=None,
                    help="path to a config YAML (defaults to config/<mode>.yaml)")
     p.add_argument("--config", "-c", default=None, help="config YAML (overridden by positional)")
-    p.add_argument("--boot", "-b", action="store_true", help="boot mode: tiny smoke run")
+    p.add_argument("--boot", "-b", action="store_true",
+                   help="boot mode: tiny CPU-sanity run (cnn encoder + shrunk model)")
+    p.add_argument("--smoke", "-s", action="store_true",
+                   help="smoke mode: real config, 1 epoch, batch 1, very few train/val iters + clips")
     p.add_argument("--no-wandb", action="store_true", help="disable W&B logging")
     p.add_argument("--max-batches", type=int, default=2,
                    help="batches to stream per split in the data dry-run")
@@ -98,6 +101,22 @@ def _dryrun_split(loaders: Dict[str, Any], split: str, max_batches: int) -> None
     logger.info(f"[{split}] streamed {n} batches in {dt:.2f}s ({dt / max(n,1):.2f}s/batch)")
 
 
+def _has_experiment_name(cfg: Any) -> bool:
+    """True when the config carries a usable (non-empty) ``EXPERIMENT_NAME`` string."""
+    raw = cfg.get("EXPERIMENT_NAME", None)
+    name = str(raw).strip() if isinstance(raw, str) else ""
+    return name not in ("", "None")
+
+
+def _sync_run_name(name: str, is_ddp: bool, is_main: bool, device) -> str:
+    """Broadcast rank-0's resolved run name to every rank (no-op without DDP)."""
+    if not is_ddp:
+        return name
+    obj = [name if is_main else None]
+    dist.broadcast_object_list(obj, src=0, device=device)
+    return obj[0]
+
+
 def run_pipeline(mode: str = "train", config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Run the (currently data-only) TWIST pipeline.
 
@@ -122,7 +141,8 @@ def run_pipeline(mode: str = "train", config: Optional[Dict[str, Any]] = None) -
         args, unknown = _build_parser(mode).parse_known_args()
         cfg_path = _resolve_config_path(args.config_file or args.config, mode)
         cfg = load_and_process_config(
-            config_path=cfg_path, unknown_args=unknown, boot_mode=args.boot
+            config_path=cfg_path, unknown_args=unknown,
+            boot_mode=args.boot, smoke_mode=args.smoke,
         )
         if args.no_wandb:
             cfg.NO_WANDB = True
@@ -158,9 +178,45 @@ def run_pipeline(mode: str = "train", config: Optional[Dict[str, Any]] = None) -
 
     is_main = rank == 0
 
+    # Set OMP_NUM_THREADS and intra-op threads: split available cores across ranks.
+    # Overrides torchrun's OMP_NUM_THREADS=1 default (set per-process, so each rank
+    # gets its fair share rather than fighting over all cores).
+    try:
+        affinity = os.sched_getaffinity(os.getpid())
+        n_cores = len(affinity)
+        omp_threads = max(1, n_cores // world_size)
+        os.environ["OMP_NUM_THREADS"] = str(omp_threads)
+        torch.set_num_threads(omp_threads)
+        if is_main:
+            logger.info(
+                f"CPU cores available: {n_cores}  OMP_NUM_THREADS={omp_threads} (cores/world_size)",
+                context="DDP" if is_ddp else "MAIN",
+            )
+    except Exception:
+        if is_main:
+            logger.warning("Could not read CPU affinity; OMP_NUM_THREADS unchanged")
+
     # A run is identified by EXPERIMENT_NAME; --resume-run points at an existing one.
     if resume_run:
         cfg.EXPERIMENT_NAME = resume_run
+
+    # When no EXPERIMENT_NAME is given, adopt W&B's friendly run name
+    # (adjective-noun-number) so the local results dir matches the W&B run. That
+    # name only exists after wandb.init, so rank 0 opens the run now (before
+    # run_dir is known) and broadcasts the resolved name to the other ranks.
+    wandb_run, owns_wandb = None, False
+    if not _has_experiment_name(cfg):
+        if is_main:
+            wandb_run, owns_wandb = init_wandb(cfg, run_dir=None)
+        name = getattr(wandb_run, "name", None) or time.strftime("run-%Y%m%d_%H%M%S")
+        name = _sync_run_name(name, is_ddp, is_main, device)
+        cfg.EXPERIMENT_NAME = name
+        if wandb_run is not None:
+            try:
+                wandb_run.config.update({"EXPERIMENT_NAME": name}, allow_val_change=True)
+            except Exception:  # noqa: BLE001
+                pass
+
     run_dir = resolve_run_dir(cfg)
     stages = get_stages(cfg)
 
@@ -182,12 +238,15 @@ def run_pipeline(mode: str = "train", config: Optional[Dict[str, Any]] = None) -
     if start >= len(stages):
         if is_main:
             logger.info(f"all {len(stages)} stage(s) already complete -- nothing to do")
+            finish_wandb(wandb_run, owns_wandb)
         if is_ddp:
             dist.destroy_process_group()
         return {"config": cfg, "run_dir": str(run_dir), "stages": [], "loaders": None}
 
-    # One W&B run for the whole schedule, rank-0 only (reused if a sweep already opened one).
-    wandb_run, owns_wandb = (init_wandb(cfg, run_dir) if is_main else (None, False))
+    # One W&B run for the whole schedule, rank-0 only (already opened above for an
+    # auto-named run; otherwise opened here, reusing a sweep's run if present).
+    if is_main and wandb_run is None:
+        wandb_run, owns_wandb = init_wandb(cfg, run_dir)
 
     last = None
     try:

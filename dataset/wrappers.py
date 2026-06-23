@@ -18,6 +18,10 @@ from typing import Any, Dict
 # Reserved key under DATASETS: overrides applied to *every* dataset (per-dataset
 # keys take precedence). Mirrors the unreflectanything convention.
 ALL_DATASETS_KEY = "ALL_DATASETS"
+# Reserved key under DATASETS: forced overrides applied to *every* dataset that
+# win OVER per-dataset keys (the opposite precedence to ALL_DATASETS). Use it to
+# pin e.g. TARGET_SIZE / MAX_CLIPS across all datasets in one place.
+OVERRIDE_ALL_DATASETS_KEY = "OVERRIDE_ALL_DATASETS"
 
 
 # All readers expose the identical config-driven API (see
@@ -87,6 +91,53 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "POINT_SAMPLE_MODE": "even",
         "QUERY_FRAME": 0,
         "VAL_FRACTION": 0.1,
+        "SPLIT_SEED": 42,
+    },
+    # --- Evaluation-only benchmarks (ground-truth point tracks) -----------
+    # Converted from TAP-Vid pickles by tapvid_data_prep.py.
+    # VAL_FRACTION=1.0 -> all sequences are validation, none are training.
+    "TAPVID_DAVIS": {
+        "ROOT_DIR": "$DATASET_DIR/tapvid_davis/gt_tracks",
+        "READER": _COTRACKER_READER,
+        "CLIP_LEN": None,          # whole sequence as one clip
+        "MAX_POINTS": None,        # keep all GT points (~5 per video)
+        "POINT_SAMPLE_MODE": "even",
+        "QUERY_FRAME": 0,
+        "REQUIRE_VISIBLE_AT_QUERY": False,  # some GT points start occluded
+        "VAL_FRACTION": 1.0,       # eval-only: all sequences -> val
+        "SPLIT_SEED": 42,
+    },
+    "TAPVID_RGB_STACKING": {
+        "ROOT_DIR": "$DATASET_DIR/tapvid_rgb_stacking/gt_tracks",
+        "READER": _COTRACKER_READER,
+        "CLIP_LEN": None,
+        "MAX_POINTS": None,
+        "POINT_SAMPLE_MODE": "even",
+        "QUERY_FRAME": 0,
+        "REQUIRE_VISIBLE_AT_QUERY": False,
+        "VAL_FRACTION": 1.0,
+        "SPLIT_SEED": 42,
+    },
+    "ROBOTAP": {
+        "ROOT_DIR": "$DATASET_DIR/robotap/gt_tracks",
+        "READER": _COTRACKER_READER,
+        "CLIP_LEN": None,
+        "MAX_POINTS": None,
+        "POINT_SAMPLE_MODE": "even",
+        "QUERY_FRAME": 0,
+        "REQUIRE_VISIBLE_AT_QUERY": False,
+        "VAL_FRACTION": 1.0,
+        "SPLIT_SEED": 42,
+    },
+    "ENDOTAPP_GT": {
+        "ROOT_DIR": "$DATASET_DIR/EndoTAPP/gt_tracks",
+        "READER": _COTRACKER_READER,
+        "CLIP_LEN": None,
+        "MAX_POINTS": None,
+        "POINT_SAMPLE_MODE": "even",
+        "QUERY_FRAME": 0,
+        "REQUIRE_VISIBLE_AT_QUERY": False,
+        "VAL_FRACTION": 1.0,
         "SPLIT_SEED": 42,
     },
 }

@@ -22,6 +22,8 @@ import ast
 import copy
 import importlib
 import inspect
+import math
+import os
 from typing import Any, Dict, List, Optional
 
 import yaml
@@ -29,7 +31,12 @@ from torch.utils.data import ConcatDataset, DataLoader
 
 from dataset.collate import is_fixed_shape, pad_collate
 from dataset.splits import split_sequences
-from dataset.wrappers import ALL_DATASETS_KEY, DATASET_DEFAULTS, reader_class_for
+from dataset.wrappers import (
+    ALL_DATASETS_KEY,
+    DATASET_DEFAULTS,
+    OVERRIDE_ALL_DATASETS_KEY,
+    reader_class_for,
+)
 from utilities.env import expand_path
 from utilities.log import get_logger
 
@@ -114,15 +121,20 @@ def load_and_process_config(
     config: Optional[Dict[str, Any]] = None,
     unknown_args: Optional[List[str]] = None,
     boot_mode: bool = False,
+    smoke_mode: bool = False,
 ) -> "DotMap":
-    """Load a YAML config (or accept a dict), apply CLI overrides + boot mode.
+    """Load a YAML config (or accept a dict), apply CLI overrides + boot/smoke mode.
 
     Args:
         config_path: path to a ``parameters: {KEY: {value: ...}}`` YAML.
         config: a flat ``{KEY: value}`` dict (e.g. ``wandb.config``); if given,
             ``config_path`` is ignored.
         unknown_args: leftover ``--KEY=value`` / ``--KEY value`` CLI tokens.
-        boot_mode: shrink batch/epochs/datasets for a quick smoke test.
+        boot_mode: force the no-download CNN encoder + a shrunk model and shrink
+            batch/epochs/datasets — a CPU-login-node sanity run.
+        smoke_mode: run the *real* config end to end on a tiny volume — 1 epoch,
+            batch size 1, very few train/val iterations and clips. OR-ed with the
+            config's own ``SMOKE`` flag, so it can be set either way.
     """
     if config is not None:
         config_dict = dict(config)
@@ -199,6 +211,32 @@ def load_and_process_config(
             mc.setdefault("TRANSITION", {}).update({"DEPTH": 1, "HEADS": 2})
         logger.info("boot mode: minimal batch/epochs/datasets + cnn encoder for a quick smoke test")
 
+    # Smoke mode: the *real* config (real encoder/model) run on a tiny volume to
+    # verify the full pipeline end to end. Triggered by ``-s/--smoke`` OR a config
+    # ``SMOKE: true``. Unlike boot it does NOT swap the encoder or shrink the model.
+    smoke = bool(smoke_mode) or bool(config_dict.get("SMOKE", False))
+    config_dict["SMOKE"] = smoke
+    if smoke:
+        n_train = int(config_dict.get("SMOKE_TRAIN_STEPS", 2))  # train iters in the single epoch
+        n_val = int(config_dict.get("SMOKE_VAL_STEPS", 2))      # val iters after it
+        config_dict["EPOCHS"] = 1
+        config_dict["BATCH_SIZE"] = 1
+        config_dict["MAX_STEPS_PER_EPOCH"] = n_train            # engine train-loop cap
+        config_dict["MAX_VAL_STEPS"] = n_val                    # engine val-loop cap
+        config_dict["VAL_EVERY"] = 1
+        config_dict["WARMUP_EPOCHS"] = 0
+        config_dict["EARLY_STOP_PATIENCE"] = 0
+        n_clips = max(n_train, n_val, 1)
+        for name, dcfg in (config_dict.get("DATASETS") or {}).items():
+            if isinstance(dcfg, dict):
+                # keep just enough sequences for a train+val split, and very few clips
+                dcfg["MAX_SEQUENCES"] = min(dcfg.get("MAX_SEQUENCES") or 4, 4)
+                dcfg["MAX_CLIPS"] = min(dcfg.get("MAX_CLIPS") or n_clips, n_clips)
+        logger.info(
+            f"smoke mode: 1 epoch, batch=1, {n_train} train / {n_val} val iters, "
+            f"<= {n_clips} clips per dataset (real model/encoder kept)"
+        )
+
     return DotMap(config_dict)
 
 
@@ -217,10 +255,14 @@ STAGE_NAME_KEY = "STAGE_NAME"
 
 
 def get_stages(config: "DotMap") -> List[dict]:
-    """Ordered list of stage-override dicts. One implicit stage if no ``STAGES``."""
+    """Ordered list of stage-override dicts. One implicit (unnamed) stage if no
+    ``STAGES`` -- its ``STAGE_NAME`` then falls back to the generic ``stage{idx}``
+    (``"stage0"``) rather than the run name, so per-phase namespacing (W&B video /
+    perf keys, the stage dir) never embeds ``EXPERIMENT_NAME``.
+    """
     stages = config.get("STAGES")
     if not stages:
-        return [{"NAME": config.get("EXPERIMENT_NAME", "stage0")}]
+        return [{}]
     return [_as_dict(s) for s in stages]
 
 
@@ -239,7 +281,7 @@ def resolve_stage_config(config: "DotMap", stage_idx: int) -> "DotMap":
     merged = {**copy.deepcopy(base), **copy.deepcopy(stages[stage_idx])}
     merged[STAGE_INDEX_KEY] = stage_idx
     merged[STAGE_NAME_KEY] = stages[stage_idx].get("NAME", f"stage{stage_idx}")
-    merged.setdefault("EXPERIMENT_NAME", config.get("EXPERIMENT_NAME", "run"))
+    merged.setdefault("EXPERIMENT_NAME", config.get("EXPERIMENT_NAME"))
     return DotMap(merged)
 
 
@@ -277,10 +319,11 @@ def create_datasets_from_config(
 ) -> Dict[str, Any]:
     """Build train / val / test datasets from ``config.DATASETS``.
 
-    For each dataset: merge ``DATASET_DEFAULTS`` < ``ALL_DATASETS`` overrides <
-    per-dataset config; resolve the reader + root; split sequences (explicit
-    lists or fractional+seed); instantiate the train and val readers. Validation
-    forces deterministic point sampling for reproducible metrics.
+    For each dataset: merge ``DATASET_DEFAULTS`` < ``ALL_DATASETS`` < per-dataset
+    config < ``OVERRIDE_ALL_DATASETS`` (the last wins, forcing a value across every
+    dataset); resolve the reader + root; split sequences (explicit lists or
+    fractional+seed); instantiate the train and val readers. Validation forces
+    deterministic point sampling for reproducible metrics.
 
     Returns ``{"Training", "Validation", "Test", "workers"}`` where each split
     is a ``ConcatDataset`` (or ``None``).
@@ -291,11 +334,15 @@ def create_datasets_from_config(
 
     all_overrides = _as_dict(datasets_cfg.get(ALL_DATASETS_KEY))
     if all_overrides:
-        logger.info(f"applying ALL_DATASETS overrides: {all_overrides}")
+        logger.info(f"applying ALL_DATASETS overrides (per-dataset wins): {all_overrides}")
+    forced_overrides = _as_dict(datasets_cfg.get(OVERRIDE_ALL_DATASETS_KEY))
+    if forced_overrides:
+        logger.info(f"applying OVERRIDE_ALL_DATASETS (forced, wins over per-dataset): {forced_overrides}")
 
+    _reserved = {ALL_DATASETS_KEY, OVERRIDE_ALL_DATASETS_KEY}
     names = dataset_names or [
         n for n, c in datasets_cfg.items()
-        if n != ALL_DATASETS_KEY and isinstance(_as_dict(c), dict) and _as_dict(c)
+        if n not in _reserved and isinstance(_as_dict(c), dict) and _as_dict(c)
     ]
     if not names:
         raise ValueError("no datasets listed under DATASETS")
@@ -304,10 +351,11 @@ def create_datasets_from_config(
     logger.info(f"building {len(names)} dataset(s): {names}")
 
     for name in names:
-        # merge: registry defaults < ALL_DATASETS < per-dataset
+        # merge: registry defaults < ALL_DATASETS < per-dataset < OVERRIDE_ALL_DATASETS
         merged = dict(DATASET_DEFAULTS.get(name, {}))
         merged.update(all_overrides)
         merged.update(_as_dict(datasets_cfg.get(name)))
+        merged.update(forced_overrides)
 
         reader_cls = reader_class_for(name, merged)
         root = expand_path(merged.get("ROOT_DIR", f"$DATASET_DIR/{name}"))
@@ -367,6 +415,25 @@ def _collate_for(dataset):
     return None if all(is_fixed_shape(s) for s in sets) else pad_collate
 
 
+def _compute_num_workers(config: "DotMap", is_ddp: bool) -> tuple[int, str]:
+    """Return (num_workers, source_label) for DataLoader.
+
+    DDP: use explicit config value.
+    Single GPU + no explicit WORKERS: auto-detect from CPU affinity (90% of cores).
+    """
+    explicit = config.get("WORKERS", None)
+    if is_ddp:
+        n = int(explicit if explicit is not None else 4)
+        return n, "DDP config"
+    if explicit is not None:
+        return int(explicit), "config"
+    try:
+        affinity = os.sched_getaffinity(os.getpid())
+        return int(math.floor(0.9 * len(affinity))), "cpu_affinity auto"
+    except Exception:
+        return 4, "default"
+
+
 def build_dataloaders(
     config: "DotMap",
     datasets: Dict[str, Any],
@@ -384,8 +451,9 @@ def build_dataloaders(
     from torch.utils.data.distributed import DistributedSampler
 
     batch_size = int(config.get("BATCH_SIZE", 4))
-    workers = int(datasets.get("workers", config.get("WORKERS", 4)))
     is_ddp = world_size > 1
+    workers, workers_src = _compute_num_workers(config, is_ddp)
+    logger.info(f"DataLoader workers={workers} ({workers_src})")
     loaders: Dict[str, Any] = {}
 
     specs = [("train", "Training", True), ("val", "Validation", False), ("test", "Test", False)]
@@ -394,6 +462,7 @@ def build_dataloaders(
         if ds is None or len(ds) == 0:
             loaders[key] = None
             continue
+        prefetch = config.get("PREFETCH_FACTOR", 2) if workers > 0 else None
         if is_ddp:
             sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank,
                                         shuffle=is_train, drop_last=is_train)
@@ -406,6 +475,7 @@ def build_dataloaders(
                 drop_last=False,     # DistributedSampler handles drop_last
                 pin_memory=config.get("PIN_MEMORY", False),
                 persistent_workers=workers > 0,
+                prefetch_factor=prefetch,
                 collate_fn=_collate_for(ds),
             )
         else:
@@ -417,6 +487,7 @@ def build_dataloaders(
                 drop_last=is_train and len(ds) >= batch_size,
                 pin_memory=config.get("PIN_MEMORY", False),
                 persistent_workers=workers > 0,
+                prefetch_factor=prefetch,
                 collate_fn=_collate_for(ds),
             )
     return loaders

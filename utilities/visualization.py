@@ -347,17 +347,21 @@ def render_comparison_frames(
     pred_visibility=None,                    # (T, N)
     *,
     max_points: Optional[int] = 64,
-    point_size: float = 30.0,
+    point_size: float = 6.0,
     cmap: str = "rainbow",
     dpi: int = 80,
+    out_size: Optional[int] = None,
     title: Optional[str] = None,
     draw_error: bool = True,
 ) -> np.ndarray:
     """Render a pred-vs-GT comparison clip to a ``(T, 3, H, W)`` uint8 array.
 
     A non-interactive (Agg) sibling of :func:`animate_comparison` that returns the
-    rendered RGB frames directly — the shape ``wandb.Video`` wants — instead of a
-    ``FuncAnimation``. The engine logs the result with ``wandb.Video(arr, fps=...)``.
+    rendered RGB frames directly — the per-frame RGB the engine logs one frame at a
+    time (paired with a ``viz/frame_number`` slider metric on W&B).
+
+    ``out_size`` forces an exact square ``out_size x out_size`` pixel canvas
+    (overrides ``dpi``); leave it ``None`` to keep the source aspect ratio at ``dpi``.
     """
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
@@ -376,7 +380,10 @@ def render_comparison_frames(
     colors = _point_colors(gt, cmap)                     # shared identity colours
 
     h, w = imgs.shape[1], imgs.shape[2]
-    fig = Figure(figsize=(w / 100.0, h / 100.0), dpi=dpi)
+    if out_size is not None:                             # exact out_size x out_size px
+        fig = Figure(figsize=(1.0, 1.0), dpi=int(out_size))
+    else:
+        fig = Figure(figsize=(w / 100.0, h / 100.0), dpi=dpi)
     canvas = FigureCanvasAgg(fig)
     ax = fig.add_axes([0, 0, 1, 1])
 
@@ -395,3 +402,69 @@ def render_comparison_frames(
         buf = np.asarray(canvas.buffer_rgba())[..., :3]  # (Hp,Wp,3) uint8
         out.append(np.transpose(buf.copy(), (2, 0, 1)))  # (3,Hp,Wp)
     return np.stack(out, axis=0)                         # (T,3,Hp,Wp) uint8
+
+
+def render_track_frames(
+    frames,                                  # (T,3,H,W) or (T,H,W,3)
+    tracks,                                  # (T, N, 2) x,y px
+    visibility=None,                         # (T, N) bool
+    *,
+    max_points: Optional[int] = 64,
+    point_size: float = 5.0,
+    linewidth: float = 1.2,
+    tail: int = 12,
+    cmap: str = "rainbow",
+    dpi: int = 80,
+    out_size: Optional[int] = None,
+    title: Optional[str] = None,
+    show_occluded: bool = True,
+) -> np.ndarray:
+    """Render *tracks* (per-point fading motion trails) to ``(T, 3, H, W)`` uint8.
+
+    The Agg/array sibling of :func:`animate_tracks` — used to log the **predicted
+    tracks** (not just per-frame points): each point trails its last ``tail``
+    positions so the motion path is visible. Frames are emitted one at a time for
+    the W&B ``viz/frame_number`` slider. ``out_size`` forces an exact square canvas.
+    """
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.collections import LineCollection
+    from matplotlib.figure import Figure
+
+    imgs = _frames_to_hwc_uint8(frames)                  # (T,H,W,3)
+    pos = _to_numpy(tracks).astype(np.float32)           # (T,N,2)
+    t, n = pos.shape[0], pos.shape[1]
+    vis = _to_numpy(visibility).astype(bool) if visibility is not None else np.ones((t, n), bool)
+    if max_points is not None and max_points < n:
+        sel = np.linspace(0, n - 1, max_points).round().astype(int)
+        pos, vis, n = pos[:, sel], vis[:, sel], max_points
+    base_rgb = _point_colors(pos, cmap)[:, :3]           # (N,3)
+
+    h, w = imgs.shape[1], imgs.shape[2]
+    if out_size is not None:
+        fig = Figure(figsize=(1.0, 1.0), dpi=int(out_size))
+    else:
+        fig = Figure(figsize=(w / 100.0, h / 100.0), dpi=dpi)
+    canvas = FigureCanvasAgg(fig)
+    ax = fig.add_axes([0, 0, 1, 1])
+
+    out = []
+    for ti in range(t):
+        ax.clear()
+        ax.imshow(imgs[ti])
+        ax.set_xlim(0, w); ax.set_ylim(h, 0); ax.axis("off")
+        # fading trails over the last `tail` frames
+        s = max(0, ti - tail)
+        segs = [pos[s:ti + 1, i, :] for i in range(n)]
+        tails = LineCollection(segs, linewidths=linewidth, capstyle="round",
+                               colors=np.concatenate([base_rgb, np.full((n, 1), 0.7)], axis=1))
+        ax.add_collection(tails)
+        rgba = np.concatenate([base_rgb, np.ones((n, 1))], axis=1)
+        rgba[~vis[ti], 3] = 0.25 if show_occluded else 0.0
+        ax.scatter(pos[ti, :, 0], pos[ti, :, 1], s=point_size, c=rgba,
+                   edgecolors="white", linewidths=0.4)
+        if title:
+            ax.set_title(f"{title} | {ti + 1}/{t}", fontsize=8)
+        canvas.draw()
+        buf = np.asarray(canvas.buffer_rgba())[..., :3]
+        out.append(np.transpose(buf.copy(), (2, 0, 1)))
+    return np.stack(out, axis=0)                         # (T,3,out,out) uint8

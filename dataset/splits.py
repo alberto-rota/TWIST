@@ -57,8 +57,11 @@ def split_sequences(
         return train, val
 
     # Fractional, deterministic split.
-    if not (0.0 <= val_fraction < 1.0):
-        raise ValueError(f"val_fraction must be in [0, 1), got {val_fraction}")
+    if not (0.0 <= val_fraction <= 1.0):
+        raise ValueError(f"val_fraction must be in [0, 1], got {val_fraction}")
+    # val_fraction=1.0: all sequences to val, nothing to train (eval-only datasets).
+    if val_fraction == 1.0:
+        return [], list(allset)
     order = np.array(sorted(allset))
     rng = np.random.default_rng(seed)
     perm = rng.permutation(len(order))
