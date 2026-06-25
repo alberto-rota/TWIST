@@ -172,21 +172,36 @@ class BaseTracksDataset(torch.utils.data.Dataset):
         return frames, depths, tracks, queries
 
     def _apply_resize(self, frames, depths, tracks, queries, cur_hw):
+        """Aspect-preserving resize-to-cover the target, **then** center-crop to it.
+
+        Uniform-scales (single factor, so no aspect distortion) until the frame
+        *covers* ``target_size``, then center-crops to exactly ``target_size``.
+        Track coordinates follow the same scale + crop offset. (The previous
+        version anisotropically squashed straight to the target, distorting any
+        non-square source — e.g. 540x960 -> 448x448 — which is the aspect-ratio
+        warping seen on PointOdyssey / DAVIS clips.)
+        """
         th, tw = self.target_size
         ch, cw = cur_hw
-        sx, sy = tw / cw, th / ch
-        scale = tracks.new_tensor([sx, sy])                  # (2,)
-        tracks = tracks * scale                               # (T, N, 2)
+        s = max(th / ch, tw / cw)                            # uniform cover scale
+        rh, rw = max(int(round(ch * s)), th), max(int(round(cw * s)), tw)  # resized size
+        oy, ox = (rh - th) // 2, (rw - tw) // 2              # center-crop offsets
+        # use the *actual* per-axis ratio (rounding rh/rw makes it differ from s
+        # by <1px) so coords stay registered to the resized pixels, then offset.
+        scale = tracks.new_tensor([rw / cw, rh / ch])        # (2,)
+        off = tracks.new_tensor([ox, oy])                    # (2,)
+        tracks = tracks * scale - off                         # (T, N, 2)
         queries = queries.clone()
-        queries[:, 1:] = queries[:, 1:] * scale              # (N, 3)
-        if frames is not None:  # (T, H, W, 3) np uint8 -> torch resize
+        queries[:, 1:] = queries[:, 1:] * scale - off        # (N, 3)
+        if frames is not None:  # (T, H, W, 3) np uint8 -> resize-to-cover -> crop
             f = torch.from_numpy(np.ascontiguousarray(frames)).permute(0, 3, 1, 2).float()  # (T,3,H,W)
-            f = F.interpolate(f, size=(th, tw), mode="bilinear", align_corners=False)
+            f = F.interpolate(f, size=(rh, rw), mode="bilinear", align_corners=False)
+            f = f[:, :, oy:oy + th, ox:ox + tw]                                             # center crop
             frames = f.round().clamp(0, 255).to(torch.uint8).permute(0, 2, 3, 1).numpy()    # (T,th,tw,3)
         if depths is not None:
             d = torch.from_numpy(np.ascontiguousarray(depths)).unsqueeze(1)                 # (T,1,H,W)
-            d = F.interpolate(d, size=(th, tw), mode="nearest").squeeze(1)                  # (T,th,tw)
-            depths = d.numpy()
+            d = F.interpolate(d, size=(rh, rw), mode="nearest").squeeze(1)                  # (T,rh,rw)
+            depths = d[:, oy:oy + th, ox:ox + tw].numpy()                                   # center crop
         return frames, depths, tracks, queries, (th, tw)
 
     # ------------------------------------------------------------------ #
@@ -216,7 +231,10 @@ class BaseTracksDataset(torch.utils.data.Dataset):
             [torch.full_like(tracks[q, :, :1], float(q)), tracks[q]], dim=-1
         )  # (N, 3)
 
-        # ---- geometry: crop -> resize (coords follow) ----
+        # ---- geometry: (optional manual crop) -> resize-to-cover + center-crop ----
+        # The manual ``crop`` selects a native-pixel region (e.g. trimming endoscope
+        # borders); the target resize then preserves aspect ratio (resize-to-cover
+        # then center-crop) instead of squashing. Coords follow both transforms.
         cur_hw = tuple(native_hw) if native_hw is not None else None
         if self.crop is not None:
             frames, depths, tracks, queries = self._apply_crop(frames, depths, tracks, queries)

@@ -175,10 +175,11 @@ class CoTrackerTracksDataset(BaseTracksDataset):
                         and per_video.get(vid, 0) >= int(self.max_clips_per_video)):
                     break
                 ci = per_video.get(vid, 0)
-                entries.append(
-                    dict(video=vid, clip_idx=ci, path=e["path"],
-                         start=int(start), clip_len=int(clip_t))
-                )
+                ce = dict(video=vid, clip_idx=ci, path=e["path"],
+                          start=int(start), clip_len=int(clip_t))
+                if e.get("num_points") is not None:  # lets collate detect fixed N
+                    ce["num_points"] = int(e["num_points"])
+                entries.append(ce)
                 per_video[vid] = ci + 1
 
         if self.max_sequences is not None:

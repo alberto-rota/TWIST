@@ -378,7 +378,9 @@ def create_datasets_from_config(
 
         kw = _reader_kwargs(merged, reader_cls)
         if train_seqs:
-            train_sets.append(reader_cls(root=root, include=train_seqs, **kw))
+            tr = reader_cls(root=root, include=train_seqs, **kw)
+            tr.dataset_name = name                      # for per-dataset viz / logging
+            train_sets.append(tr)
             logger.info(
                 f"  ✓ {name} train: {len(train_seqs)} seqs -> {len(train_sets[-1])} clips"
                 f"  (N={kw.get('max_points')}, clip_len={kw.get('clip_len')})"
@@ -387,7 +389,9 @@ def create_datasets_from_config(
             val_kw = dict(kw)
             if val_kw.get("point_sample_mode") == "random":
                 val_kw["point_sample_mode"] = "even"  # reproducible val metrics
-            val_sets.append(reader_cls(root=root, include=val_seqs, **val_kw))
+            vl = reader_cls(root=root, include=val_seqs, **val_kw)
+            vl.dataset_name = name                      # so the engine logs >=1 viz clip per dataset
+            val_sets.append(vl)
             logger.info(
                 f"  ✓ {name} val:   {len(val_seqs)} seqs -> {len(val_sets[-1])} clips"
             )
@@ -568,9 +572,9 @@ def create_model_from_config(config: "DotMap", device, verbose: bool = True):
 
 
 def create_loss_from_config(config: "DotMap", device=None):
-    """Build the training loss from ``config.MODEL.LOSS``."""
+    """Build the training loss from the top-level ``config.LOSS`` block."""
     mc = _as_dict(config.get("MODEL"))
-    lc = _as_dict(mc.get("LOSS"))
+    lc = _as_dict(config.get("LOSS"))
     models_module = importlib.import_module(mc.get("MODEL_MODULE", "models"))
     loss = models_module.TrackerLoss(
         pos_weight=float(lc.get("POS_WEIGHT", 10.0)),

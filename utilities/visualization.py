@@ -55,6 +55,32 @@ def _frames_to_hwc_uint8(frames) -> np.ndarray:
     return f
 
 
+def _present_mask(pos, vis, hw=None, eps: float = 1e-3) -> np.ndarray:
+    """``(T, N)`` bool: where each point has a *real* position to draw.
+
+    A point queried/born mid-clip (or that has already left) stores a padding
+    **sentinel** in those frames -- either the ``(0, 0)`` origin or, once a resize
+    has shifted it, an off-frame coordinate -- always with ``visibility == False``.
+    Drawing those snaps the marker/trail to the top-left corner. A slot counts as
+    *present* when the point is **visible**, or when it is occluded **but** still
+    carries a genuine in-frame position (Kubric / PointOdyssey keep real coords
+    through occlusion, which we still want to show as hollow rings).
+
+    Shapes: ``pos (T, N, 2)``, ``vis (T, N)``; ``hw=(H, W)`` enables the off-frame
+    sentinel test (skip it when frame size is unknown).
+    """
+    pos = _to_numpy(pos).astype(np.float32)                      # (T, N, 2)
+    vis = _to_numpy(vis).astype(bool)                            # (T, N)
+    at_origin = np.abs(pos).sum(-1) < eps                        # (T, N) the (0,0) sentinel
+    sentinel = at_origin
+    if hw is not None:
+        H, W = hw
+        off = ((pos[..., 0] < 0) | (pos[..., 0] >= W)
+               | (pos[..., 1] < 0) | (pos[..., 1] >= H))         # (T, N)
+        sentinel = sentinel | off
+    return vis | ~sentinel                                       # (T, N) drawable
+
+
 def _point_colors(tracks: np.ndarray, cmap: str) -> np.ndarray:
     """One RGBA colour per point, by initial x-position -> horizontal rainbow.
 
@@ -68,6 +94,28 @@ def _point_colors(tracks: np.ndarray, cmap: str) -> np.ndarray:
     return mpl.colormaps[cmap](norm(x0))             # (N, 4)
 
 
+def _draw_markers(ax, points, colors, visibility=None, *, marker: str = "o",
+                  size: float = 20.0, edge_lw: float = 0.5, show_occluded: bool = True):
+    """Scatter one marker layer with visibility encoded by *fill*, not opacity.
+
+    Visible points are **filled** with their identity colour; occluded points are
+    drawn **edge-only** (transparent fill, coloured outline) so they read as a
+    hollow ring of the same colour. ``show_occluded=False`` drops occluded points
+    entirely. ``colors`` is an ``(N, 4)`` per-identity RGBA array.
+    """
+    pts = _to_numpy(points).astype(np.float32)        # (N, 2)
+    n = pts.shape[0]
+    rgb = _to_numpy(colors)[:, :3]                    # (N, 3) identity colour
+    vis = (_to_numpy(visibility).astype(bool) if visibility is not None
+           else np.ones(n, dtype=bool))
+    face_a = vis.astype(np.float32)                   # 1 where visible, 0 (hollow) where occluded
+    edge_a = np.ones(n, np.float32) if show_occluded else face_a
+    face = np.concatenate([rgb, face_a[:, None]], axis=1)   # (N, 4)
+    edge = np.concatenate([rgb, edge_a[:, None]], axis=1)   # (N, 4)
+    ax.scatter(pts[:, 0], pts[:, 1], s=size, marker=marker,
+               facecolors=face, edgecolors=edge, linewidths=edge_lw)
+
+
 # --------------------------------------------------------------------------- #
 # Static single-frame rendering
 # --------------------------------------------------------------------------- #
@@ -78,25 +126,39 @@ def draw_tracks_on_frame(
     ax=None,
     colors: Optional[np.ndarray] = None,
     cmap: str = "rainbow",
-    point_size: float = 40.0,
+    point_size: float = 0.03,                # Percentage of image height (default 5%)
+    marker: str = "o",
     show_occluded: bool = True,
 ):
-    """Draw one frame with its points; returns the Matplotlib ``Axes``."""
+    """Draw one frame with its points; returns the Matplotlib ``Axes``.
+
+    Visible points are filled, occluded points are drawn edge-only (hollow ring)
+    — see :func:`_draw_markers`.
+    
+    point_size: size of points as a fraction of image height (e.g., 0.05 = 5%).
+    """
     import matplotlib.pyplot as plt
 
     img = _frames_to_hwc_uint8(frame[None])[0]       # (H, W, 3)
     pts = _to_numpy(points).astype(np.float32)       # (N, 2)
     if colors is None:
         colors = _point_colors(pts[None], cmap)      # (N, 4)
-    rgba = colors.copy()
-    if visibility is not None:
-        vis = _to_numpy(visibility).astype(bool)     # (N,)
-        rgba[~vis, 3] = 0.25 if show_occluded else 0.0
 
     if ax is None:
         _, ax = plt.subplots(figsize=(img.shape[1] / 100, img.shape[0] / 100))
+    # Compute marker size as a percentage of image height in points^2
+    H = img.shape[0]
+    # Set the marker diameter in pixels as percentage of H, then convert to points^2
+    marker_diameter_pixels = point_size * H
+    # Conversion to marker 'size' (points^2) for scatter:
+    # 1 pixel ≈ 0.75 points (matplotlib), area in points^2
+    # Use area = π*(radius_in_points)^2; marker_diameter_pixels in points ≈ marker_diameter_pixels*0.75
+    marker_radius_points = 0.5 * marker_diameter_pixels * 0.75
+    point_size = (marker_radius_points ** 2) * 3.14159  # π*radius^2
+
     ax.imshow(img)
-    ax.scatter(pts[:, 0], pts[:, 1], s=point_size, c=rgba, edgecolors="white", linewidths=0.4)
+    _draw_markers(ax, pts, colors, visibility, marker=marker,
+                  size=point_size, show_occluded=show_occluded)
     ax.set_xlim(0, img.shape[1])
     ax.set_ylim(img.shape[0], 0)
     ax.axis("off")
@@ -112,8 +174,8 @@ def animate_tracks(
     visibility=None,                        # (T, N) bool
     *,
     tail: int = 10,
-    point_size: float = 20.0,
-    linewidth: float = 1.5,
+    point_size: float = 10.0,
+    linewidth: float = 0.75,
     max_points: Optional[int] = None,
     cmap: str = "rainbow",
     fps: int = 10,
@@ -148,6 +210,10 @@ def animate_tracks(
         pos, vis, N = pos[:, sel], vis[:, sel], max_points
 
     H, W = imgs.shape[1], imgs.shape[2]
+    # NaN out padding/sentinel slots so they never anchor a marker or trail to (0,0)
+    present = _present_mask(pos, vis, hw=(H, W))                  # (T, N) bool
+    pos_draw = pos.copy()
+    pos_draw[~present] = np.nan                                   # (T, N, 2)
     base_rgb = _point_colors(pos, cmap)[:, :3]       # (N, 3)
 
     if figsize is None:
@@ -161,8 +227,7 @@ def animate_tracks(
     im = ax.imshow(imgs[0])
     tails = LineCollection([], linewidths=linewidth, capstyle="round")
     ax.add_collection(tails)
-    scat = ax.scatter(pos[0, :, 0], pos[0, :, 1], s=point_size,
-                      edgecolors="white", linewidths=0.4)
+    scat = ax.scatter(pos_draw[0, :, 0], pos_draw[0, :, 1], s=point_size, linewidths=0.5)
     txt = ax.text(0.01, 0.99, "", transform=ax.transAxes, va="top", ha="left",
                   color="white", fontsize=10,
                   bbox=dict(facecolor="black", alpha=0.4, pad=2, edgecolor="none"))
@@ -170,15 +235,20 @@ def animate_tracks(
     def update(t: int):
         im.set_data(imgs[t])
 
-        # markers: colour by id, alpha by visibility
-        rgba = np.concatenate([base_rgb, np.ones((N, 1))], axis=1)   # (N, 4)
-        rgba[~vis[t], 3] = 0.25 if show_occluded else 0.0
-        scat.set_offsets(pos[t])                                     # (N, 2)
-        scat.set_facecolors(rgba)
+        # markers: colour by id; visible -> filled, occluded -> edge-only (hollow).
+        # padding/sentinel slots are NaN in pos_draw, so scatter skips them entirely.
+        face_a = vis[t].astype(np.float32)
+        edge_a = np.ones(N, np.float32) if show_occluded else face_a
+        face = np.concatenate([base_rgb, face_a[:, None]], axis=1)   # (N, 4)
+        edge = np.concatenate([base_rgb, edge_a[:, None]], axis=1)   # (N, 4)
+        scat.set_offsets(pos_draw[t])                                # (N, 2), NaN where absent
+        scat.set_facecolors(face)
+        scat.set_edgecolors(edge)
 
-        # fading motion trails over the last `tail` frames
+        # fading motion trails over the last `tail` frames; NaN sentinel vertices
+        # break the polyline, so a trail never reaches back into padding (0, 0)
         s = max(0, t - tail)
-        segs = [pos[s:t + 1, i, :] for i in range(N)]                # list of (<=tail+1, 2)
+        segs = [pos_draw[s:t + 1, i, :] for i in range(N)]           # list of (<=tail+1, 2)
         tail_rgba = np.concatenate([base_rgb, np.full((N, 1), 0.6)], axis=1)
         tails.set_segments(segs)
         tails.set_color(tail_rgba)
@@ -228,33 +298,46 @@ def overlay_tracks_on_frame(
     ax=None,
     colors: Optional[np.ndarray] = None,
     cmap: str = "rainbow",
-    point_size: float = 40.0,
+    point_size: float = 20.0,
     show_occluded: bool = True,
     draw_error: bool = True,
 ):
-    """Overlay GT (circles) and predicted (×) points on one frame.
+    """Overlay GT (triangles △) and predicted (circles ○) points on one frame.
 
-    Points share a per-identity colour; GT are circles, predictions are crosses,
-    and a thin line connects each GT→prediction (the endpoint error). Reuses
-    :func:`draw_tracks_on_frame` for the GT layer.
+    Points share a per-identity colour; the **prediction is a circle** and the
+    **GT is a triangle**, and a thin line connects each GT→prediction (the
+    endpoint error). For both layers visibility is shown by *fill*: visible points
+    are filled, occluded points are edge-only (hollow). Reuses
+    :func:`draw_tracks_on_frame` for the GT (triangle) layer.
     """
-    gt = _to_numpy(gt_points).astype(np.float32)
-    pr = _to_numpy(pred_points).astype(np.float32)
+    import matplotlib.pyplot as plt
+
+    img = _frames_to_hwc_uint8(frame[None])[0]           # (H, W, 3)
+    gt = _to_numpy(gt_points).astype(np.float32)         # (N, 2)
+    pr = _to_numpy(pred_points).astype(np.float32)       # (N, 2)
     if colors is None:
         colors = _point_colors(gt[None], cmap)           # (N, 4) shared identity colours
-    ax = draw_tracks_on_frame(
-        frame, gt, visibility=gt_visibility, ax=ax, colors=colors,
-        point_size=point_size, show_occluded=show_occluded,
-    )
+    if ax is None:
+        _, ax = plt.subplots(figsize=(img.shape[1] / 100, img.shape[0] / 100))
+
+    # Draw the frame ONCE here, then both layers via `_draw_markers` so GT and
+    # pred share the same raw scatter-area `point_size` semantics. (Routing the
+    # GT layer through `draw_tracks_on_frame` reinterpreted `point_size` as a
+    # fraction of image height, blowing the GT triangles up to cover the frame.)
+    ax.imshow(img)
+    # GT layer: triangles (filled where visible, hollow where occluded)
+    _draw_markers(ax, gt, colors, gt_visibility, marker="^",
+                  size=point_size, show_occluded=show_occluded)
     if draw_error:
         for i in range(gt.shape[0]):
             ax.plot([gt[i, 0], pr[i, 0]], [gt[i, 1], pr[i, 1]],
-                    color=colors[i], linewidth=0.5, alpha=0.6)
-    rgba = colors.copy()
-    if pred_visibility is not None:
-        vis = _to_numpy(pred_visibility).astype(bool)
-        rgba[~vis, 3] = 0.25 if show_occluded else 0.0
-    ax.scatter(pr[:, 0], pr[:, 1], s=point_size, c=rgba, marker="x", linewidths=1.2)
+                    color=colors[i], linewidth=0.4, alpha=0.5)
+    # prediction layer: circles (filled where visible, hollow where occluded)
+    _draw_markers(ax, pr, colors, pred_visibility, marker="o",
+                  size=point_size, show_occluded=show_occluded)
+    ax.set_xlim(0, img.shape[1])
+    ax.set_ylim(img.shape[0], 0)
+    ax.axis("off")
     return ax
 
 
@@ -265,7 +348,7 @@ def animate_comparison(
     gt_visibility=None,                      # (T, N)
     pred_visibility=None,                    # (T, N)
     *,
-    point_size: float = 40.0,
+    point_size: float = 20.0,
     max_points: Optional[int] = None,
     cmap: str = "rainbow",
     fps: int = 10,
@@ -275,7 +358,7 @@ def animate_comparison(
     draw_error: bool = True,
     save_path: Optional[str] = None,
 ):
-    """Animate predicted (×) vs ground-truth (circles) tracks over a clip.
+    """Animate predicted (circles ○) vs ground-truth (triangles △) tracks over a clip.
 
     Returns a ``matplotlib.animation.FuncAnimation`` (render with ``.to_jshtml()``).
     """
@@ -310,7 +393,7 @@ def animate_comparison(
             pred_visibility=pv[ti] if pv is not None else None,
             ax=ax, colors=colors, point_size=point_size, draw_error=draw_error,
         )
-        label = f"frame {ti + 1}/{t}  (○ GT  × pred)"
+        label = f"frame {ti + 1}/{t}  (○ pred  △ GT)"
         ax.set_title(f"{title} | {label}" if title else label, fontsize=9)
         return ()
 
@@ -347,7 +430,7 @@ def render_comparison_frames(
     pred_visibility=None,                    # (T, N)
     *,
     max_points: Optional[int] = 64,
-    point_size: float = 6.0,
+    point_size: float = 1.5,
     cmap: str = "rainbow",
     dpi: int = 80,
     out_size: Optional[int] = None,
@@ -410,8 +493,8 @@ def render_track_frames(
     visibility=None,                         # (T, N) bool
     *,
     max_points: Optional[int] = 64,
-    point_size: float = 5.0,
-    linewidth: float = 1.2,
+    point_size: float = 1.25,
+    linewidth: float = 0.6,
     tail: int = 12,
     cmap: str = "rainbow",
     dpi: int = 80,
@@ -438,8 +521,13 @@ def render_track_frames(
         sel = np.linspace(0, n - 1, max_points).round().astype(int)
         pos, vis, n = pos[:, sel], vis[:, sel], max_points
     base_rgb = _point_colors(pos, cmap)[:, :3]           # (N,3)
+    colors = np.concatenate([base_rgb, np.ones((n, 1))], axis=1)  # (N,4) identity RGBA
 
     h, w = imgs.shape[1], imgs.shape[2]
+    # NaN out padding/sentinel slots so markers/trails never anchor to (0,0)
+    present = _present_mask(pos, vis, hw=(h, w))         # (T, N) bool
+    pos_draw = pos.copy()
+    pos_draw[~present] = np.nan                          # (T, N, 2)
     if out_size is not None:
         fig = Figure(figsize=(1.0, 1.0), dpi=int(out_size))
     else:
@@ -452,16 +540,17 @@ def render_track_frames(
         ax.clear()
         ax.imshow(imgs[ti])
         ax.set_xlim(0, w); ax.set_ylim(h, 0); ax.axis("off")
-        # fading trails over the last `tail` frames
+        # fading trails over the last `tail` frames; NaN sentinel vertices break
+        # the polyline so a trail never reaches back into padding (0, 0)
         s = max(0, ti - tail)
-        segs = [pos[s:ti + 1, i, :] for i in range(n)]
+        segs = [pos_draw[s:ti + 1, i, :] for i in range(n)]
         tails = LineCollection(segs, linewidths=linewidth, capstyle="round",
                                colors=np.concatenate([base_rgb, np.full((n, 1), 0.7)], axis=1))
         ax.add_collection(tails)
-        rgba = np.concatenate([base_rgb, np.ones((n, 1))], axis=1)
-        rgba[~vis[ti], 3] = 0.25 if show_occluded else 0.0
-        ax.scatter(pos[ti, :, 0], pos[ti, :, 1], s=point_size, c=rgba,
-                   edgecolors="white", linewidths=0.4)
+        # visible -> filled circle, occluded -> edge-only (hollow) ring;
+        # sentinel/padding slots are NaN, so _draw_markers skips them entirely
+        _draw_markers(ax, pos_draw[ti], colors, vis[ti], marker="o",
+                      size=point_size, show_occluded=show_occluded)
         if title:
             ax.set_title(f"{title} | {ti + 1}/{t}", fontsize=8)
         canvas.draw()

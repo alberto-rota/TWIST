@@ -11,8 +11,8 @@
 # sweep_agent.py hands wandb.config straight into run_pipeline (the exact same
 # path as `python train.py`). Fixed parts of the config are `{value: ...}`;
 # swept fields use `{values: [...]}`. Nested fields are swept with DOTTED names
-# (e.g. MODEL.LOSS.KL_WEIGHT), which load_and_process_config folds back into the
-# nested MODEL block. method: bayes => the agent proposes promising points; stop
+# (e.g. LOSS.KL_WEIGHT), which load_and_process_config folds back into the
+# nested LOSS block. method: bayes => the agent proposes promising points; stop
 # the agent whenever you have enough trials.
 
 program: sweep_agent.py
@@ -81,14 +81,17 @@ parameters:
       OBSERVATION: { K: 7, RADIUS_PX: 24.0, HEADS: 4 }
       TRANSITION: { DEPTH: 2, HEADS: 4 }
       HEADS: { UNCERTAINTY: true }
-      LOSS:
-        POS_WEIGHT: 10.0
-        VIS_WEIGHT: 0.5
-        KL_WEIGHT: 0.05
-        KL_FREE_BITS: 0.5
-        KL_BALANCE_ALPHA: 0.8
-        HUBER_DELTA: 0.2
-        UNC_WEIGHT: 0.02
+
+  ### LOSS — TrackerLoss weights & parameters (models/losses.py)
+  LOSS:
+    value:
+      POS_WEIGHT: 10.0
+      VIS_WEIGHT: 0.5
+      KL_WEIGHT: 0.05
+      KL_FREE_BITS: 0.5
+      KL_BALANCE_ALPHA: 0.8
+      HUBER_DELTA: 0.2
+      UNC_WEIGHT: 0.02
 
   ### DATA — joint pretrain (both datasets, matched (T,N,H,W) so they batch together)
   DATASETS:
@@ -115,9 +118,9 @@ parameters:
     values: [1.5e-4, 3.0e-4, 5.0e-4]
   TEACHER_FORCING_EPOCHS:        # scheduled-sampling decay window
     values: [5, 10, 15]
-  MODEL.LOSS.POS_WEIGHT:         # how hard the direct position term dominates
+  LOSS.POS_WEIGHT:               # how hard the direct position term dominates
     values: [5.0, 10.0, 20.0]
-  MODEL.LOSS.KL_WEIGHT:          # dynamics-prior regularization strength
+  LOSS.KL_WEIGHT:                # dynamics-prior regularization strength
     values: [0.02, 0.05, 0.1]
   MODEL.OBSERVATION.RADIUS_PX:   # cost-volume window half-extent (match range)
     values: [16.0, 24.0, 32.0]

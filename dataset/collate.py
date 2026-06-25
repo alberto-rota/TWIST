@@ -21,16 +21,29 @@ from torch.utils.data._utils.collate import default_collate
 def is_fixed_shape(dataset) -> bool:
     """True iff every clip in ``dataset`` (or its index) shares ``(T, N)``.
 
-    Cheap heuristic from the index: same ``clip_len`` everywhere and a fixed
-    ``max_points``. Falls back to ``True`` when it cannot tell (default collate
-    will then raise loudly if shapes actually differ).
+    Cheap heuristic from the index: a single ``clip_len`` everywhere (fixed
+    ``T``) and a fixed ``N``. ``N`` is fixed only when ``max_points`` is set
+    *and* every clip stores at least that many points -- otherwise the reader
+    returns all of a clip's (fewer) points and ``N`` varies across clips (e.g.
+    RoboTAP / TAP-Vid, whose GT clips hold far fewer points than ``max_points``).
+    Falls back to ``True`` when it cannot tell (default collate will then raise
+    loudly if shapes actually differ).
     """
     index = getattr(dataset, "index", None)
     if not index:
         return True
     lens = {e.get("clip_len") for e in index if isinstance(e, dict)}
-    fixed_points = getattr(dataset, "max_points", None) is not None
-    return len(lens) <= 1 and fixed_points
+    if len(lens) > 1:
+        return False
+    max_points = getattr(dataset, "max_points", None)
+    if max_points is None:
+        return False  # keep-all -> N follows each clip's own point count
+    # N == max_points only if no clip is smaller than max_points; if any clip
+    # stores fewer points, that clip yields N < max_points (variable shape).
+    nums = [e.get("num_points") for e in index if isinstance(e, dict)]
+    if any(n is None for n in nums):
+        return True  # index lacks point counts -> trust max_points (legacy)
+    return min(nums) >= int(max_points)
 
 
 def pad_collate(batch: List[Dict]) -> Dict:

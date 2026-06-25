@@ -59,6 +59,20 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "VAL_FRACTION": 0.1,
         "SPLIT_SEED": 42,
     },
+    # Long-horizon synthetic phase (sibling of PointOdyssey). Dynamic Replica
+    # ships ground-truth tracks, converted to gt_tracks/ by
+    # dynamicreplica_data_prep.py (same index.json + .npz layout).
+    "DYNAMICREPLICA": {
+        "ROOT_DIR": "$DATASET_DIR/DynamicReplica/gt_tracks",
+        "READER": _COTRACKER_READER,
+        "CLIP_LEN": 48,
+        "FRAME_STRIDE": 1,
+        "MAX_POINTS": 256,
+        "POINT_SAMPLE_MODE": "even",
+        "QUERY_FRAME": 0,
+        "VAL_FRACTION": 0.1,
+        "SPLIT_SEED": 42,
+    },
     # Surgical adaptation datasets (pre-tracked offline, shared CoTracker layout).
     "CHOLEC80": {
         "ROOT_DIR": "$DATASET_DIR/cholec80/cotracker_tracks",
@@ -96,6 +110,10 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
     # --- Evaluation-only benchmarks (ground-truth point tracks) -----------
     # Converted from TAP-Vid pickles by tapvid_data_prep.py.
     # VAL_FRACTION=1.0 -> all sequences are validation, none are training.
+    # IS_EVAL_DATASET=True marks them for the standalone benchmark evaluation
+    # (utilities.evaluation): these are the datasets the headline TAP metrics are
+    # reported on. The flag defaults False everywhere else, so training datasets
+    # are never benchmarked unless a config explicitly opts them in.
     "TAPVID_DAVIS": {
         "ROOT_DIR": "$DATASET_DIR/tapvid_davis/gt_tracks",
         "READER": _COTRACKER_READER,
@@ -106,6 +124,7 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "REQUIRE_VISIBLE_AT_QUERY": False,  # some GT points start occluded
         "VAL_FRACTION": 1.0,       # eval-only: all sequences -> val
         "SPLIT_SEED": 42,
+        "IS_EVAL_DATASET": True,
     },
     "TAPVID_RGB_STACKING": {
         "ROOT_DIR": "$DATASET_DIR/tapvid_rgb_stacking/gt_tracks",
@@ -117,6 +136,22 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "REQUIRE_VISIBLE_AT_QUERY": False,
         "VAL_FRACTION": 1.0,
         "SPLIT_SEED": 42,
+        "IS_EVAL_DATASET": True,
+    },
+    # TAP-Vid-Kinetics: converted from the sharded generate_tapvid.py pickles by
+    # tapvid_kinetics_data_prep.py (see assets/dataprep/TAPVID_KINETICS.md for the
+    # download + processing runbook). Same eval-only conventions as DAVIS.
+    "TAPVID_KINETICS": {
+        "ROOT_DIR": "$DATASET_DIR/tapvid_kinetics/gt_tracks",
+        "READER": _COTRACKER_READER,
+        "CLIP_LEN": None,          # whole sequence as one clip
+        "MAX_POINTS": None,        # keep all GT points
+        "POINT_SAMPLE_MODE": "even",
+        "QUERY_FRAME": 0,
+        "REQUIRE_VISIBLE_AT_QUERY": False,  # some GT points start occluded
+        "VAL_FRACTION": 1.0,       # eval-only: all sequences -> val
+        "SPLIT_SEED": 42,
+        "IS_EVAL_DATASET": True,
     },
     "ROBOTAP": {
         "ROOT_DIR": "$DATASET_DIR/robotap/gt_tracks",
@@ -128,6 +163,7 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "REQUIRE_VISIBLE_AT_QUERY": False,
         "VAL_FRACTION": 1.0,
         "SPLIT_SEED": 42,
+        "IS_EVAL_DATASET": True,
     },
     "ENDOTAPP_GT": {
         "ROOT_DIR": "$DATASET_DIR/EndoTAPP/gt_tracks",
@@ -139,6 +175,7 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "REQUIRE_VISIBLE_AT_QUERY": False,
         "VAL_FRACTION": 1.0,
         "SPLIT_SEED": 42,
+        "IS_EVAL_DATASET": True,
     },
 }
 

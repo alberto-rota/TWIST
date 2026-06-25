@@ -308,6 +308,7 @@ class TrackerWorldModel(nn.Module):
         queries: torch.Tensor,                   # (B,N,3) = (t,x,y)
         point_mask: Optional[torch.Tensor] = None,
         observe_steps: Optional[int] = None,
+        observe_mask: Optional[torch.Tensor] = None,
         tf_prob: float = 0.0,
         gt_tracks: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
@@ -338,7 +339,14 @@ class TrackerWorldModel(nn.Module):
         put(qf, query_xy, query_xy, zlv, zlv, vis_obs, gate_obs)  # query frame itself
 
         for ti in range(qf + 1, t):
-            observe = observe_steps is None or (ti - qf) <= observe_steps
+            # ``observe_mask`` (B,) or (T,) takes precedence: training-time observation
+            # dropout drops the frame correction at masked steps so the loss there
+            # trains the prior directly (the occlusion curriculum). Falls back to the
+            # contiguous ``observe_steps`` forecast horizon used by rollout eval.
+            if observe_mask is not None:
+                observe = bool(observe_mask[ti])
+            else:
+                observe = observe_steps is None or (ti - qf) <= observe_steps
             prev_pos = state["pos"]
             state, o = self.step(state, feats[:, ti], hw, point_mask, use_observation=observe)
             put(ti, state["pos"], o["prior_mean"], o["prior_logvar"],

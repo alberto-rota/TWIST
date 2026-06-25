@@ -13,7 +13,7 @@ Design (a lean version of the unreflectanything engine):
 * **AMP** — bf16 autocast on an A100 (no grad scaler needed), fp16 + ``GradScaler``
   elsewhere, disabled on CPU.
 * **Schedules** — cosine LR with linear warmup; KL weight annealed from
-  ``KL_WEIGHT_START`` up to ``MODEL.LOSS.KL_WEIGHT`` over ``KL_ANNEAL_EPOCHS``;
+  ``KL_WEIGHT_START`` up to ``LOSS.KL_WEIGHT`` over ``KL_ANNEAL_EPOCHS``;
   **scheduled sampling** — a per-point teacher-forcing probability annealed
   linearly 1->0 over ``TEACHER_FORCING_EPOCHS`` (feed GT positions often early,
   then let the filter run on its own predictions; no hard cliff). All are pure
@@ -33,6 +33,7 @@ from __future__ import annotations
 import math
 import os
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -212,7 +213,10 @@ class Engine:
         self.grad_clip = float(config.get("GRAD_CLIP", 1.0))
         self.log_every = int(config.get("LOG_EVERY", 20))
         self.viz_every = int(config.get("VIZ_EVERY", 5))          # epochs between val gifs (0 off)
+        self.viz_val_clips = max(1, int(config.get("VIZ_VAL_CLIPS", 1)))  # # distinct val clips logged per viz epoch
         self.viz_every_batches = int(config.get("VIZ_EVERY_BATCHES", 0))  # train-step viz cadence (0 off)
+        self.viz_dense_spacing = int(config.get("VIZ_DENSE_SPACING", 0))  # dense-grid query spacing px (0 off)
+        self.viz_dense_max_points = int(config.get("VIZ_DENSE_MAX_POINTS", 400))  # safety cap on grid size
         self.viz_frames = int(config.get("VIZ_FRAMES", 24))       # cap clip length (short)
         self.viz_max_points = int(config.get("VIZ_MAX_POINTS", 48))
         self.viz_size = int(config.get("VIZ_SIZE", 256))          # square px of the logged frames
@@ -224,6 +228,15 @@ class Engine:
         # torch generator, so viz picks vary across calls within one run).
         import random as _random
         self._viz_rng = _random.Random()
+        # W&B video logging (mp4 encode + upload) is offloaded to a single
+        # background thread on rank 0 so it never blocks the training loop /
+        # DDP collective schedule. Only one viz is in flight at a time; a new
+        # one is dropped while the previous is still encoding (prevents backlog).
+        self._viz_executor: Optional[ThreadPoolExecutor] = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="wandb-viz")
+            if (self._rank == 0 and self.wandb is not None) else None
+        )
+        self._viz_future: Optional[Future] = None
         self.val_every = max(1, int(config.get("VAL_EVERY", 1)))
         self.max_steps = int(config.get("MAX_STEPS_PER_EPOCH", 0))  # 0 -> all
         self.max_val_steps = int(config.get("MAX_VAL_STEPS", 0))    # 0 -> all (smoke caps this)
@@ -245,6 +258,38 @@ class Engine:
 
         # teacher-forcing curriculum
         self.tf_epochs = int(config.get("TEACHER_FORCING_EPOCHS", 0))
+
+        # rollout (frame-free forecast) evaluation: observe ROLLOUT_OBSERVE_STEPS
+        # frames after the query, then predict the rest prior-only. Isolates the
+        # transition prior's standalone quality -- the occlusion/forecast thesis
+        # the headline (fully-observed) EPE never exercises. Logged as
+        # ``val/epoch/rollout/*`` (EPE/delta/AJ on the forecast region only).
+        self.rollout_eval = bool(config.get("ROLLOUT_EVAL", False))
+        self.rollout_observe = int(config.get("ROLLOUT_OBSERVE_STEPS", 4))
+
+        # observation-dropout curriculum: per-step prob of dropping the frame
+        # correction during TRAINING so the loss at those steps trains the prior
+        # directly (forces a competent, load-bearing prior instead of letting the
+        # gate open to ~1 and bypass it). Ramped 0 -> OBS_DROPOUT over
+        # OBS_DROPOUT_EPOCHS so the model first learns to observe, then to coast.
+        self.obs_dropout = float(config.get("OBS_DROPOUT", 0.0))
+        self.obs_dropout_epochs = int(config.get("OBS_DROPOUT_EPOCHS", 0))
+
+        # benchmark evaluation (utilities.evaluation): the standalone TAP metrics
+        # (Delta AVG / Average Jaccard / Occlusion Accuracy / ms-per-frame) on the
+        # IS_EVAL_DATASET-flagged datasets, written as a CSV + a W&B table.
+        #   EVAL_AT_END    -- run once after this stage's training finishes.
+        #   EVAL_EVERY > 0 -- also run every N epochs after validation (monitoring).
+        # Both default off, so existing runs are unaffected.
+        self.eval_at_end = bool(config.get("EVAL_AT_END", False))
+        self.eval_every = int(config.get("EVAL_EVERY", 0))
+        self.eval_max_clips = config.get("EVAL_MAX_CLIPS", None)
+        self.eval_batch_size = int(config.get("EVAL_BATCH_SIZE", 1))
+        self.eval_workers = int(config.get("EVAL_WORKERS", 0))
+        # eval scores the whole dataset by default (independent of MAX_VAL_STEPS,
+        # which only caps the per-epoch validation loop). Cap with EVAL_MAX_CLIPS /
+        # EVAL_MAX_STEPS explicitly for a quick eval-path smoke.
+        self.eval_max_steps = int(config.get("EVAL_MAX_STEPS", 0))
 
         # AMP: bf16 (no scaler) on A100-class GPUs, else fp16 + scaler, off on CPU
         self.amp = bool(config.get("AMP", True)) and device.type == "cuda"
@@ -276,6 +321,17 @@ class Engine:
     def _unwrap_model(self) -> nn.Module:
         """Return the underlying module, stripping any DDP wrapper."""
         return self.model.module if self._is_ddp else self.model
+
+    def _barrier(self) -> None:
+        """All-rank sync point (no-op outside DDP).
+
+        Used to resync after rank-0-only work (viz, checkpointing) so the other
+        ranks don't race ahead into the next gradient all-reduce and trip the
+        NCCL watchdog timeout while rank 0 is still busy.
+        """
+        if self._is_ddp:
+            import torch.distributed as dist
+            dist.barrier()
 
     def _all_reduce_dict(self, d: Dict[str, float]) -> Dict[str, float]:
         """Average a metrics dict across all DDP ranks. Safe against NaN values."""
@@ -313,15 +369,25 @@ class Engine:
             return 0.0
         return max(0.0, 1.0 - epoch / self.tf_epochs)
 
-    def _apply_schedules(self, epoch: int) -> Tuple[float, float, float]:
+    def _obs_dropout(self, epoch: int) -> float:
+        """Per-step observation-dropout probability: linear 0 -> ``OBS_DROPOUT`` over
+        ``OBS_DROPOUT_EPOCHS`` epochs, then constant (0 disables the curriculum)."""
+        if self.obs_dropout <= 0:
+            return 0.0
+        if self.obs_dropout_epochs <= 0:
+            return self.obs_dropout
+        return self.obs_dropout * min(1.0, epoch / self.obs_dropout_epochs)
+
+    def _apply_schedules(self, epoch: int) -> Tuple[float, float, float, float]:
         mult = self._lr_mult(epoch)
         for g, base in zip(self.optimizer.param_groups, self.base_lrs):
             g["lr"] = base * mult
         kw = self._kl_weight(epoch)
         self.loss_fn.kl_weight = kw
         tf_prob = self._tf_prob(epoch)
+        obs_p = self._obs_dropout(epoch)
         lr0 = self.optimizer.param_groups[0]["lr"] if self.optimizer.param_groups else 0.0
-        return lr0, kw, tf_prob
+        return lr0, kw, tf_prob, obs_p
 
     # -- batch prep ---------------------------------------------------------- #
     def _prep(self, batch: Dict[str, Any]):
@@ -346,7 +412,17 @@ class Engine:
             torch.cuda.synchronize(self.device)
 
     # -- train / validate ---------------------------------------------------- #
-    def train_epoch(self, epoch: int, tf_prob: float) -> Dict[str, float]:
+    def _build_observe_mask(self, T: int, qf: int, p: float) -> Optional[torch.Tensor]:
+        """``(T,)`` bool mask for observation dropout: each post-query step is observed
+        with prob ``1-p``. Pre-query / query frames stay True (no correction runs there
+        anyway). Returns None when ``p<=0`` (forward then observes every step)."""
+        if p <= 0:
+            return None
+        keep = torch.rand(T, device=self.device) >= p
+        keep[:qf + 1] = True
+        return keep
+
+    def train_epoch(self, epoch: int, tf_prob: float, obs_dropout: float = 0.0) -> Dict[str, float]:
         loader = self.loaders.get("train")
         if loader is None:
             return {}
@@ -357,7 +433,12 @@ class Engine:
             self.model.encoder.eval()                    # keep the frozen backbone in eval
         agg = {"loss": 0.0, "pos": 0.0, "prior": 0.0, "unc": 0.0, "vis": 0.0, "kl": 0.0, "epe": 0.0,
                "w_pos": 0.0, "w_prior": 0.0, "w_unc": 0.0, "w_vis": 0.0, "w_kl": 0.0,
-               "gate": 0.0, "motion_ratio": 0.0}
+               "gate": 0.0, "motion_ratio": 0.0, "obs_kept": 0.0}
+        # full TAP metrics on the train batches, NaN-safe (separate counters since a
+        # batch with no visible points yields NaN that must not poison the average).
+        m_keys = ("average_jaccard", "delta_avg", "occlusion_accuracy")
+        m_sum = {k: 0.0 for k in m_keys}
+        m_cnt = {k: 0 for k in m_keys}
         n = 0
         gn_sum, gn_cnt = 0.0, 0   # grad-norm aggregated separately (skip non-finite overflow steps)
         # --- compute-efficiency accounting (excludes dataloading + diagnostics) ---
@@ -369,11 +450,17 @@ class Engine:
             if self.max_steps and step >= self.max_steps:
                 break
             frames, queries, tgt = self._prep(batch)
+            # observation-dropout curriculum: drop the frame correction at random
+            # post-query steps so the loss there trains the prior directly.
+            qf0 = max(0, min(int(queries[0, 0, 0].item()), frames.shape[1] - 1))
+            observe_mask = self._build_observe_mask(frames.shape[1], qf0, obs_dropout)
+            obs_kept = float(observe_mask[qf0 + 1:].float().mean()) if observe_mask is not None else 1.0
             self.optimizer.zero_grad(set_to_none=True)
             self._sync()
             _t0 = time.perf_counter()
             with self._autocast():
                 out = self.model(frames, queries, point_mask=tgt.get("point_mask"),
+                                 observe_mask=observe_mask,
                                  tf_prob=tf_prob,
                                  gt_tracks=tgt["tracks"] if tf_prob > 0.0 else None)
                 total, parts = self.loss_fn(out, tgt)
@@ -408,11 +495,20 @@ class Engine:
                 gd = torch.linalg.norm(tgt["tracks"] - tgt["tracks"][:, :1], dim=-1)
                 vm = tgt["visibility"].bool()
                 motion_ratio = float((pd[vm].mean() / gd[vm].mean().clamp_min(1e-6))) if vm.any() else float("nan")
+            # full TAP metrics on the train batch (recorded coords are ALWAYS the
+            # model's own predictions, so this is valid even while teacher-forced)
+            tm = tracking_metrics(out["coords"], tgt["tracks"], out["vis_logits"],
+                                  tgt["visibility"], tgt.get("time_mask"), tgt.get("point_mask"))
+            for k in m_keys:
+                v = tm.get(k, float("nan"))
+                if v == v:                                   # finite
+                    m_sum[k] += v; m_cnt[k] += 1
             agg["loss"] += float(total.detach())
             for k in ("pos", "prior", "unc", "vis", "kl", "epe", "w_pos", "w_prior", "w_unc", "w_vis", "w_kl"):
                 agg[k] += float(parts[k])
             agg["gate"] += gate
             agg["motion_ratio"] += motion_ratio
+            agg["obs_kept"] += obs_kept
             if grad_norm == grad_norm:                   # finite (GradScaler overflow steps -> NaN, skipped)
                 gn_sum += grad_norm; gn_cnt += 1
             n += 1
@@ -431,17 +527,23 @@ class Engine:
                         "train/step_grad_norm": grad_norm,
                         "train/step_gate": gate,
                         "train/step_motion_ratio": motion_ratio,
-                        "lr": self.optimizer.param_groups[0]["lr"],
-                        "kl_weight": self.loss_fn.kl_weight,
-                        "tf_prob": tf_prob,
+                        "schedules/lr": self.optimizer.param_groups[0]["lr"],
+                        "schedules/kl_weight": self.loss_fn.kl_weight,
+                        "schedules/tf_prob": tf_prob,
+                        "schedules/obs_dropout": obs_dropout,
                     })
-            # periodic in-training tracks viz (random clip of the CURRENT batch)
+            # periodic in-training tracks viz (random clip of the CURRENT batch).
+            # Rank-0-only forward; the barrier resyncs all ranks afterwards so the
+            # others don't race into the next all-reduce while rank 0 visualizes.
             if (self.viz_every_batches and step > 0 and step % self.viz_every_batches == 0):
                 self._log_tracks(epoch, split="train", batch=batch, step=step)
                 self.model.train()                           # _log_tracks switched to eval
                 if getattr(self.model, "encoder", None) is not None and getattr(self.model.encoder, "frozen", False):
                     self.model.encoder.eval()
+                self._barrier()
         out = {k: v / max(n, 1) for k, v in agg.items()}
+        for k in m_keys:                                     # NaN-safe TAP metric means
+            out[k] = m_sum[k] / m_cnt[k] if m_cnt[k] else float("nan")
         out["grad_norm"] = gn_sum / gn_cnt if gn_cnt else float("nan")
         peak_mem_gb = (torch.cuda.max_memory_allocated() / 1e9) if self.device.type == "cuda" else float("nan")
         self._train_perf = self._compute_perf(compute_s, n_frames, n_clips_done, peak_mem_gb)
@@ -504,6 +606,18 @@ class Engine:
         g = total ** 0.5
         return g if math.isfinite(g) else float("nan")
 
+    def _forecast_mask(self, queries: torch.Tensor, tgt: Dict[str, torch.Tensor], T: int) -> torch.Tensor:
+        """``(B,T)`` bool mask of the frame-free *forecast* region: steps more than
+        ``rollout_observe`` after each clip's query frame (intersected with the real
+        time_mask). Restricts the rollout metrics to the prior-only horizon."""
+        ar = torch.arange(T, device=self.device)[None, :]          # (1,T)
+        qfb = queries[:, 0, 0].long()[:, None]                     # (B,1) query frame per clip
+        fmask = (ar - qfb) > self.rollout_observe                  # (B,T) forecast region
+        tmask = tgt.get("time_mask")
+        if tmask is not None:
+            fmask = fmask & tmask.bool()
+        return fmask
+
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
         loader = self.loaders.get("val")
@@ -526,8 +640,47 @@ class Engine:
                 if v == v:                               # drop NaN
                     agg[k] = agg.get(k, 0.0) + v
                     cnt[k] = cnt.get(k, 0) + 1
+            # --- frame-free rollout eval (prior-only forecast horizon) ---
+            if self.rollout_eval:
+                with self._autocast():
+                    out_r = self.model(frames, queries, point_mask=tgt.get("point_mask"),
+                                       observe_steps=self.rollout_observe)
+                fmask = self._forecast_mask(queries, tgt, frames.shape[1])
+                m_r = tracking_metrics(out_r["coords"], tgt["tracks"], out_r["vis_logits"],
+                                       tgt["visibility"], fmask, tgt.get("point_mask"))
+                for k, v in m_r.items():
+                    rk = f"rollout/{k}"
+                    if v == v:
+                        agg[rk] = agg.get(rk, 0.0) + v
+                        cnt[rk] = cnt.get(rk, 0) + 1
         local = {k: (agg[k] / cnt[k] if cnt.get(k) else float("nan")) for k in agg}
         return self._all_reduce_dict(local)
+
+    # -- benchmark evaluation ------------------------------------------------ #
+    @torch.no_grad()
+    def _run_evaluation(self, epoch: int, tag: str) -> None:
+        """Run the standalone benchmark evaluation on the IS_EVAL_DATASET datasets
+        (rank-0 only, on the unwrapped model) and write its CSV + W&B table.
+
+        Other ranks wait at the trailing barrier so they don't race into the next
+        gradient all-reduce while rank 0 evaluates. Never raises into the loop.
+        """
+        if not self._is_main_process():
+            self._barrier()
+            return
+        try:
+            from utilities.evaluation import evaluate_and_report
+            evaluate_and_report(
+                self._unwrap_model(), self.config, self.device, self.run_dir,
+                wandb_run=self.wandb, tag=tag, epoch=epoch,
+                max_clips=self.eval_max_clips, batch_size=self.eval_batch_size,
+                num_workers=self.eval_workers, amp=self.amp, amp_dtype=self.amp_dtype,
+                max_steps=self.eval_max_steps,
+            )
+        except Exception as e:  # noqa: BLE001 -- eval must never crash training
+            logger.warning(f"benchmark evaluation skipped ({e})")
+        finally:
+            self._barrier()
 
     # -- qualitative tracks viz ---------------------------------------------- #
     def _random_batch(self, split: str):
@@ -548,15 +701,50 @@ class Engine:
                 return None
 
     @torch.no_grad()
-    def _log_tracks(self, epoch: int, split: str, batch=None, step: Optional[int] = None) -> None:
-        """Log a randomly-sampled clip as W&B MP4 videos (one log call per viz interval).
+    def _render_tracks_pair(self, epoch: int, split: str, batch,
+                            step: Optional[int] = None, label: Optional[str] = None) -> Dict[str, np.ndarray]:
+        """Render one clip to its two ``VIZ_SIZE``² uint8 viz arrays (no logging):
 
-        Two media keys, both ``VIZ_SIZE``² px, logged as ``wandb.Video`` MP4s:
-          * ``{split}/videos/compare``     — GT (○) vs predicted (×) points, error lines
-          * ``{split}/videos/pred_tracks`` — predicted tracks with fading motion trails
+          * ``compare``     — predicted (○) vs GT (△) points, with error lines
+          * ``pred_tracks`` — predicted tracks with fading motion trails
 
-        A random batch + random clip-in-batch makes it different every call. The
-        model runs free (no teacher forcing) so the viz reflects true tracking.
+        ``label`` (e.g. a dataset name) prefixes the on-frame title. The model runs
+        free (no teacher forcing) so the viz reflects true tracking. Returns the
+        arrays; the caller namespaces the keys and submits them.
+        """
+        from utilities.visualization import render_comparison_frames, render_track_frames
+        frames, queries, tgt = self._prep(batch)
+        b = self._viz_rng.randrange(frames.shape[0])     # random clip in the batch
+        model = self._unwrap_model()                     # unwrapped: no DDP sync on this pass
+        model.eval()
+        with self._autocast():
+            out = model(frames, queries, point_mask=tgt.get("point_mask"))
+        tf = min(self.viz_frames, frames.shape[1]) if self.viz_frames > 0 else frames.shape[1]
+        pred_vis = (torch.sigmoid(out["vis_logits"][b, :tf]) > 0.5).cpu()
+        gt_xy = tgt["tracks"][b, :tf].cpu()
+        pr_xy = out["coords"][b, :tf].float().cpu()
+        gt_vis = tgt["visibility"][b, :tf].cpu()
+        src = batch["frames"][b, :tf]
+        tag = (f"{label} " if label else "") + f"{self.stage_name} {split} ep{epoch}" \
+            + (f" b{step}" if step is not None else "")
+        compare = render_comparison_frames(
+            src, gt_xy, pr_xy, gt_visibility=gt_vis, pred_visibility=pred_vis,
+            max_points=self.viz_max_points, out_size=self.viz_size, title=tag,
+        )
+        tracks = render_track_frames(
+            src, pr_xy, visibility=pred_vis, tail=self.viz_tail,
+            max_points=self.viz_max_points, out_size=self.viz_size, title=f"{tag} pred",
+        )
+        return {"compare": compare, "pred_tracks": tracks}
+
+    @torch.no_grad()
+    def _log_tracks(self, epoch: int, split: str, batch=None, step: Optional[int] = None,
+                    idx: Optional[int] = None, label: Optional[str] = None) -> None:
+        """Render + submit a single clip's videos (the train-step batch-viz path).
+
+        The per-epoch validation/train viz instead goes through
+        :meth:`_log_epoch_viz`, which batches every clip into one submission so the
+        single-flight viz executor cannot drop part of the set.
         """
         if not self._is_main_process() or self.wandb is None:
             return
@@ -565,46 +753,198 @@ class Engine:
         if batch is None:
             return
         try:
-            import wandb
-
-            from utilities.visualization import render_comparison_frames, render_track_frames
-            frames, queries, tgt = self._prep(batch)
-            b = self._viz_rng.randrange(frames.shape[0])     # random clip in the batch
-            model = self._unwrap_model()                     # unwrapped: no DDP sync on this pass
-            model.eval()
-            with self._autocast():
-                out = model(frames, queries, point_mask=tgt.get("point_mask"))
-            tf = min(self.viz_frames, frames.shape[1]) if self.viz_frames > 0 else frames.shape[1]
-            pred_vis = (torch.sigmoid(out["vis_logits"][b, :tf]) > 0.5).cpu()
-            gt_xy = tgt["tracks"][b, :tf].cpu()
-            pr_xy = out["coords"][b, :tf].float().cpu()
-            gt_vis = tgt["visibility"][b, :tf].cpu()
-            src = batch["frames"][b, :tf]
-            tag = f"{self.stage_name} {split} ep{epoch}" + (f" b{step}" if step is not None else "")
-            compare = render_comparison_frames(
-                src, gt_xy, pr_xy, gt_visibility=gt_vis, pred_visibility=pred_vis,
-                max_points=self.viz_max_points, out_size=self.viz_size, title=tag,
-            )
-            tracks = render_track_frames(
-                src, pr_xy, visibility=pred_vis, tail=self.viz_tail,
-                max_points=self.viz_max_points, out_size=self.viz_size, title=f"{tag} pred",
-            )
-            self._log_video(epoch, split, {"compare": compare, "pred_tracks": tracks})
+            pair = self._render_tracks_pair(epoch, split, batch, step=step, label=label)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"tracks viz skipped ({e})")
+            return
+        suffix = f"_{label}" if label is not None else (f"_{idx}" if idx is not None else "")
+        self._log_video(epoch, split, pair, suffix=suffix)
 
-    def _log_video(self, epoch: int, split: str, arrays: Dict[str, np.ndarray]) -> None:
-        """Log each ``(T,3,H,W)`` uint8 array as a ``wandb.Video`` MP4.
+    # -- per-epoch qualitative viz (one batched W&B submission) -------------- #
+    def _val_subdatasets(self):
+        """``[(name, dataset), ...]`` for the val loader's sub-datasets.
 
-        Keys are namespaced as ``<split>/videos/<KEYNAME>`` (e.g.
-        ``val/videos/pred_tracks``, ``train/videos/compare``) so W&B groups
-        train and val clips under separate ``videos`` panels.
+        Unwraps a ``ConcatDataset`` into its readers (each tagged with
+        ``dataset_name`` by ``create_datasets_from_config``); a single dataset is
+        returned as one entry. Empty list when there is no val loader.
         """
-        import wandb
-        row: Dict[str, Any] = {"epoch": epoch}
-        for key, arr in arrays.items():
-            row[f"{split}/videos/{key}"] = wandb.Video(arr, fps=self.viz_fps, format="mp4")
-        self.wandb.log(row)
+        loader = self.loaders.get("val")
+        ds = getattr(loader, "dataset", None) if loader is not None else None
+        if ds is None:
+            return []
+        subs = getattr(ds, "datasets", None) or [ds]     # ConcatDataset.datasets, else itself
+        return [(getattr(s, "dataset_name", None) or s.__class__.__name__, s) for s in subs]
+
+    def _collate_one(self, item: Dict[str, Any]):
+        """Collate a single dataset item into a batch of 1 using the val loader's
+        collate_fn (``pad_collate`` for variable-length clips, else default)."""
+        from torch.utils.data._utils.collate import default_collate
+        loader = self.loaders.get("val")
+        collate = getattr(loader, "collate_fn", None) if loader is not None else None
+        return (collate or default_collate)([item])
+
+    @torch.no_grad()
+    def _collect_val_per_dataset(self, epoch: int) -> Dict[str, np.ndarray]:
+        """Render ``VIZ_VAL_CLIPS`` clip(s) **per val dataset** so every dataset is
+        shown, returning namespaced media (``val/videos/compare_<DATASET>`` ...).
+
+        Falls back to a single random val clip if the val loader exposes no
+        identifiable sub-datasets.
+        """
+        media: Dict[str, np.ndarray] = {}
+        subsets = self._val_subdatasets()
+        if not subsets:
+            batch = self._random_batch("val")
+            if batch is not None:
+                try:
+                    pair = self._render_tracks_pair(epoch, "val", batch)
+                    media["val/videos/compare"] = pair["compare"]
+                    media["val/videos/pred_tracks"] = pair["pred_tracks"]
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"val tracks viz skipped ({e})")
+            return media
+        for name, sub in subsets:
+            n = len(sub)
+            if n == 0:
+                continue
+            for j in range(self.viz_val_clips):
+                sfx = name if self.viz_val_clips == 1 else f"{name}_{j}"
+                try:
+                    k = self._viz_rng.randrange(n)
+                    pair = self._render_tracks_pair(epoch, "val", self._collate_one(sub[k]), label=sfx)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"val viz failed for {name} ({e})")
+                    continue
+                media[f"val/videos/compare_{sfx}"] = pair["compare"]
+                media[f"val/videos/pred_tracks_{sfx}"] = pair["pred_tracks"]
+        return media
+
+    @torch.no_grad()
+    def _collect_dense(self, epoch: int, split: str, batch=None) -> Dict[str, np.ndarray]:
+        """Qualitative DENSE tracking: query a regular grid of points (spacing
+        ``VIZ_DENSE_SPACING`` px) at the first frame and render the predicted
+        tracks. Inspection only — these grid points have no GT, so nothing is
+        scored; it shows how the field flows where the sparse GT can't. Returns
+        ``{"<split>/videos/dense_tracks": (T,3,H,W)}`` (empty when disabled/failed).
+        """
+        if (not self._is_main_process() or self.wandb is None
+                or self.viz_dense_spacing <= 0):
+            return {}
+        if batch is None:
+            batch = self._random_batch(split)
+        if batch is None:
+            return {}
+        try:
+            from utilities.visualization import render_track_frames
+            frames, _, _ = self._prep(batch)
+            b = self._viz_rng.randrange(frames.shape[0])
+            clip = frames[b:b + 1]                              # (1,T,3,H,W)
+            h, w = int(clip.shape[-2]), int(clip.shape[-1])
+            sp = self.viz_dense_spacing
+            ys = torch.arange(sp // 2, h, sp, device=clip.device)
+            xs = torch.arange(sp // 2, w, sp, device=clip.device)
+            gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+            grid = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=-1).float()   # (N,2) xy
+            if grid.shape[0] > self.viz_dense_max_points:      # safety cap (even subsample)
+                sel = torch.linspace(0, grid.shape[0] - 1, self.viz_dense_max_points).round().long()
+                grid = grid[sel]
+            queries = torch.cat([grid.new_zeros(grid.shape[0], 1), grid], dim=-1).unsqueeze(0)  # (1,N,3)
+            model = self._unwrap_model(); model.eval()
+            with self._autocast():
+                out = model(clip, queries)
+            tf = min(self.viz_frames, clip.shape[1]) if self.viz_frames > 0 else clip.shape[1]
+            pred_vis = (torch.sigmoid(out["vis_logits"][0, :tf]) > 0.5).cpu()
+            pr_xy = out["coords"][0, :tf].float().cpu()
+            src = batch["frames"][b, :tf]
+            tag = f"{self.stage_name} {split} ep{epoch} dense({sp}px,{grid.shape[0]}pts)"
+            dense = render_track_frames(
+                src, pr_xy, visibility=pred_vis, tail=self.viz_tail,
+                max_points=grid.shape[0], out_size=self.viz_size, title=tag,
+            )
+            return {f"{split}/videos/dense_tracks": dense}
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"dense tracks viz skipped ({e})")
+            return {}
+
+    @torch.no_grad()
+    def _log_epoch_viz(self, epoch: int) -> None:
+        """Render the whole per-epoch qualitative viz and submit it as ONE W&B media
+        row: a clip **per val dataset** (>=1 video per dataset), a random train clip,
+        and the optional dense grids. Batching into a single submission means the
+        single-flight viz executor never logs only part of the set.
+        """
+        if not self._is_main_process() or self.wandb is None:
+            return
+        media: Dict[str, np.ndarray] = {}
+        media.update(self._collect_val_per_dataset(epoch))
+        train_batch = self._random_batch("train")           # ... and a random train clip
+        if train_batch is not None:
+            try:
+                pair = self._render_tracks_pair(epoch, "train", train_batch)
+                media["train/videos/compare"] = pair["compare"]
+                media["train/videos/pred_tracks"] = pair["pred_tracks"]
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"train tracks viz skipped ({e})")
+        media.update(self._collect_dense(epoch, "val"))      # no-op unless VIZ_DENSE_SPACING > 0
+        media.update(self._collect_dense(epoch, "train"))
+        self._submit_media(epoch, media)
+
+    def _log_video(self, epoch: int, split: str, arrays: Dict[str, np.ndarray],
+                   suffix: str = "") -> None:
+        """Namespace ``arrays`` as ``<split>/videos/<KEYNAME><suffix>`` and submit
+        them as one media row (used by the train-step batch-viz path). ``suffix``
+        (e.g. ``"_0"``) keeps several clips of the same split/epoch on distinct keys.
+        """
+        media = {f"{split}/videos/{k}{suffix}": v for k, v in arrays.items()}
+        self._submit_media(epoch, media)
+
+    def _submit_media(self, epoch: int, media: Dict[str, np.ndarray]) -> None:
+        """Encode a ``{full_wandb_key: (T,3,H,W) uint8}`` media row to mp4 and log it.
+
+        The mp4 encode + ``wandb.log`` is dispatched to a background thread so it
+        never blocks the training loop (and, in DDP, never stalls the other ranks
+        at the next gradient all-reduce). Only one row is encoded at a time; if a
+        previous one is still in flight the new row is dropped rather than queued,
+        so a slow encoder can never build an unbounded backlog. The whole epoch's
+        viz is submitted as a single row so this single-flight drop is all-or-nothing
+        (never logs only part of the per-dataset set).
+        """
+        if not media:
+            return
+        media = {k: np.ascontiguousarray(v) for k, v in media.items()}  # detach from caller's buffers
+        if self._viz_executor is None:                       # no async path -> log inline
+            self._encode_and_log_media(epoch, media)
+            return
+        if self._viz_future is not None and not self._viz_future.done():
+            logger.debug("viz drop: previous W&B video still encoding")
+            return
+        self._viz_future = self._viz_executor.submit(self._encode_and_log_media, epoch, media)
+
+    def _encode_and_log_media(self, epoch: int, media: Dict[str, np.ndarray]) -> None:
+        """Encode each array to an mp4 ``wandb.Video`` and push the row to W&B.
+        Runs on the viz worker thread; never raises into the training loop."""
+        try:
+            import wandb
+            row: Dict[str, Any] = {"epoch": epoch}
+            for key, arr in media.items():
+                row[key] = wandb.Video(arr, fps=self.viz_fps, format="mp4")
+            self.wandb.log(row)
+        except Exception as e:  # noqa: BLE001 -- logging must never crash training
+            logger.warning(f"W&B video log skipped ({e})")
+
+    def _flush_viz(self, timeout: float = 120.0) -> None:
+        """Block until any in-flight background video log finishes (rank 0 only).
+
+        Called before a stage ends so the last clips are not lost when the W&B run
+        is closed. Bounded by ``timeout`` so a wedged encoder can't hang shutdown.
+        """
+        fut, self._viz_future = self._viz_future, None
+        if fut is None:
+            return
+        try:
+            fut.result(timeout=timeout)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"viz flush incomplete ({e})")
 
     # -- checkpoint ---------------------------------------------------------- #
     def _ckpt(self, epoch: int) -> Dict[str, Any]:
@@ -705,13 +1045,10 @@ class Engine:
             if self._is_main_process():
                 logger.info(f"stage {self.stage_idx} already at epoch {self.start_epoch}/{self.epochs}; nothing to train")
                 mark_stage_complete(self.run_dir, self.stage_idx, self.stage_name)
-            if self._is_ddp:
-                import torch.distributed as dist
-                dist.barrier()
+            self._barrier()
             return {"epe": self.best_metric}
 
         has_val = self.loaders.get("val") is not None
-        phase = self.stage_name
         if self._is_main_process():
             logger.info(f"training stage {self.stage_idx} '{self.stage_name}' for {self.epochs} epochs "
                         f"(amp={self.amp}/{self.amp_dtype if self.amp else '-'}, device={self.device.type}, "
@@ -720,14 +1057,14 @@ class Engine:
                         f"({self.n_trainable/1e6:.2f}M trainable)")
             if self.wandb is not None:
                 try:
-                    self.wandb.summary[f"{phase}/perf/params_total_M"] = self.n_params / 1e6
-                    self.wandb.summary[f"{phase}/perf/params_trainable_M"] = self.n_trainable / 1e6
+                    self.wandb.summary["performance/params_total_M"] = self.n_params / 1e6
+                    self.wandb.summary["performance/params_trainable_M"] = self.n_trainable / 1e6
                 except Exception:  # noqa: BLE001
                     pass
         last_val: Dict[str, float] = {}
         for epoch in range(self.start_epoch, self.epochs):
-            lr0, kw, tf_prob = self._apply_schedules(epoch)
-            tr = self.train_epoch(epoch, tf_prob=tf_prob)
+            lr0, kw, tf_prob, obs_p = self._apply_schedules(epoch)
+            tr = self.train_epoch(epoch, tf_prob=tf_prob, obs_dropout=obs_p)
             do_val = has_val and (epoch % self.val_every == 0 or epoch == self.epochs - 1)
             val = self.validate() if do_val else {}
             if val:
@@ -742,25 +1079,38 @@ class Engine:
                 self._bad_epochs += 1
 
             self.history.append({"epoch": epoch, "lr": lr0, "kl_weight": kw, "tf_prob": tf_prob,
+                                 "obs_dropout": obs_p,
                                  **{f"train_{k}": v for k, v in tr.items()},
                                  **{f"val_{k}": v for k, v in val.items()}})
-            self._log_console(epoch, lr0, kw, tf_prob, tr, val)
+            self._log_console(epoch, lr0, kw, tf_prob, obs_p, tr, val)
             self._log_perf_console(epoch)
             if self._is_main_process() and self.wandb is not None:
-                row = {"epoch": epoch, "stage": self.stage_idx, "lr": lr0,
-                       "kl_weight": kw, "tf_prob": tf_prob,
+                row = {"epoch": epoch, "stage": self.stage_idx,
+                       "schedules/lr": lr0, "schedules/kl_weight": kw,
+                       "schedules/tf_prob": tf_prob, "schedules/obs_dropout": obs_p,
                        **{f"train/epoch/{k}": v for k, v in tr.items()},
                        **{f"val/epoch/{k}": v for k, v in val.items()},
-                       **{f"{phase}/perf/{k}": v for k, v in self._train_perf.items()}}
+                       **{f"performance/{k}": v for k, v in self._train_perf.items()}}
                 self.wandb.log(row)
             if self.viz_every and (epoch % self.viz_every == 0 or epoch == self.epochs - 1):
-                self._log_tracks(epoch, split="val")     # random val clip (rank-0 only)
-                self._log_tracks(epoch, split="train")   # ... and a random train clip
+                # one batched submission (rank-0): a clip per val DATASET (>=1 video
+                # per dataset, each dataset-keyed), a train clip, and dense grids.
+                self._log_epoch_viz(epoch)
 
             if self._is_main_process():
                 torch.save(self._ckpt(epoch), self.dir / "last.pt")
                 if improved:
                     torch.save(self._ckpt(epoch), self.dir / "best.pt")
+
+            # Resync after the rank-0-only epoch viz + checkpoint so the other
+            # ranks don't enter the next epoch's all-reduce while rank 0 is busy.
+            self._barrier()
+
+            # periodic benchmark evaluation (monitoring): the full TAP metrics on
+            # the IS_EVAL_DATASET datasets every EVAL_EVERY epochs. Its own CSV /
+            # W&B table snapshot, tagged with the epoch.
+            if self.eval_every and epoch % self.eval_every == 0:
+                self._run_evaluation(epoch, tag=f"{self.stage_name}_ep{epoch + 1}")
 
             if self.patience and self._bad_epochs >= self.patience:
                 if self._is_main_process():
@@ -771,9 +1121,14 @@ class Engine:
             mark_stage_complete(self.run_dir, self.stage_idx, self.stage_name)
             logger.info(f"stage {self.stage_idx} '{self.stage_name}' complete -- best epe={self.best_metric:.3f}px "
                         f"(checkpoints in {self.dir})")
-        if self._is_ddp:
-            import torch.distributed as dist
-            dist.barrier()  # all ranks wait before returning (next stage must see completion marker)
+        self._flush_viz()                       # finish pending W&B video before the run can close
+        if self._viz_executor is not None:
+            self._viz_executor.shutdown(wait=True)
+            self._viz_executor = None
+        # end-of-stage benchmark evaluation (canonical CSV per stage + W&B table)
+        if self.eval_at_end:
+            self._run_evaluation(self.epochs - 1, tag=self.stage_name)
+        self._barrier()  # all ranks wait before returning (next stage must see completion marker)
         return last_val or {"epe": self.best_metric}
 
     def _log_train_step_console(self, epoch, step, n_batches, total, parts,
@@ -787,20 +1142,23 @@ class Engine:
             f"lr={self.optimizer.param_groups[0]['lr']:.2e} tf={tf_prob:.2f}"
         )
 
-    def _log_console(self, epoch, lr, kw, tf_prob, tr, val) -> None:
+    def _log_console(self, epoch, lr, kw, tf_prob, obs_p, tr, val) -> None:
         if not self._is_main_process():
             return
         line = f"[stage{self.stage_idx} {self.stage_name}] epoch {epoch + 1}/{self.epochs}"
         if tr:
             line += (f"  train: loss={tr.get('loss', float('nan')):.3f} epe={tr.get('epe', float('nan')):.2f}px "
                      f"mr={tr.get('motion_ratio', float('nan')):.2f} gate={tr.get('gate', float('nan')):.2f} "
+                     f"AJ={tr.get('average_jaccard', float('nan')):.3f} "
                      f"|g|={tr.get('grad_norm', float('nan')):.2f}")
         if val:
             line += (f"  val: loss={val.get('loss', float('nan')):.3f} epe={val.get('epe', float('nan')):.2f}px "
                      f"mr={val.get('motion_ratio', float('nan')):.2f} stuck={val.get('stuck_frac', float('nan')):.2f} "
                      f"δ={val.get('delta_avg', float('nan')):.3f} OA={val.get('occlusion_accuracy', float('nan')):.3f} "
                      f"AJ={val.get('average_jaccard', float('nan')):.3f}")
-        line += f"  lr={lr:.2e} kl_w={kw:.3f} tf={tf_prob:.2f}  best_epe={self.best_metric:.2f}"
+            if "rollout/epe" in val:
+                line += f" | roll_epe={val.get('rollout/epe', float('nan')):.2f}px roll_δ={val.get('rollout/delta_avg', float('nan')):.3f}"
+        line += f"  lr={lr:.2e} kl_w={kw:.3f} tf={tf_prob:.2f} obs_drop={obs_p:.2f}  best_epe={self.best_metric:.2f}"
         logger.info(line)
 
     def _log_perf_console(self, epoch) -> None:
