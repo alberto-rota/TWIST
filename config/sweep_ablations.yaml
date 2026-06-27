@@ -1,18 +1,22 @@
 # TWIST — parallel ablation grid over the two ceiling levers (from scratch).
 #
-# Tests, as a clean GRID (every cell, not a search), two levers:
-#   * MODEL.RGB_ENCODER.IMAGE_SIZE  448 vs 512   (localization resolution)
-#   * LOSS.ROLLOUT_WEIGHT           2.0 vs 4.0    (push the frame-free forecast)
-# => 2 x 2 = 4 trials, each a fresh from-scratch run on the SAME (augmented) data
+# Tests, as a clean GRID (every cell, not a search), four levers:
+#   * MODEL.RGB_ENCODER.IMAGE_SIZE   448 vs 512    (localization resolution)
+#   * LOSS.ROLLOUT_WEIGHT            2.0 vs 4.0     (push the frame-free forecast)
+#   * MODEL.OBSERVATION.MAX_CORR     0.0 vs 0.05    (sub-cell soft-argmax refinement)
+#   * MODEL.OBSERVATION.RADIUS_PX    24.0 vs 16.0   (cost-volume window tightness)
+# => 2^4 = 16 trials, each a fresh from-scratch run on the SAME (augmented) data
 # mix, so each lever's effect is unconfounded. Shorter EPOCHS for throughput; the
-# plateau shows by ~ep6 so 25 epochs is plenty to rank the cells.
+# plateau shows by ~ep6 so 25 epochs is plenty to rank the cells. (16 cells x 25ep
+# is a lot — drop a dim's second value, or split into two sweeps, to shrink it.)
 #
-# CAVEAT (per the per-threshold analysis): 448->512 is a MODEST resolution step
-# (28x28 -> 32x32 grid, 16->14px/cell, and it upsamples a 448 frame), so expect a
-# small effect. The measured gap is at TIGHT delta thresholds (9%/21% within
-# 1/2px), which is better targeted by sub-cell refinement (OBSERVATION.MAX_CORR
-# 0->0.05) and a tighter cost-volume window (OBSERVATION.RADIUS_PX 24->16) -- swap
-# those in for IMAGE_SIZE if the goal is delta_avg/AJ rather than confirming res.
+# Why these four: the per-threshold val breakdown shows the gap is at TIGHT delta
+# thresholds (9%/21% of pts within 1/2px though 89% within 16px) -> fine
+# localization. MAX_CORR (enable the zero-init sub-cell residual) and a tighter
+# RADIUS_PX (24->16 at K=9 = 4px sample spacing vs 6px) target that directly and
+# cheaply; IMAGE_SIZE 448->512 is the (modest, ~14% finer, upsampled-448) resolution
+# probe; ROLLOUT_WEIGHT pushes the forecast horizon. delta_avg/AJ are the metrics
+# these should move; mean EPE is tail-limited (data/robustness) and unlikely to.
 #
 # Why from scratch (not warm-started from the live runs): warm-starting all cells
 # from one plateaued 448 checkpoint would measure a fine-tune delta from a shared
@@ -174,8 +178,14 @@ parameters:
         VAL_FRACTION: 1.0
         IS_EVAL_DATASET: True
 
-  ### SWEPT KNOBS — the two ceiling levers (grid: 2 x 2 = 4 trials) ------------
+  ### SWEPT KNOBS — four levers (grid: 2^4 = 16 trials) -----------------------
+  # Original two ceiling levers (unchanged):
   MODEL.RGB_ENCODER.IMAGE_SIZE:
     values: [448, 512]
   LOSS.ROLLOUT_WEIGHT:
     values: [2.0, 4.0]
+  # Added fine-localization levers (target the tight-threshold delta gap):
+  MODEL.OBSERVATION.MAX_CORR:
+    values: [0.0, 0.05]        # 0 = pure soft-argmax; 0.05 = enable the zero-init sub-cell residual
+  MODEL.OBSERVATION.RADIUS_PX:
+    values: [24.0, 16.0]       # cost-volume window half-extent (16 -> 4px sample spacing at K=9)
