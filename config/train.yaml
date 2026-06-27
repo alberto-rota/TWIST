@@ -43,6 +43,7 @@ parameters:
         DEPTH: 2  # Inter-point self-attention blocks (rigidity)
         HEADS: 4  # Number of attention heads
         MAX_STEP: 0.12  # Max learned residual displacement (normalized ~= 15px); prior = pos + last_velocity + this (keeps the prior inside the observation window instead of saturating to ~87px)
+      ROLLOUT_VEL_DECAY: 1.0  # OFF by default. Friction on the constant-velocity skip during FRAME-FREE steps only (vel *= this each forecast step). Damps a velocity RUNAWAY (rollout motion_ratio >> 1) but CAUSES UNDERSHOOT on genuine constant-velocity motion (workshop 21: <1 made the Kubric forecast tail worse). Enable (e.g. 0.9) only if a live run shows persistent over-movement the rollout loss alone doesn't tame.
       HEADS:
         UNCERTAINTY: true  # Predict per-point aleatoric log-variance
 
@@ -69,7 +70,7 @@ parameters:
         FRAME_STRIDE: 1  # Keep every Nth frame
         REQUIRE_VISIBLE_AT_QUERY: true  # Drop points not visible at the query frame
         MIN_VISIBLE_FRAMES: 1  # Drop points visible in fewer than this many frames
-        # MAX_CLIPS: 8
+        MAX_CLIPS: 100
         
       # ----------------------------------------------------------------
 
@@ -77,6 +78,7 @@ parameters:
       ### TRAINING + VALIDATION
       KUBRIC:
         VAL_FRACTION: 0.1  # In-domain held-out split (10% of sequences) -> the train-distribution val signal
+
 
       POINTODYSSEY:
         VAL_FRACTION: 0.1  # In-domain held-out split (10% of sequences) -> the train-distribution val signal
@@ -104,6 +106,8 @@ parameters:
       ROBOTAP:
         VAL_FRACTION: 1.0  
 
+      VLSURGPT:
+        VAL_FRACTION: 1.0  
       # STIRCHALLENGE24:  
       #   VAL_FRACTION: 1.0  
 
@@ -153,6 +157,7 @@ parameters:
       HUBER_DELTA: 0.2  # Huber transition point (normalized units)
       UNC_WEIGHT: 0.0  # Heteroscedastic NLL OFF (drove total<0 and gamed confidence on the static solution)
       PRIOR_WEIGHT: 0.5  # Direct GT supervision of the prior mean (was implicit via KL only -> prior ran away)
+      ROLLOUT_WEIGHT: 2.0  # Multi-step frame-free rollout vs GT (observes ROLLOUT_OBSERVE_STEPS then forecasts the rest, supervised against GT): trains the prior to predict from its OWN propagated state -- the fix for the diverging val/epoch/rollout/* (1-step supervision alone leaves it exposure-biased). 0 disables.
 
   ###===========================================================================================================================
   ### VALIDATION
@@ -173,6 +178,8 @@ parameters:
   # meaned per dataset over the datasets flagged IS_EVAL_DATASET (set per-dataset under DATASETS; the TAP-Vid/RoboTAP/EndoTAPP-GT
   # registry entries default True). Writes a CSV under the run dir + a W&B table (rows=datasets, cols=metrics). Run offline with
   # `python evaluate.py --run <EXPERIMENT_NAME>`, or have training trigger it via the knobs below.
+  EVAL_QUERY_MODE:
+    value: first  # TAP-Vid query protocol (CoTracker-comparable): "first" = query each point at its FIRST VISIBLE frame and score only frames after it (the standard "queried first"); "frame0" = legacy all-points-at-frame-0. "first" avoids ever using the (0,0) occluded-coord placeholder as a query (the real harm of partial GT tracks).
   EVAL_AT_END:
     value: true  # Run the benchmark once after each stage's training finishes -> resul0ts/<run>/evaluation_<stage>.csv + W&B table
   EVAL_EVERY:

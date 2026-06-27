@@ -41,10 +41,18 @@ def tracking_metrics(
     point_mask: Optional[torch.Tensor] = None,
     thresholds=TAP_THRESHOLDS,
     query_frame: int = 0,
+    eval_mask: Optional[torch.Tensor] = None,
 ) -> Dict[str, float]:
+    """``eval_mask`` (B,T,N) bool, when given, is the set of **evaluation points**
+    (the TAP-Vid ``evaluation_points``) and *replaces* the ``time_mask``⊗``point_mask``
+    outer product. Use it to express per-point eval regions the outer product can't —
+    e.g. TAP-Vid "queried first" scores only frames *after* each point's own query
+    frame (see :mod:`utilities.evaluation`). Visibility is still applied on top, so
+    occluded GT frames inside the region count only toward OA / Jaccard-FP, never EPE."""
     coords = coords.float(); gt_tracks = gt_tracks.float()
     gt_vis_b = gt_vis.bool()
-    exist = _exist_mask(gt_vis, time_mask, point_mask).bool()
+    exist = (eval_mask.bool() if eval_mask is not None
+             else _exist_mask(gt_vis, time_mask, point_mask).bool())
     pred_vis = (torch.sigmoid(vis_logits) > 0.5)
 
     dist = torch.linalg.norm(coords - gt_tracks, dim=-1)       # (B,T,N) px

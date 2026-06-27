@@ -4,12 +4,13 @@ Computes the headline TAP metrics on the **evaluation datasets** -- the ones a
 config flags with ``IS_EVAL_DATASET: True`` (default ``False``) -- and reports
 their per-dataset mean. The reported metrics are:
 
+  * ``EPE``                 (``epe``)                 mean L2 endpoint error (px), lower better
   * ``Delta AVG``           (``delta_avg``)           position accuracy, higher better
   * ``Average Jaccard``     (``average_jaccard``)     position+visibility, higher better
   * ``Occlusion Accuracy``  (``occlusion_accuracy``)  visibility match, higher better
   * ``Time (ms/frame)``     (``ms_per_frame``)        wall-clock inference cost / frame
 
-The first three reuse :func:`models.metrics.tracking_metrics` (the *same*
+The first four reuse :func:`models.metrics.tracking_metrics` (the *same*
 definitions the engine monitors with), so eval numbers and the training
 ``val/epe`` family are directly comparable. ``ms_per_frame`` is measured around
 the model forward (CUDA-synchronised), warm-up batch excluded.
@@ -63,15 +64,16 @@ IS_EVAL_DATASET_KEY = "IS_EVAL_DATASET"
 
 # Reported metrics: machine key -> human header (CSV / W&B table columns).
 # Order here is the column order everywhere.
-METRIC_KEYS = ["delta_avg", "average_jaccard", "occlusion_accuracy", "ms_per_frame"]
+METRIC_KEYS = ["epe", "delta_avg", "average_jaccard", "occlusion_accuracy", "ms_per_frame"]
 METRIC_HEADERS = {
+    "epe": "EPE (px)",
     "delta_avg": "Delta AVG",
     "average_jaccard": "Average Jaccard",
     "occlusion_accuracy": "Occlusion Accuracy",
     "ms_per_frame": "Time (ms/frame)",
 }
-# The three quality metrics come from tracking_metrics; ms_per_frame is timed here.
-_QUALITY_KEYS = ["delta_avg", "average_jaccard", "occlusion_accuracy"]
+# The quality metrics come from tracking_metrics; ms_per_frame is timed here.
+_QUALITY_KEYS = ["epe", "delta_avg", "average_jaccard", "occlusion_accuracy"]
 
 
 def _nanmean(xs: List[float]) -> float:
@@ -151,6 +153,57 @@ def _amp_settings(device: torch.device, amp: Optional[bool], amp_dtype):
     return use_amp, amp_dtype
 
 
+# Benchmark query protocols (how each GT point's query frame is chosen).
+QUERY_MODES = ("first", "frame0")
+
+
+@torch.no_grad()
+def _first_visible_eval(model, frames, gt_tracks, gt_vis, point_mask, *, autocast_ctx):
+    """TAP-Vid **"queried first"** forward for a batch of clips.
+
+    Each GT point is queried at its **first visible frame** and scored only on the
+    frames **strictly after** that frame (the standard TAP-Vid ``evaluation_points``
+    for ``first`` mode). The TWIST model takes a single query frame per forward, so
+    points that share a first-visible frame are grouped and run together (one forward
+    per distinct first-visible frame), then scattered back into per-point arrays.
+    Points never visible (or padded out by ``point_mask``) are left out of the eval
+    mask entirely. This is the protocol that makes our numbers comparable to
+    CoTracker's — and it sidesteps the ``(0,0)`` occluded-coordinate placeholder ever
+    being used as a *query* (the real harm of those placeholders; see CLAUDE.md).
+
+    Returns ``(coords, vis_logits, eval_mask)`` shaped ``(B,T,N,2)/(B,T,N)/(B,T,N)``.
+    """
+    B, T = frames.shape[:2]
+    N = gt_vis.shape[2]
+    device = frames.device
+    gt_vis_b = gt_vis.bool()
+    pm = point_mask.bool() if point_mask is not None else torch.ones(B, N, dtype=torch.bool, device=device)
+
+    coords = gt_tracks.clone().float()                          # overwritten per group
+    vis_logits = torch.full((B, T, N), -10.0, device=device, dtype=torch.float32)
+    eval_mask = torch.zeros((B, T, N), dtype=torch.bool, device=device)
+
+    for b in range(B):
+        vis = gt_vis_b[b]                                       # (T,N)
+        usable = vis.any(0) & pm[b]                             # (N,) visible somewhere & real
+        if not usable.any():
+            continue
+        first_vis = vis.float().argmax(0)                      # (N,) first visible frame (0 if none)
+        for f in torch.unique(first_vis[usable]).tolist():
+            f = int(f)
+            idx = ((first_vis == f) & usable).nonzero(as_tuple=True)[0]   # points queried at f
+            q_xy = gt_tracks[b, f, idx].float()                # (n_g,2) the (visible) query coord
+            t_col = torch.full((idx.numel(), 1), float(f), device=device)
+            queries = torch.cat([t_col, q_xy], dim=-1).unsqueeze(0).float()   # (1,n_g,3)
+            with autocast_ctx():
+                out = model(frames[b:b + 1], queries)
+            coords[b, :, idx] = out["coords"][0].float()
+            vis_logits[b, :, idx] = out["vis_logits"][0].float()
+            if f + 1 < T:
+                eval_mask[b, f + 1:, idx] = True               # score strictly after the query frame
+    return coords, vis_logits, eval_mask
+
+
 @torch.no_grad()
 def evaluate_model_on_dataset(
     model: torch.nn.Module,
@@ -163,6 +216,7 @@ def evaluate_model_on_dataset(
     amp_dtype=None,
     max_steps: int = 0,
     query_frame: int = 0,
+    query_mode: str = "first",
 ) -> Dict[str, float]:
     """Run ``model`` over ``dataset`` and return the reported metric means.
 
@@ -171,9 +225,21 @@ def evaluate_model_on_dataset(
     processed; on CUDA a warm-up forward runs first (outside timing) so cudnn
     autotune isn't charged to it. Returns ``delta_avg``, ``average_jaccard``,
     ``occlusion_accuracy``, ``ms_per_frame`` plus ``n_clips`` / ``n_frames``.
+
+    ``query_mode``: ``"first"`` (TAP-Vid "queried first" — each point queried at its
+    first visible frame, scored only after it; the comparable-to-CoTracker default)
+    or ``"frame0"`` (legacy — all points queried at frame 0, every frame scored).
+    Timing (``ms_per_frame``) always uses the single all-points-at-frame-0 forward,
+    so it reflects realistic one-pass inference cost regardless of ``query_mode``.
     """
     model.eval()
+    if query_mode not in QUERY_MODES:
+        raise ValueError(f"query_mode must be one of {QUERY_MODES}, got {query_mode!r}")
     use_amp, amp_dtype = _amp_settings(device, amp, amp_dtype)
+
+    def autocast_ctx():
+        return torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp)
+
     loader = DataLoader(
         dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,
         drop_last=False, collate_fn=_collate_for(dataset),
@@ -219,15 +285,23 @@ def evaluate_model_on_dataset(
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         t0 = time.perf_counter()
-        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+        with autocast_ctx():
             out = model(frames, queries, point_mask=point_mask)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         compute_s += time.perf_counter() - t0
         timed_frames += nf
 
-        m = tracking_metrics(out["coords"], gt_tracks, out["vis_logits"], gt_vis,
-                             time_mask, point_mask, query_frame=query_frame)
+        # Quality metrics: TAP-Vid "first" (query each point at its first visible
+        # frame, score only after it) or legacy "frame0" (reuse the timed forward).
+        if query_mode == "first":
+            e_coords, e_vislog, e_mask = _first_visible_eval(
+                model, frames, gt_tracks, gt_vis, point_mask, autocast_ctx=autocast_ctx)
+            m = tracking_metrics(e_coords, gt_tracks, e_vislog, gt_vis,
+                                 eval_mask=e_mask, query_frame=query_frame)
+        else:
+            m = tracking_metrics(out["coords"], gt_tracks, out["vis_logits"], gt_vis,
+                                 time_mask, point_mask, query_frame=query_frame)
         for k in _QUALITY_KEYS:
             v = m.get(k, float("nan"))
             if v == v:                                  # NaN-safe
@@ -260,18 +334,22 @@ def evaluate(
     amp_dtype=None,
     max_steps: int = 0,
     query_frame: int = 0,
+    query_mode: Optional[str] = None,
 ) -> Dict[str, Dict[str, float]]:
     """Evaluate ``model`` on every selected eval dataset.
 
     Returns ``{dataset_name: metrics, ..., "MEAN": metrics}`` where ``MEAN`` is
     the across-dataset mean of each metric (NaN-safe). Datasets whose data is not
-    present on disk are skipped with a warning.
+    present on disk are skipped with a warning. ``query_mode`` defaults to the
+    config's ``EVAL_QUERY_MODE`` (``"first"`` if unset) — see
+    :func:`evaluate_model_on_dataset`.
     """
     names = dataset_names if dataset_names is not None else select_eval_datasets(config)
     if not names:
         logger.warning("no datasets flagged IS_EVAL_DATASET -- nothing to evaluate")
         return {}
-    logger.info(f"evaluating on {len(names)} dataset(s): {names}")
+    qm = (query_mode or str(config.get("EVAL_QUERY_MODE", "first"))).lower()
+    logger.info(f"evaluating on {len(names)} dataset(s) [query_mode={qm}]: {names}")
 
     results: Dict[str, Dict[str, float]] = {}
     for name in names:
@@ -282,12 +360,13 @@ def evaluate(
         m = evaluate_model_on_dataset(
             model, ds, device, batch_size=batch_size, num_workers=num_workers,
             amp=amp, amp_dtype=amp_dtype, max_steps=max_steps, query_frame=query_frame,
+            query_mode=qm,
         )
         results[name] = m
         logger.info(
-            f"  {name}: δ_avg={m['delta_avg']:.3f} AJ={m['average_jaccard']:.3f} "
-            f"OA={m['occlusion_accuracy']:.3f} {m['ms_per_frame']:.2f} ms/frame "
-            f"({m['n_clips']} clips)"
+            f"  {name}: EPE={m['epe']:.2f}px δ_avg={m['delta_avg']:.3f} "
+            f"AJ={m['average_jaccard']:.3f} OA={m['occlusion_accuracy']:.3f} "
+            f"{m['ms_per_frame']:.2f} ms/frame ({m['n_clips']} clips)"
         )
 
     if results:
@@ -387,6 +466,7 @@ def evaluate_and_report(
     amp_dtype=None,
     max_steps: int = 0,
     query_frame: int = 0,
+    query_mode: Optional[str] = None,
     csv_name: Optional[str] = None,
 ) -> Dict[str, Dict[str, float]]:
     """Evaluate then emit all reports: CSV under ``run_dir``, a console table, and
@@ -398,7 +478,7 @@ def evaluate_and_report(
     results = evaluate(
         model, config, device, dataset_names=dataset_names, max_clips=max_clips,
         batch_size=batch_size, num_workers=num_workers, amp=amp, amp_dtype=amp_dtype,
-        max_steps=max_steps, query_frame=query_frame,
+        max_steps=max_steps, query_frame=query_frame, query_mode=query_mode,
     )
     if not results:
         logger.warning("evaluation produced no results (no datasets available)")
@@ -463,6 +543,7 @@ def evaluate_checkpoint(
     batch_size: int = 1,
     num_workers: int = 0,
     max_steps: int = 0,
+    query_mode: Optional[str] = None,
 ) -> Dict[str, Dict[str, float]]:
     """Load a trained checkpoint and evaluate it end to end.
 
@@ -484,7 +565,7 @@ def evaluate_checkpoint(
         results = evaluate_and_report(
             model, config, device, run_dir, wandb_run=wandb_run, tag=tag,
             dataset_names=dataset_names, max_clips=max_clips, batch_size=batch_size,
-            num_workers=num_workers, max_steps=max_steps,
+            num_workers=num_workers, max_steps=max_steps, query_mode=query_mode,
         )
     finally:
         if owns and wandb_run is not None:

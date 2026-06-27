@@ -2,7 +2,7 @@
 """Standalone evaluation entry point.
 
 Loads a trained checkpoint, rebuilds the model from its embedded config, and
-computes the headline TAP metrics (Delta AVG / Average Jaccard / Occlusion
+computes the headline TAP metrics (EPE / Delta AVG / Average Jaccard / Occlusion
 Accuracy / ms-per-frame) on the ``IS_EVAL_DATASET``-flagged datasets, then
 writes a CSV under the run dir and (optionally) a W&B table.
 
@@ -74,6 +74,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=1, help="eval batch size (default 1)")
     p.add_argument("--workers", type=int, default=0, help="dataloader workers (default 0)")
     p.add_argument("--max-steps", type=int, default=0, help="cap batches per dataset (0=all)")
+    p.add_argument("--query-mode", choices=("first", "frame0"), default=None,
+                   help="TAP-Vid query protocol: 'first' (query each point at its first "
+                        "visible frame, score after it; CoTracker-comparable) or 'frame0' "
+                        "(legacy, all points at frame 0). Default: config EVAL_QUERY_MODE / 'first'")
     p.add_argument("--tag", default="", help="CSV name tag -> evaluation_<tag>.csv")
     p.add_argument("--out-dir", default=None, help="override where the CSV is written")
     p.add_argument("--wandb", action="store_true", help="open a W&B run and log the table")
@@ -119,6 +123,7 @@ def main() -> int:
         batch_size=args.batch_size,
         num_workers=args.workers,
         max_steps=args.max_steps,
+        query_mode=args.query_mode,
     )
     if not results:
         logger.error("evaluation produced no results (no eval datasets available?)")
