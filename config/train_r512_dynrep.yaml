@@ -131,7 +131,10 @@ parameters:
   ### TRAINING (ENGINE)
   ###===========================================================================================================================
   BATCH_SIZE:
-    value: 2  # 512 encoder memory on A100-40; raise on A100-80 / DDP
+    value: 6  # 512 grows only the stored feats (28x28->32x32, +31%) + encoder transient;
+              # the trainable graph is tied to TARGET_SIZE=448 (unchanged). From a bs8@448
+              # OOM-edge, ~6 fits at 512 with headroom. VERIFY via the per-epoch peak_mem_gb
+              # log on a 2-step smoke; drop to 4 if OOM, push to 8 if there's room.
   EPOCHS:
     value: 50
   LR:

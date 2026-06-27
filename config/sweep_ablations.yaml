@@ -57,7 +57,9 @@ parameters:
 
   ### TRAINING — fixed engine settings (swept knobs declared at the bottom)
   BATCH_SIZE:
-    value: 2          # 512-safe on A100-40; see header
+    value: 6          # must be safe for the heavier 512 cells (only feats+encoder grow vs 448,
+                      # not the trainable graph). From a bs8@448 OOM-edge, ~6 fits at 512;
+                      # verify via peak_mem_gb on a smoke, drop to 4 if any cell OOMs.
   EPOCHS:
     value: 25         # short ablation trials
   LR:
