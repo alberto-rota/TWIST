@@ -1,12 +1,18 @@
 # TWIST — parallel ablation grid over the two ceiling levers (from scratch).
 #
-# Tests, as a clean GRID (every cell, not a search), the two changes the plateau
-# analysis pointed at:
+# Tests, as a clean GRID (every cell, not a search), two levers:
 #   * MODEL.RGB_ENCODER.IMAGE_SIZE  448 vs 512   (localization resolution)
 #   * LOSS.ROLLOUT_WEIGHT           2.0 vs 4.0    (push the frame-free forecast)
 # => 2 x 2 = 4 trials, each a fresh from-scratch run on the SAME (augmented) data
 # mix, so each lever's effect is unconfounded. Shorter EPOCHS for throughput; the
 # plateau shows by ~ep6 so 25 epochs is plenty to rank the cells.
+#
+# CAVEAT (per the per-threshold analysis): 448->512 is a MODEST resolution step
+# (28x28 -> 32x32 grid, 16->14px/cell, and it upsamples a 448 frame), so expect a
+# small effect. The measured gap is at TIGHT delta thresholds (9%/21% within
+# 1/2px), which is better targeted by sub-cell refinement (OBSERVATION.MAX_CORR
+# 0->0.05) and a tighter cost-volume window (OBSERVATION.RADIUS_PX 24->16) -- swap
+# those in for IMAGE_SIZE if the goal is delta_avg/AJ rather than confirming res.
 #
 # Why from scratch (not warm-started from the live runs): warm-starting all cells
 # from one plateaued 448 checkpoint would measure a fine-tune delta from a shared

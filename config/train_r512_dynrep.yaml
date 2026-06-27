@@ -2,11 +2,20 @@
 #
 # Rationale (from the lap32y0x/8c5afg1k A/B + plateau analysis):
 #   * val EPE plateaus ~22px by epoch 6 while train EPE keeps dropping -> a
-#     representation/data CEILING, not under-training. So we raise the ceiling:
-#   * IMAGE_SIZE 448 -> 512   : encoder 16x16 -> 32x32 grid (16px/cell -> 8px/cell),
-#                               the documented ~2x-localization lever for EPE/delta/AJ.
+#     representation/data CEILING, not under-training. The plateau is TWO failures:
+#       - delta_avg is fine-localization-limited (only 9%/21% of pts within 1/2px,
+#         but 89% within 16px) -> a feature-granularity / sub-cell-refinement issue.
+#       - mean EPE is tail-limited (~11% lost/drifting pts dominate the average)
+#         -> a data-diversity / matching-robustness issue, NOT a resolution one.
+#   * IMAGE_SIZE 448 -> 512   : MODEST lever. DINOv3 patch=16 -> grid 28x28 -> 32x32,
+#                               i.e. 16px/cell -> 14px/cell in the 448 eval space (~14%
+#                               finer, NOT 2x). And since TARGET_SIZE=448 this UPSAMPLES
+#                               a 448 frame (no new detail). Expect a small delta bump at
+#                               best; a real localization gain needs TARGET_SIZE raised
+#                               too + sub-cell refinement (OBSERVATION.MAX_CORR>0) +
+#                               a tighter window (RADIUS_PX). See the sweep notes.
 #   * +DynamicReplica in TRAIN: data diversity to close the widening train/val gap
-#                               (it was eval-only before).
+#                               (it was eval-only before) -- the main lever for the EPE tail.
 #   * ROLLOUT_WEIGHT 2.0      : kept — the A/B validated it (much better frame-free
 #                               forecast at ~zero cost to observed tracking).
 #
@@ -54,7 +63,7 @@ parameters:
       TOKEN_DIM: 256
       RGB_ENCODER:
         ENCODER: facebook/dinov3-vitl16-pretrain-lvd1689m
-        IMAGE_SIZE: 512  # LEVER: 448 -> 512 (32x32 grid, 8px/cell); independent of DATASETS.*.TARGET_SIZE
+        IMAGE_SIZE: 512  # 28x28 -> 32x32 grid (16px/cell -> 14px/cell in the 448 eval space; ~14% finer, upsamples a 448 frame). Modest; see header.
         FREEZE_BACKBONE: true
         RGB_ENCODER_LR: 0.0
       OBSERVATION:
