@@ -33,7 +33,12 @@ wandb sweep config/sweep.yaml           # -> SWEEP_ID
 wandb agent <entity>/<project>/<id>
 
 # Real GPU training: submit to SLURM (A100-40). Re-submitting auto-resumes from last.pt.
-sbatch train_a100.sbatch                # job output -> /home/hpc/v120bb/v120bb18/job_outputs/
+sbatch .sbatch_scripts/train_a100.sbatch   # job output -> /home/hpc/v120bb/v120bb18/job_outputs/
+
+# Launch a sweep AGENT as a SLURM job via jsub -w (template carries __JSUB_WANDB_AGENT_PLACEHOLDER__):
+wandb sweep config/sweep_ablations.yaml                                   # -> twisteam/twist/<SWEEP_ID>
+jsub -w 'wandb agent twisteam/twist/<SWEEP_ID>' agent_gpu/singlegpu/A100_40GB.sbatch
+# submit the same job N times = N parallel agents (one per GPU); agent_gpu/singlegpu/{A100_40GB,A100_80GB,A40_48GB}.sbatch
 ```
 
 `uv`-managed env (`.venv`, Python 3.13): use `source .venv/bin/activate` (the sbatch scripts do `module load python` first). **There is no test suite** — verification is done through executed workshop notebooks and the boot/smoke runs.
