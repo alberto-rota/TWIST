@@ -266,6 +266,11 @@ class Engine:
         # ``val/epoch/rollout/*`` (EPE/delta/AJ on the forecast region only).
         self.rollout_eval = bool(config.get("ROLLOUT_EVAL", False))
         self.rollout_observe = int(config.get("ROLLOUT_OBSERVE_STEPS", 4))
+        # multi-step rollout TRAINING loss: when LOSS.ROLLOUT_WEIGHT>0 the model also
+        # forecasts frame-free from a clean observed state (same ROLLOUT_OBSERVE_STEPS
+        # as eval) and the loss supervises it vs GT -- trains the prior to forecast
+        # through occlusion, the cure for the rollout divergence the eval exposes.
+        self.rollout_loss = float(getattr(loss_fn, "rollout_weight", 0.0)) > 0.0
 
         # observation-dropout curriculum: per-step prob of dropping the frame
         # correction during TRAINING so the loss at those steps trains the prior
@@ -432,6 +437,7 @@ class Engine:
         if getattr(self.model, "encoder", None) is not None and getattr(self.model.encoder, "frozen", False):
             self.model.encoder.eval()                    # keep the frozen backbone in eval
         agg = {"loss": 0.0, "pos": 0.0, "prior": 0.0, "unc": 0.0, "vis": 0.0, "kl": 0.0, "epe": 0.0,
+               "rollout": 0.0, "rollout_epe": 0.0, "w_rollout": 0.0,
                "w_pos": 0.0, "w_prior": 0.0, "w_unc": 0.0, "w_vis": 0.0, "w_kl": 0.0,
                "gate": 0.0, "motion_ratio": 0.0, "obs_kept": 0.0}
         # full TAP metrics on the train batches, NaN-safe (separate counters since a
@@ -462,7 +468,11 @@ class Engine:
                 out = self.model(frames, queries, point_mask=tgt.get("point_mask"),
                                  observe_mask=observe_mask,
                                  tf_prob=tf_prob,
-                                 gt_tracks=tgt["tracks"] if tf_prob > 0.0 else None)
+                                 gt_tracks=tgt["tracks"] if tf_prob > 0.0 else None,
+                                 # multi-step rollout supervision: observe the same
+                                 # ROLLOUT_OBSERVE_STEPS the eval uses, then forecast
+                                 # the rest frame-free (only when LOSS.ROLLOUT_WEIGHT>0)
+                                 rollout_observe=self.rollout_observe if self.rollout_loss else None)
                 total, parts = self.loss_fn(out, tgt)
             grad_norm = 0.0
             if self.use_scaler:
@@ -504,7 +514,8 @@ class Engine:
                 if v == v:                                   # finite
                     m_sum[k] += v; m_cnt[k] += 1
             agg["loss"] += float(total.detach())
-            for k in ("pos", "prior", "unc", "vis", "kl", "epe", "w_pos", "w_prior", "w_unc", "w_vis", "w_kl"):
+            for k in ("pos", "prior", "unc", "vis", "kl", "epe", "rollout", "rollout_epe",
+                      "w_pos", "w_prior", "w_unc", "w_vis", "w_kl", "w_rollout"):
                 agg[k] += float(parts[k])
             agg["gate"] += gate
             agg["motion_ratio"] += motion_ratio
@@ -524,6 +535,8 @@ class Engine:
                         "train/step_vis": float(parts["vis"]),
                         "train/step_kl": float(parts["kl"]),
                         "train/step_unc": float(parts["unc"]),
+                        "train/step_rollout": float(parts["rollout"]),
+                        "train/step_rollout_epe": float(parts["rollout_epe"]),
                         "train/step_grad_norm": grad_norm,
                         "train/step_gate": gate,
                         "train/step_motion_ratio": motion_ratio,

@@ -234,6 +234,7 @@ class TrackerWorldModel(nn.Module):
         trans_max_step: float = 0.12,
         uncertainty: bool = True,
         encode_chunk: int = 32,
+        rollout_vel_decay: float = 1.0,
         verbose: bool = True,
         **kwargs,
     ) -> None:
@@ -247,6 +248,11 @@ class TrackerWorldModel(nn.Module):
         self.dh = hidden_dim
         self.uncertainty = uncertainty
         self.encode_chunk = encode_chunk
+        # friction on the constant-velocity prior during FRAME-FREE steps only: the
+        # ``pos + vel + delta`` skip compounds a biased velocity into the ~4x over-move
+        # seen in long rollouts. <1 decays carried momentum toward 0 each forecast step
+        # (no effect on observed steps, where the observation re-anchors velocity). 1=off.
+        self.rollout_vel_decay = float(rollout_vel_decay)
 
     # -- state ---------------------------------------------------------------- #
     def init_state(self, query_xy: torch.Tensor, feats_q: torch.Tensor, hw) -> ParticleState:
@@ -283,7 +289,10 @@ class TrackerWorldModel(nn.Module):
             post_mean, post_logvar = prior_mean, prior_logvar
             vis_logit, gate_logit = state["vis_logit"], prior_mean.new_zeros(prior_mean.shape[:-1] + (1,)) - 10.0
             pos = prior_mean
-        new_state = ParticleState(pos=pos, vel=self._advance(state["pos"], pos, hw),
+        new_vel = self._advance(state["pos"], pos, hw)
+        if not use_observation and self.rollout_vel_decay != 1.0:
+            new_vel = new_vel * self.rollout_vel_decay          # friction: damp the frame-free runaway
+        new_state = ParticleState(pos=pos, vel=new_vel,
                                   feat=state["feat"], hidden=new_hidden, vis_logit=vis_logit)
         out = dict(prior_mean=prior_mean, prior_logvar=prior_logvar,
                    post_mean=post_mean, post_logvar=post_logvar,
@@ -311,6 +320,8 @@ class TrackerWorldModel(nn.Module):
         observe_mask: Optional[torch.Tensor] = None,
         tf_prob: float = 0.0,
         gt_tracks: Optional[torch.Tensor] = None,
+        rollout_observe: Optional[int] = None,
+        rollout_horizon: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         b, t = frames.shape[:2]
         h, w = int(frames.shape[-2]), int(frames.shape[-1])
@@ -374,6 +385,31 @@ class TrackerWorldModel(nn.Module):
             "gate_logits": torch.stack(rec["gate_logits"], dim=1).squeeze(-1),  # (B,T,N)
             "frame_hw": hw,
         }
+
+        # --- optional differentiable multi-step rollout supervision -------------
+        # Mirrors the rollout-eval protocol (observe ``rollout_observe`` real frames
+        # from the query, then forecast frame-free) but WITH gradients, so the loss
+        # can train the prior to predict from its OWN propagated state -- the cure
+        # for the exposure bias that lets a 1-step-supervised prior diverge in
+        # free-running rollout. Reuses ``feats`` (no re-encode) from a fresh state,
+        # observed CLEANLY (no teacher forcing / dropout) so the forecast starts from
+        # the model's own observed estimate exactly as eval does. ``rollout_horizon``
+        # defaults to the rest of the clip.
+        if rollout_observe is not None:
+            obs_end = min(qf + int(rollout_observe), t - 1)          # last observed step
+            start = obs_end + 1                                      # first forecast step
+            horizon = (t - start) if rollout_horizon is None else min(int(rollout_horizon), t - start)
+            if horizon > 0:
+                rs = self.init_state(query_xy, feats[:, qf], hw)
+                for ti in range(qf + 1, obs_end + 1):               # clean observe
+                    rs, _ = self.step(rs, feats[:, ti], hw, point_mask, use_observation=True)
+                roll = []
+                for _ in range(horizon):                            # frame-free forecast (grad on)
+                    rs, _ = self.step(rs, feats_next=None, hw=hw, point_mask=point_mask,
+                                      use_observation=False)
+                    roll.append(rs["pos"])
+                out["rollout_coords"] = torch.stack(roll, dim=1)    # (B,horizon,N,2)
+                out["rollout_start"] = start
         return out
 
     # -- frame-free rollout (occlusion / forecast / counterfactual) ----------- #

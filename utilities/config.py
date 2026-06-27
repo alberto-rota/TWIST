@@ -557,6 +557,7 @@ def create_model_from_config(config: "DotMap", device, verbose: bool = True):
         trans_max_step=float(trans.get("MAX_STEP", 0.12)),
         uncertainty=bool(heads.get("UNCERTAINTY", True)),
         encode_chunk=int(mc.get("ENCODE_CHUNK", 32)),
+        rollout_vel_decay=float(mc.get("ROLLOUT_VEL_DECAY", 1.0)),
         verbose=verbose,
     ).to(device)
 
@@ -585,5 +586,6 @@ def create_loss_from_config(config: "DotMap", device=None):
         huber_delta=float(lc.get("HUBER_DELTA", 0.2)),
         unc_weight=float(lc.get("UNC_WEIGHT", 0.0)),
         prior_weight=float(lc.get("PRIOR_WEIGHT", 0.5)),
+        rollout_weight=float(lc.get("ROLLOUT_WEIGHT", 0.0)),
     )
     return loss.to(device) if device is not None else loss

@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import os
 import time
+from datetime import timedelta
 from typing import Any, Dict, Optional
 
 import torch.distributed as dist
@@ -162,7 +163,16 @@ def run_pipeline(mode: str = "train", config: Optional[Dict[str, Any]] = None) -
     world_size = 1
     local_rank = 0
     if is_ddp:
-        dist.init_process_group(backend="nccl")
+        # Generous collective timeout (default 60 min, override via DDP_TIMEOUT_MIN).
+        # The default 10 min is too short here: validate() ends in a single metrics
+        # all-reduce after a long, no-sync val loop (ROLLOUT_EVAL doubles forwards,
+        # MAX_VAL_STEPS uncapped), so cross-rank dataloading skew over the shared FS
+        # can leave the fast rank waiting >10 min and trip the NCCL watchdog. The
+        # EVAL_AT_END / EVAL_EVERY path is worse: ranks 1.. wait at _barrier() while
+        # rank 0 runs the whole-dataset benchmark solo. This timeout governs both.
+        ddp_timeout_min = float(os.environ.get("DDP_TIMEOUT_MIN", "60"))
+        dist.init_process_group(backend="nccl",
+                                timeout=timedelta(minutes=ddp_timeout_min))
         rank = dist.get_rank()
         world_size = dist.get_world_size()
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -172,7 +182,8 @@ def run_pipeline(mode: str = "train", config: Optional[Dict[str, Any]] = None) -
         cfg.WORLD_SIZE = world_size
         cfg.LOCAL_RANK = local_rank
         if rank == 0:
-            logger.info(f"DDP enabled: world_size={world_size}, backend=nccl")
+            logger.info(f"DDP enabled: world_size={world_size}, backend=nccl, "
+                        f"collective_timeout={ddp_timeout_min:.0f}min")
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

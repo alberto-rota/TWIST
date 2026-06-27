@@ -1,0 +1,225 @@
+parameters:
+
+  ###===========================================================================================================================
+  ### RUN / GENERAL
+  ###===========================================================================================================================
+  EXPERIMENT_NAME:
+    value:   # Run identity -> $RESULTS_DIR/<name>/; new name = fresh run, same name resumes last.pt
+  RESUME:
+    value: scratch  # Checkpoint to resume from: "scratch" | "last" | "best" | <EXPERIMENT_NAME>
+  WORKERS:
+    value: 8  # Number of DataLoader worker processes
+  PIN_MEMORY:
+    value: true  # Pin memory in DataLoader for faster GPU transfer
+  NO_WANDB:
+    value: false  # Disable WandB logging if True (useful for local debugging)
+  SMOKE:
+    value: false  # Real config on a tiny volume (1 epoch, batch 1, few train/val iters + clips); also via -s/--smoke; tune with SMOKE_TRAIN_STEPS / SMOKE_VAL_STEPS (default 2)
+  WANDB_PROJECT:
+    value: twist  # WandB project name
+  SEED:
+    value: 42  # Global random seed
+
+  ###===========================================================================================================================
+  ### MODEL — OBSERVATION-CORRECTED STATE-SPACE TRACKER (see models/)
+  ###===========================================================================================================================
+  MODEL:
+    value:
+      MODEL_CLASS: TrackerWorldModel  # Main model class name (must match class in models/)
+      MODEL_MODULE: models  # Module name to import model classes from
+      HIDDEN_DIM: 256  # GRU dynamics-state width
+      TOKEN_DIM: 256  # Particle token width
+      RGB_ENCODER:
+        ENCODER: facebook/dinov3-vitl16-pretrain-lvd1689m  # DINOv3 ViT-L/16 (dim 1024, patch 16); or "cnn"
+        IMAGE_SIZE: 448  # Encoder's internal square resize -> 16x16 feature grid (16px/cell); QUALITY LEVER: 512 -> 32x32 grid (8px/cell) ~doubles localization precision at ~2.5x encoder cost; independent of DATASETS.*.TARGET_SIZE (256)
+        FREEZE_BACKBONE: true  # Freeze encoder weights
+        RGB_ENCODER_LR: 0.0  # Learning rate for RGB encoder (0.0 = frozen; engine reads this for param groups)
+      OBSERVATION:  # Local cost-volume soft-argmax localizer
+        K: 9  # KxK feature window (denser sampling for the soft-argmax)
+        RADIUS_PX: 24.0  # Window half-extent (pixels)
+        HEADS: 4  # Number of attention heads
+        MAX_CORR: 0.0  # Optional zero-init learned sub-cell residual (0 = pure soft-argmax)
+      TRANSITION:  # Frame-free constant-velocity dynamics prior
+        DEPTH: 2  # Inter-point self-attention blocks (rigidity)
+        HEADS: 4  # Number of attention heads
+        MAX_STEP: 0.12  # Max learned residual displacement (normalized ~= 15px); prior = pos + last_velocity + this (keeps the prior inside the observation window instead of saturating to ~87px)
+      ROLLOUT_VEL_DECAY: 1.0  # OFF by default. Friction on the constant-velocity skip during FRAME-FREE steps only (vel *= this each forecast step). Damps a velocity RUNAWAY (rollout motion_ratio >> 1) but CAUSES UNDERSHOOT on genuine constant-velocity motion (workshop 21: <1 made the Kubric forecast tail worse). Enable (e.g. 0.9) only if a live run shows persistent over-movement the rollout loss alone doesn't tame.
+      HEADS:
+        UNCERTAINTY: true  # Predict per-point aleatoric log-variance
+
+  ###===========================================================================================================================
+  ### DATA
+  ###===========================================================================================================================
+  # Identity defaults (ROOT_DIR, READER) live in dataset/wrappers.py DATASET_DEFAULTS; configs only override per-experiment sampling.
+  DATASETS:
+    value:
+
+      # ----------------------------------------------------------------
+      ### OVERRIDE — APPLIED TO ALL DATASETS
+      OVERRIDE_ALL_DATASETS:
+        SPLIT_SEED: 42  # Deterministic train/val split seed
+        TARGET_SIZE: [448, 448]  # Resize all loaded frames to [H, W]
+        CLIP_LEN: 24  # Output frames per clip (== train clip length)
+        LOAD_FRAMES: true  # Load RGB frames
+        LOAD_DEPTHS: false  # Load depth maps (model-unused)
+        FRAMES_AS_FLOAT: false  # Return frames as float instead of uint8
+        MARK_OFFSCREEN_INVISIBLE: true  # Mark off-screen points as invisible
+        POINT_SAMPLE_MODE: even  # Point sampling: even | random | grid | first
+        QUERY_FRAME: 0  # Frame that defines the query points
+        CLIP_STRIDE: null  # Stride between clip starts (null -> non-overlapping clips)
+        FRAME_STRIDE: 1  # Keep every Nth frame
+        REQUIRE_VISIBLE_AT_QUERY: true  # Drop points not visible at the query frame
+        MIN_VISIBLE_FRAMES: 1  # Drop points visible in fewer than this many frames
+        
+      # ----------------------------------------------------------------
+
+      # ----------------------------------------------------------------
+      ### TRAINING + VALIDATION
+      KUBRIC:
+        VAL_FRACTION: 0.1  # In-domain held-out split (10% of sequences) -> the train-distribution val signal
+        MAX_CLIPS: 1000
+
+      POINTODYSSEY:
+        VAL_FRACTION: 0.1  # In-domain held-out split (10% of sequences) -> the train-distribution val signal
+
+      CHOLEC80:  # Surgical validation (CoTracker pseudo-label tracks)
+        VAL_FRACTION: 1.0  # Eval-only: all sequences -> validation
+        MAX_CLIPS: 20  # Cap total clips per dataset (null = no cap)
+        
+      # ----------------------------------------------------------------
+      ### EVALUATION
+      TAPVID_KINETICS:
+        VAL_FRACTION: 1.0        
+        IS_EVAL_DATASET: True
+
+      TAPVID_RGB_STACKING:
+        VAL_FRACTION: 1.0  
+        IS_EVAL_DATASET: True
+
+      TAPVID_DAVIS:
+        VAL_FRACTION: 1.0  
+        IS_EVAL_DATASET: True
+
+      DYNAMICREPLICA:
+        VAL_FRACTION: 1.0  
+        IS_EVAL_DATASET: True
+
+      SURGICALMOTION:
+        VAL_FRACTION: 1.0  
+        IS_EVAL_DATASET: True
+      # ROBOTAP:
+      #   VAL_FRACTION: 1.0  
+
+      # VLSURGPT:
+      #   VAL_FRACTION: 1.0  
+      # STIRCHALLENGE24:  
+      #   VAL_FRACTION: 1.0  
+
+
+     
+
+  ###===========================================================================================================================
+  ### TRAINING (ENGINE) — OPTIMIZER & SCHEDULES
+  ###===========================================================================================================================
+  BATCH_SIZE:
+    value: 4  # Clips per batch (A100-40 fits batch size 4 with DINOv3)
+  EPOCHS:
+    value: 50  # Maximum number of training epochs
+  LR:
+    value: 3.0e-4  # Base learning rate for the model (non-encoder) param group
+  WEIGHT_DECAY:
+    value: 1.0e-4  # L2 regularization weight (AdamW decoupled decay)
+  OPTIMIZER:
+    value: adamw  # Optimizer name: adamw | adam | sgd
+  GRAD_CLIP:
+    value: 1.0  # Global grad-norm clip (0 disables)
+  AMP:
+    value: true  # bf16 on A100 (auto fp16+scaler elsewhere; off on CPU)
+  LR_SCHEDULER:
+    value: cosine  # LR schedule: cosine | none
+  WARMUP_EPOCHS:
+    value: 3  # Linear LR warmup length (epochs)
+  MIN_LR_RATIO:
+    value: 0.05  # Cosine floor (fraction of base LR)
+  KL_WEIGHT_START:  
+    value: 0.0  # Initial KL weight; annealed 0 -> LOSS.KL_WEIGHT
+  KL_ANNEAL_EPOCHS:
+    value: 5  # Epochs over which KL weight reaches its target (shortened 10->5 so the KL has weight while the prior is still being stressed by observation dropout)
+  TEACHER_FORCING_EPOCHS:
+    value: 3  # Scheduled-sampling window: per-point GT-feed prob anneals 1 -> 0 linearly over these epochs, then pure free-running
+  OBS_DROPOUT:
+    value: 0.3  # Observation-dropout curriculum: per-step prob of dropping the frame correction during training so the loss trains the prior directly (stops the gate opening to ~1 and bypassing the prior). 0 disables.
+  OBS_DROPOUT_EPOCHS:
+    value: 5  # Linear ramp 0 -> OBS_DROPOUT over these epochs (lets the model learn to observe first, then to coast); aligns with TEACHER_FORCING_EPOCHS winding down
+  LOSS:
+    value:
+      POS_WEIGHT: 10.0  # Position dominates (its per-point value is small)
+      VIS_WEIGHT: 0.5  # Visibility BCE weight
+      KL_WEIGHT: 0.05  # KL(posterior||prior) target — engine anneals this up
+      KL_FREE_BITS: 0.02  # Free-bits floor on the KL term (0.5->0.1->0.02: at 0.1 the term still pinned at the floor since PRIOR_WEIGHT already aligns the means; lowered so the now-exercised prior gets a live KL gradient)
+      KL_BALANCE_ALPHA: 0.8  # Pull prior toward posterior harder (Dreamer-style)
+      HUBER_DELTA: 0.2  # Huber transition point (normalized units)
+      UNC_WEIGHT: 0.0  # Heteroscedastic NLL OFF (drove total<0 and gamed confidence on the static solution)
+      PRIOR_WEIGHT: 0.5  # Direct GT supervision of the prior mean (was implicit via KL only -> prior ran away)
+      ROLLOUT_WEIGHT: 2.0  # Multi-step frame-free rollout vs GT (observes ROLLOUT_OBSERVE_STEPS then forecasts the rest, supervised against GT): trains the prior to predict from its OWN propagated state -- the fix for the diverging val/epoch/rollout/* (1-step supervision alone leaves it exposure-biased). 0 disables.
+
+  ###===========================================================================================================================
+  ### VALIDATION
+  ###===========================================================================================================================
+  VAL_EVERY:
+    value: 1  # Validate every N epochs
+  EARLY_STOP_PATIENCE:
+    value: 20  # Stop after N epochs without val-EPE improvement (0 off)
+  ROLLOUT_EVAL:
+    value: true  # Also run a frame-free forecast eval each val epoch -> val/epoch/rollout_* (EPE/delta/AJ on the prior-only horizon); isolates the transition prior (occlusion/forecast thesis)
+  ROLLOUT_OBSERVE_STEPS:
+    value: 4  # Observe this many frames after the query, then predict the rest prior-only (forecast region = steps beyond this)
+
+  ###===========================================================================================================================
+  ### BENCHMARK EVALUATION
+  ###===========================================================================================================================
+  # The standalone TAP benchmark (utilities.evaluation): Delta AVG / Average Jaccard / Occlusion Accuracy / ms-per-frame,
+  # meaned per dataset over the datasets flagged IS_EVAL_DATASET (set per-dataset under DATASETS; the TAP-Vid/RoboTAP/EndoTAPP-GT
+  # registry entries default True). Writes a CSV under the run dir + a W&B table (rows=datasets, cols=metrics). Run offline with
+  # `python evaluate.py --run <EXPERIMENT_NAME>`, or have training trigger it via the knobs below.
+  EVAL_AT_END:
+    value: true  # Run the benchmark once after each stage's training finishes -> resul0ts/<run>/evaluation_<stage>.csv + W&B table
+  EVAL_EVERY:
+    value: 0  # Also run it every N epochs after validation for monitoring (0 off); each snapshot tagged evaluation_<stage>_ep<N>.csv
+  EVAL_MAX_CLIPS:
+    value: null  # Cap clips per eval dataset (null = whole dataset); set small for a quick smoke of the eval path
+  EVAL_BATCH_SIZE:
+    value: 1  # Eval batch size (1 is safest for variable-length benchmark clips; >1 uses padding+masks)
+  EVAL_WORKERS:
+    value: 4  # DataLoader workers for evaluation (0 = main process)
+
+  ###===========================================================================================================================
+  ### LOGGING & VISUALIZATION
+  ###===========================================================================================================================
+  LOG_EVERY:
+    value: 5  # WandB per-step log interval (train steps): decomposed losses (pos/vis/kl/unc), EPE, grad-norm, gate, lr, tf_prob
+  VIZ_EVERY:
+    value: 1  # Log pred-vs-GT tracks (both train & val) every N epochs (0 off)
+  VIZ_VAL_CLIPS:
+    value: 1  # Clips logged PER VAL DATASET per viz epoch (guarantees >=1 video per dataset); each keyed by dataset (val/videos/compare_<DATASET>)
+  VIZ_EVERY_BATCHES:
+    value: 50  # Also log a tracks viz every N train batches (0 off); each is a randomly-sampled clip of the current batch, free-running
+  VIZ_DENSE_SPACING:
+    value: 48  # Qualitative dense tracking: query a grid of points spaced this many px (at frame 0) and render their predicted tracks (0 disables; no GT -> inspection only, shows the flow field between sparse GT)
+  VIZ_DENSE_MAX_POINTS:
+    value: 400  # Safety cap on the dense grid size (even-subsampled beyond this)
+  VIZ_FRAMES:
+    value: 48  # Trim the logged clip to the first N frames (short; 0 = full)
+  VIZ_MAX_POINTS:
+    value: 48  # Subsample to N tracks in the viz (legibility)
+  VIZ_SIZE:
+    value: 256  # Square px of each logged frame (frames are scrubbable via the viz/frame_number slider on W&B)
+  VIZ_TAIL:
+    value: 12  # Predicted-track motion-trail length (frames) in */pred_tracks
+  VIZ_DPI:
+    value: 56  # Fallback render dpi when VIZ_SIZE is unset
+  VIZ_FPS:
+    value: 8  # Unused by the frame-slider path; kept for any gif export
+
+  
+

@@ -52,6 +52,7 @@ class TrackerLoss(nn.Module):
         huber_delta: float = 0.2,    # normalized units; large enough to stay ~quadratic
         unc_weight: float = 0.0,     # heteroscedastic NLL (0 disables; it drove total<0 + gamed confidence)
         prior_weight: float = 0.5,   # direct GT supervision of the dynamics-prior mean
+        rollout_weight: float = 0.0, # multi-step frame-free rollout vs GT (0 disables)
     ) -> None:
         super().__init__()
         self.pos_weight = pos_weight
@@ -62,6 +63,7 @@ class TrackerLoss(nn.Module):
         self.huber_delta = huber_delta
         self.unc_weight = unc_weight
         self.prior_weight = prior_weight
+        self.rollout_weight = rollout_weight
 
     def forward(self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
                 ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -119,7 +121,33 @@ class TrackerLoss(nn.Module):
             kl = kl.clamp_min(self.kl_free_bits)
         kl_loss = masked_mean(kl, valid)
 
-        total = self.pos_weight * pos_loss + self.vis_weight * vis_loss + self.kl_weight * kl_loss
+        # --- multi-step frame-free rollout loss (the dynamics-prior fix) ---
+        # ``rollout_coords`` (B,H,N,2) are the prior rolled out from its OWN state for
+        # H steps with no observation (TrackerWorldModel.forward, enabled via the
+        # engine when rollout_weight>0). Supervising them directly against GT trains
+        # the prior to forecast through occlusion -- exactly what val/epoch/rollout/*
+        # measures -- instead of only predicting one step from an observation-corrected
+        # state (which diverges at test-time rollout). ``rollout_epe`` is computed
+        # whenever the block is present (independent of the weight) so it stays a valid
+        # monitor even at rollout_weight==0.
+        if "rollout_coords" in outputs:
+            s = int(outputs["rollout_start"])
+            rc = outputs["rollout_coords"]                          # (B,H,N,2) px
+            h_roll = rc.shape[1]
+            mu_roll = normalize_coords(rc, hw)
+            hub_roll = F.huber_loss(mu_roll, gt_n[:, s:s + h_roll], reduction="none",
+                                    delta=self.huber_delta).sum(-1)
+            valid_roll = valid[:, s:s + h_roll]
+            rollout_reg = masked_mean(hub_roll, valid_roll)
+            with torch.no_grad():
+                rollout_epe = masked_mean(
+                    torch.linalg.norm(rc - gt_tracks[:, s:s + h_roll], dim=-1), valid_roll)
+        else:
+            rollout_reg = coords.new_zeros(())
+            rollout_epe = coords.new_zeros(())
+
+        total = (self.pos_weight * pos_loss + self.vis_weight * vis_loss
+                 + self.kl_weight * kl_loss + self.rollout_weight * rollout_reg)
 
         with torch.no_grad():
             epe = masked_mean(torch.linalg.norm(coords - gt_tracks, dim=-1), valid)
@@ -132,11 +160,14 @@ class TrackerLoss(nn.Module):
             "unc": float(unc_reg.detach()),
             "vis": float(vis_loss.detach()),
             "kl": float(kl_loss.detach()),
+            "rollout": float(rollout_reg.detach()),
+            "rollout_epe": float(rollout_epe),
             "epe": float(epe),
             "w_pos": float((self.pos_weight * pos_reg).detach()),
             "w_prior": float((self.pos_weight * self.prior_weight * prior_reg).detach()),
             "w_unc": float((self.pos_weight * self.unc_weight * unc_reg).detach()),
             "w_vis": float((self.vis_weight * vis_loss).detach()),
             "w_kl": float((self.kl_weight * kl_loss).detach()),
+            "w_rollout": float((self.rollout_weight * rollout_reg).detach()),
         }
         return total, parts

@@ -35,7 +35,7 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
     # is converted to the shared CoTracker layout by ``ct3kubric_data_prep.py``
     # and read through the same reader as every other dataset (no bespoke reader).
     "KUBRIC": {
-        "ROOT_DIR": "$DATASET_DIR/CT3Kubric/cotracker_tracks",
+        "ROOT_DIR": "/anvme/workspace/v120bb18-kubric/gt_tracks",
         "READER": _COTRACKER_READER,
         # Sensible training defaults; override per-experiment in the YAML.
         "CLIP_LEN": 24,
@@ -107,6 +107,21 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "VAL_FRACTION": 0.1,
         "SPLIT_SEED": 42,
     },
+
+    "SURGICALMOTION": {
+        "ROOT_DIR": "$DATASET_DIR/SurgicalMotion/gt_tracks",
+        "READER": _COTRACKER_READER,
+        "CLIP_LEN": 24,
+        "FRAME_STRIDE": 1,
+        "MAX_POINTS": 256,
+        "POINT_SAMPLE_MODE": "even",
+        "QUERY_FRAME": 0,
+        "VAL_SEQUENCES": [
+            "val_case2_1", "val_case2_2", "val_case2_4",
+            "val_case3_1", "val_case3_2",
+        ],
+        "SPLIT_SEED": 42,
+    },
     # --- Evaluation-only benchmarks (ground-truth point tracks) -----------
     # Converted from TAP-Vid pickles by tapvid_data_prep.py.
     # VAL_FRACTION=1.0 -> all sequences are validation, none are training.
@@ -174,6 +189,19 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "QUERY_FRAME": 0,
         "REQUIRE_VISIBLE_AT_QUERY": False,
         "VAL_FRACTION": 1.0,
+        "SPLIT_SEED": 42,
+        "IS_EVAL_DATASET": True,
+    },
+  
+    "VLSURGPT": {
+        "ROOT_DIR": "$DATASET_DIR/VLsurgPT/gt_tracks",
+        "READER": _COTRACKER_READER,
+        "CLIP_LEN": None,          # whole (keyframe) sequence as one clip
+        "MAX_POINTS": None,        # keep all GT points
+        "POINT_SAMPLE_MODE": "even",
+        "QUERY_FRAME": 0,
+        "REQUIRE_VISIBLE_AT_QUERY": False,  # some GT points start occluded
+        "VAL_FRACTION": 1.0,       # eval-only: all sequences -> val
         "SPLIT_SEED": 42,
         "IS_EVAL_DATASET": True,
     },
