@@ -1,0 +1,175 @@
+# TWIST — parallel ablation grid over the two ceiling levers (from scratch).
+#
+# Tests, as a clean GRID (every cell, not a search), the two changes the plateau
+# analysis pointed at:
+#   * MODEL.RGB_ENCODER.IMAGE_SIZE  448 vs 512   (localization resolution)
+#   * LOSS.ROLLOUT_WEIGHT           2.0 vs 4.0    (push the frame-free forecast)
+# => 2 x 2 = 4 trials, each a fresh from-scratch run on the SAME (augmented) data
+# mix, so each lever's effect is unconfounded. Shorter EPOCHS for throughput; the
+# plateau shows by ~ep6 so 25 epochs is plenty to rank the cells.
+#
+# Why from scratch (not warm-started from the live runs): warm-starting all cells
+# from one plateaued 448 checkpoint would measure a fine-tune delta from a shared
+# basin, not each lever's true effect — and there is no clean cross-run init knob.
+#
+# EXPERIMENT_NAME is intentionally OMITTED so every trial adopts its unique W&B
+# run name -> a unique $RESULTS_DIR/<name>/ (a fixed name would make trials clobber
+# / resume each other).
+#
+# Launch:
+#   wandb sweep config/sweep_ablations.yaml      # -> SWEEP_ID
+#   wandb agent <entity>/<project>/<id>          # one agent per free GPU = parallel cells
+#
+# Memory: BATCH_SIZE 2 is safe for the 512 cells on A100-40; the 448 cells could go
+# higher but a single sweep batch must cover both. Raise on A100-80 / DDP.
+
+program: sweep_agent.py
+method: grid
+metric:
+  name: val/epe
+  goal: minimize
+
+parameters:
+
+  ### RUN — no EXPERIMENT_NAME (unique per trial; see header)
+  WANDB_PROJECT:
+    value: twist
+  RESUME:
+    value: scratch
+  WORKERS:
+    value: 8
+  PIN_MEMORY:
+    value: true
+  NO_WANDB:
+    value: false
+  SEED:
+    value: 42
+
+  ### TRAINING — fixed engine settings (swept knobs declared at the bottom)
+  BATCH_SIZE:
+    value: 2          # 512-safe on A100-40; see header
+  EPOCHS:
+    value: 25         # short ablation trials
+  LR:
+    value: 3.0e-4
+  WEIGHT_DECAY:
+    value: 1.0e-4
+  OPTIMIZER:
+    value: adamw
+  GRAD_CLIP:
+    value: 1.0
+  AMP:
+    value: true
+  LR_SCHEDULER:
+    value: cosine
+  WARMUP_EPOCHS:
+    value: 3
+  MIN_LR_RATIO:
+    value: 0.05
+  KL_WEIGHT_START:
+    value: 0.0
+  KL_ANNEAL_EPOCHS:
+    value: 5
+  TEACHER_FORCING_EPOCHS:
+    value: 3
+  OBS_DROPOUT:
+    value: 0.3
+  OBS_DROPOUT_EPOCHS:
+    value: 5
+  VAL_EVERY:
+    value: 1
+  EARLY_STOP_PATIENCE:
+    value: 12         # cut losing cells early
+  ROLLOUT_EVAL:
+    value: true
+  ROLLOUT_OBSERVE_STEPS:
+    value: 4
+  LOG_EVERY:
+    value: 25
+  VIZ_EVERY:
+    value: 5
+
+  ### BENCHMARK EVALUATION — one capped, CoTracker-comparable score per trial at the end
+  EVAL_QUERY_MODE:
+    value: first
+  EVAL_AT_END:
+    value: true
+  EVAL_EVERY:
+    value: 0
+  EVAL_MAX_CLIPS:
+    value: 30
+  EVAL_BATCH_SIZE:
+    value: 1
+  EVAL_WORKERS:
+    value: 4
+
+  ### MODEL — base block. Swept nested fields MUST exist here so the dotted
+  ### override at the bottom is type-coerced (IMAGE_SIZE).
+  MODEL:
+    value:
+      MODEL_CLASS: TrackerWorldModel
+      MODEL_MODULE: models
+      HIDDEN_DIM: 256
+      TOKEN_DIM: 256
+      RGB_ENCODER:
+        ENCODER: facebook/dinov3-vitl16-pretrain-lvd1689m
+        IMAGE_SIZE: 448         # swept below
+        FREEZE_BACKBONE: true
+        RGB_ENCODER_LR: 0.0
+      OBSERVATION: { K: 9, RADIUS_PX: 24.0, HEADS: 4, MAX_CORR: 0.0 }
+      TRANSITION: { DEPTH: 2, HEADS: 4, MAX_STEP: 0.12 }
+      ROLLOUT_VEL_DECAY: 1.0
+      HEADS: { UNCERTAINTY: true }
+
+  ### LOSS — base block. ROLLOUT_WEIGHT swept below (must exist here).
+  LOSS:
+    value:
+      POS_WEIGHT: 10.0
+      VIS_WEIGHT: 0.5
+      KL_WEIGHT: 0.05
+      KL_FREE_BITS: 0.02
+      KL_BALANCE_ALPHA: 0.8
+      HUBER_DELTA: 0.2
+      UNC_WEIGHT: 0.0
+      PRIOR_WEIGHT: 0.5
+      ROLLOUT_WEIGHT: 2.0       # swept below
+
+  ### DATA — same augmented mix as config/train_r512_dynrep.yaml (DynRep in train)
+  DATASETS:
+    value:
+      OVERRIDE_ALL_DATASETS:
+        SPLIT_SEED: 42
+        TARGET_SIZE: [448, 448]
+        CLIP_LEN: 24
+        LOAD_FRAMES: true
+        LOAD_DEPTHS: false
+        FRAMES_AS_FLOAT: false
+        MARK_OFFSCREEN_INVISIBLE: true
+        POINT_SAMPLE_MODE: even
+        QUERY_FRAME: 0
+        CLIP_STRIDE: null
+        FRAME_STRIDE: 1
+        REQUIRE_VISIBLE_AT_QUERY: true
+        MIN_VISIBLE_FRAMES: 1
+      KUBRIC:
+        VAL_FRACTION: 0.1
+        MAX_CLIPS: 1000
+      POINTODYSSEY:
+        VAL_FRACTION: 0.1
+      DYNAMICREPLICA:
+        VAL_FRACTION: 0.1
+      CHOLEC80:
+        VAL_FRACTION: 1.0
+        MAX_CLIPS: 20
+      TAPVID_DAVIS:
+        VAL_FRACTION: 1.0
+        IS_EVAL_DATASET: True
+      SURGICALMOTION:
+        VAL_FRACTION: 1.0
+        IS_EVAL_DATASET: True
+
+  ### SWEPT KNOBS — the two ceiling levers (grid: 2 x 2 = 4 trials) ------------
+  MODEL.RGB_ENCODER.IMAGE_SIZE:
+    values: [448, 512]
+  LOSS.ROLLOUT_WEIGHT:
+    values: [2.0, 4.0]
