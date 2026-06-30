@@ -1,0 +1,145 @@
+# TWIST — resolution / feature-granularity sweep (the REAL fine-localization gap).
+#
+# WHY THIS, NOT MORE OF sweep_ablations (0kg2atga): that 2^3 grid settled the
+# fine-localization levers it tried (ROLLOUT_WEIGHT=2, RADIUS_PX=24, MAX_CORR~0)
+# and FALSIFIED their hypothesis — tightening RADIUS hurt, MAX_CORR did nothing,
+# and the tight-threshold gap did NOT move (delta_1px stayed ~0.09, delta_2px
+# ~0.19 across all 8 cells). Conclusion: sub-2px localization is NOT bottlenecked
+# by the cost-volume window/sub-cell knobs. The structural suspect is feature
+# spatial resolution: DINOv3 ViT-L is patch-16, so at IMAGE_SIZE=512 the cost
+# volume is built on a 32x32 grid (~16px/cell) — that alone caps how finely a
+# point can be localized regardless of RADIUS/MAX_CORR.
+#
+# So this sweep raises the thing that 0kg2atga held fixed:
+#   * IMAGE_SIZE (encoder input)   512 / 768   -> 32x32 vs 48x48 patch grid
+#   * MODEL.OBSERVATION.K          9 / 15      -> denser local matching
+#   3x... no: 2 levers x 2 = 4 cells, plus a 768 mid-tier => see grid below (6 cells).
+#
+# CRITICAL: IMAGE_SIZE alone just UPSAMPLES the TARGET_SIZE frame inside the
+# encoder (no new detail). TARGET_SIZE is therefore raised to [512,512] as the
+# base for ALL cells (0kg2atga already validated bs6 @ TARGET=512/IMAGE=512), so
+# the 768 arm gets a genuine resolution increase, not an upsample.
+#
+# Levers settled by 0kg2atga and HELD here: ROLLOUT_WEIGHT=2, RADIUS_PX=24,
+# MAX_CORR=0. Config is otherwise the same 20-epoch / capped-PO / EVAL_AT_END
+# ranking harness — these trials RANK resolution tiers, they are not the headline
+# (the winner gets trained long on the full mix, like train_r512_dynrep).
+#
+# MEMORY: BATCH_SIZE dropped 6 -> 4. The 768 encoder is ~2.25x the patch count of
+# 512; the encoder runs frozen/no_grad (small activation cost) but stores a larger
+# feature map for the observation model. 4 is the safe pick across all cells on
+# A100-80; VERIFY peak_mem_gb on a 2-step smoke before committing 8 agents, and
+# raise to 6 if the 768 arm shows headroom.
+#
+# Launch (one cell per A100-80 GPU; 6 cells -> submit 6+ agents):
+#   wandb sweep config/sweep_resolution.yaml                                  # -> twisteam/twist/<SWEEP_ID>
+#   for i in $(seq 6); do jsub -w 'wandb agent twisteam/twist/<SWEEP_ID>' .sbatch_scripts/agent_gpu/singlegpu/A100_80GB.sbatch; done
+
+program: sweep_agent.py
+method: grid
+metric:
+  name: val/epoch/epe
+  goal: minimize
+entity: twisteam
+project: twist
+
+parameters:
+
+  ### RUN — no EXPERIMENT_NAME (unique per trial)
+  WANDB_PROJECT: { value: twist }
+  RESUME: { value: scratch }
+  WORKERS: { value: 8 }
+  PIN_MEMORY: { value: true }
+  NO_WANDB: { value: false }
+  SEED: { value: 42 }
+
+  ### TRAINING — fixed engine settings
+  BATCH_SIZE: { value: 4 }     # dropped 6->4 for the 768 arm; verify on a smoke (see header)
+  EPOCHS: { value: 20 }
+  LR: { value: 3.0e-4 }
+  WEIGHT_DECAY: { value: 1.0e-4 }
+  OPTIMIZER: { value: adamw }
+  GRAD_CLIP: { value: 1.0 }
+  AMP: { value: true }
+  LR_SCHEDULER: { value: cosine }
+  WARMUP_EPOCHS: { value: 3 }
+  MIN_LR_RATIO: { value: 0.05 }
+  KL_WEIGHT_START: { value: 0.0 }
+  KL_ANNEAL_EPOCHS: { value: 5 }
+  TEACHER_FORCING_EPOCHS: { value: 3 }
+  OBS_DROPOUT: { value: 0.3 }
+  OBS_DROPOUT_EPOCHS: { value: 5 }
+  VAL_EVERY: { value: 1 }
+  EARLY_STOP_PATIENCE: { value: 12 }
+  ROLLOUT_EVAL: { value: true }
+  ROLLOUT_OBSERVE_STEPS: { value: 4 }
+  LOG_EVERY: { value: 25 }
+  VIZ_EVERY: { value: 5 }
+
+  ### BENCHMARK EVALUATION — one capped, CoTracker-comparable score per trial
+  EVAL_QUERY_MODE: { value: first }
+  EVAL_AT_END: { value: true }
+  EVAL_EVERY: { value: 0 }
+  EVAL_MAX_CLIPS: { value: 30 }
+  EVAL_BATCH_SIZE: { value: 1 }
+  EVAL_WORKERS: { value: 4 }
+
+  ### MODEL — base block (swept nested fields MUST exist here for type coercion)
+  MODEL:
+    value:
+      MODEL_CLASS: TrackerWorldModel
+      MODEL_MODULE: models
+      HIDDEN_DIM: 256
+      TOKEN_DIM: 256
+      RGB_ENCODER:
+        ENCODER: facebook/dinov3-vitl16-pretrain-lvd1689m
+        IMAGE_SIZE: 512         # swept below
+        FREEZE_BACKBONE: true
+        RGB_ENCODER_LR: 0.0
+      OBSERVATION: { K: 9, RADIUS_PX: 24.0, HEADS: 4, MAX_CORR: 0.0 }   # K swept below; RADIUS/MAX_CORR settled by 0kg2atga
+      TRANSITION: { DEPTH: 2, HEADS: 4, MAX_STEP: 0.12 }
+      ROLLOUT_VEL_DECAY: 1.0
+      HEADS: { UNCERTAINTY: true }
+
+  ### LOSS — ROLLOUT_WEIGHT settled at 2.0 by 0kg2atga
+  LOSS:
+    value:
+      POS_WEIGHT: 10.0
+      VIS_WEIGHT: 0.5
+      KL_WEIGHT: 0.05
+      KL_FREE_BITS: 0.02
+      KL_BALANCE_ALPHA: 0.8
+      HUBER_DELTA: 0.2
+      UNC_WEIGHT: 0.0
+      PRIOR_WEIGHT: 0.5
+      ROLLOUT_WEIGHT: 2.0
+
+  ### DATA — TARGET_SIZE raised to 512 so IMAGE_SIZE=768 is a real res bump (see header)
+  DATASETS:
+    value:
+      OVERRIDE_ALL_DATASETS:
+        SPLIT_SEED: 42
+        TARGET_SIZE: [512, 512]
+        CLIP_LEN: 24
+        LOAD_FRAMES: true
+        LOAD_DEPTHS: false
+        FRAMES_AS_FLOAT: false
+        MARK_OFFSCREEN_INVISIBLE: true
+        POINT_SAMPLE_MODE: even
+        QUERY_FRAME: 0
+        CLIP_STRIDE: null
+        FRAME_STRIDE: 1
+        REQUIRE_VISIBLE_AT_QUERY: true
+        MIN_VISIBLE_FRAMES: 1
+      KUBRIC: { VAL_FRACTION: 0.1, MAX_CLIPS: 1000 }
+      POINTODYSSEY: { VAL_FRACTION: 0.1, MAX_CLIPS: 1500 }
+      DYNAMICREPLICA: { VAL_FRACTION: 0.1 }
+      CHOLEC80: { VAL_FRACTION: 1.0, MAX_CLIPS: 20 }
+      TAPVID_DAVIS: { VAL_FRACTION: 1.0, IS_EVAL_DATASET: True }
+      SURGICALMOTION: { VAL_FRACTION: 1.0, IS_EVAL_DATASET: True }
+
+  ### SWEPT KNOBS — resolution x cost-volume density (grid: 3 x 2 = 6 cells) -------
+  MODEL.RGB_ENCODER.IMAGE_SIZE:
+    values: [512, 640, 768]    # 32x32 / 40x40 / 48x48 patch grid (16 / 12.8 / 10.7 px/cell in the 512 space)
+  MODEL.OBSERVATION.K:
+    values: [9, 15]            # local cost-volume sample count (denser matching)

@@ -1,43 +1,53 @@
-# TWIST — parallel ablation grid over the two ceiling levers (from scratch).
+# TWIST — parallel ablation grid over the fine-localization / forecast levers.
 #
-# Tests, as a clean GRID (every cell, not a search), four levers:
-#   * MODEL.RGB_ENCODER.IMAGE_SIZE   448 vs 512    (localization resolution)
+# Clean 3-lever GRID (every cell), IMAGE_SIZE FIXED at 512 (not swept):
 #   * LOSS.ROLLOUT_WEIGHT            2.0 vs 4.0     (push the frame-free forecast)
 #   * MODEL.OBSERVATION.MAX_CORR     0.0 vs 0.05    (sub-cell soft-argmax refinement)
 #   * MODEL.OBSERVATION.RADIUS_PX    24.0 vs 16.0   (cost-volume window tightness)
-# => 2^4 = 16 trials, each a fresh from-scratch run on the SAME (augmented) data
-# mix, so each lever's effect is unconfounded. Shorter EPOCHS for throughput; the
-# plateau shows by ~ep6 so 25 epochs is plenty to rank the cells. (16 cells x 25ep
-# is a lot — drop a dim's second value, or split into two sweeps, to shrink it.)
+# => 2^3 = 8 trials = exactly one cell per A100-80 GPU (submit the agent job 8x,
+# each agent grabs one cell and runs it from scratch on the SAME augmented mix, so
+# each lever's effect is unconfounded).
 #
-# Why these four: the per-threshold val breakdown shows the gap is at TIGHT delta
+# Why these three: the per-threshold val breakdown shows the gap is at TIGHT delta
 # thresholds (9%/21% of pts within 1/2px though 89% within 16px) -> fine
 # localization. MAX_CORR (enable the zero-init sub-cell residual) and a tighter
 # RADIUS_PX (24->16 at K=9 = 4px sample spacing vs 6px) target that directly and
-# cheaply; IMAGE_SIZE 448->512 is the (modest, ~14% finer, upsampled-448) resolution
-# probe; ROLLOUT_WEIGHT pushes the forecast horizon. delta_avg/AJ are the metrics
+# cheaply; ROLLOUT_WEIGHT pushes the forecast horizon. delta_avg/AJ are the metrics
 # these should move; mean EPE is tail-limited (data/robustness) and unlikely to.
+# IMAGE_SIZE is held at 512 (prior analysis: 448->512 is only ~14% finer and
+# upsamples a 448 frame — not worth a 4th grid dim).
+#
+# 24h-WALL FIX (the previous run of this grid, sweep vp0m8nqz, was KILLED by the
+# SLURM 24h --time limit at epoch 14/25 with NO EVAL_AT_END -> no benchmark number):
+# at 512, train compute was ~66 min/epoch + ~36 min val, and PointOdyssey (4436
+# clips, then UNCAPPED) was ~80% of the train mix and the bulk of the val cost.
+# So this revision (a) caps POINTODYSSEY at 1500 clips and (b) shortens EPOCHS to 20
+# -> ~48 min/epoch wall -> ~16h + EVAL_AT_END, comfortably inside 24h. The historical
+# plateau is by ~ep6, so 20 epochs is plenty to RANK cells; the winning config is
+# then trained long on the FULL mix (config/train_r512_dynrep.yaml).
 #
 # Why from scratch (not warm-started from the live runs): warm-starting all cells
-# from one plateaued 448 checkpoint would measure a fine-tune delta from a shared
+# from one plateaued checkpoint would measure a fine-tune delta from a shared
 # basin, not each lever's true effect — and there is no clean cross-run init knob.
 #
 # EXPERIMENT_NAME is intentionally OMITTED so every trial adopts its unique W&B
 # run name -> a unique $RESULTS_DIR/<name>/ (a fixed name would make trials clobber
 # / resume each other).
 #
-# Launch:
-#   wandb sweep config/sweep_ablations.yaml      # -> SWEEP_ID
-#   wandb agent <entity>/<project>/<id>          # one agent per free GPU = parallel cells
+# Launch (8x A100-80, one cell each):
+#   wandb sweep config/sweep_ablations.yaml                                   # -> twisteam/twist/<SWEEP_ID>
+#   for i in $(seq 8); do jsub -w 'wandb agent twisteam/twist/<SWEEP_ID>' agent_gpu/singlegpu/A100_80GB.sbatch; done
 #
-# Memory: BATCH_SIZE 2 is safe for the 512 cells on A100-40; the 448 cells could go
-# higher but a single sweep batch must cover both. Raise on A100-80 / DDP.
+# Memory: BATCH_SIZE 6 @ 512 measured 75.3 GB peak on A100-80 (~5 GB headroom). It
+# does NOT fit A100-40 (use bs2-3 there). Could push to 7 on 80GB; 6 is the safe pick.
 
 program: sweep_agent.py
 method: grid
 metric:
-  name: val/epe
+  name: val/epoch/epe   # actual logged key (W&B UI "best run" tracking; grid ignores it for selection)
   goal: minimize
+entity: twisteam
+project: twist
 
 parameters:
 
@@ -57,11 +67,10 @@ parameters:
 
   ### TRAINING — fixed engine settings (swept knobs declared at the bottom)
   BATCH_SIZE:
-    value: 6          # must be safe for the heavier 512 cells (only feats+encoder grow vs 448,
-                      # not the trainable graph). From a bs8@448 OOM-edge, ~6 fits at 512;
-                      # verify via peak_mem_gb on a smoke, drop to 4 if any cell OOMs.
+    value: 6          # MEASURED 75.3 GB peak @ 512 on A100-80 (sweep vp0m8nqz) -> fits with
+                      # ~5 GB headroom. Does NOT fit A100-40 (use bs2-3 there). Push to 7 only on 80GB.
   EPOCHS:
-    value: 25         # short ablation trials
+    value: 20         # short ablation trials; sized to finish + EVAL_AT_END inside the 24h wall (see header)
   LR:
     value: 3.0e-4
   WEIGHT_DECAY:
@@ -125,7 +134,7 @@ parameters:
       TOKEN_DIM: 256
       RGB_ENCODER:
         ENCODER: facebook/dinov3-vitl16-pretrain-lvd1689m
-        IMAGE_SIZE: 448         # swept below
+        IMAGE_SIZE: 512         # FIXED (not swept); see header
         FREEZE_BACKBONE: true
         RGB_ENCODER_LR: 0.0
       OBSERVATION: { K: 9, RADIUS_PX: 24.0, HEADS: 4, MAX_CORR: 0.0 }
@@ -151,7 +160,7 @@ parameters:
     value:
       OVERRIDE_ALL_DATASETS:
         SPLIT_SEED: 42
-        TARGET_SIZE: [448, 448]
+        TARGET_SIZE: [512, 512]
         CLIP_LEN: 24
         LOAD_FRAMES: true
         LOAD_DEPTHS: false
@@ -168,8 +177,12 @@ parameters:
         MAX_CLIPS: 1000
       POINTODYSSEY:
         VAL_FRACTION: 0.1
+        MAX_CLIPS: 1500   # capped for sweep throughput (was uncapped 4436 = ~80% of train + bulk
+                          # of val cost -> the 24h kill). The long run (train_r512_dynrep) uses full PO.
       DYNAMICREPLICA:
-        VAL_FRACTION: 0.1
+        VAL_FRACTION: 0.1   # 120 clips, no cap needed
+        IS_EVAL_DATASET: True
+
       CHOLEC80:
         VAL_FRACTION: 1.0
         MAX_CLIPS: 20
@@ -181,9 +194,6 @@ parameters:
         IS_EVAL_DATASET: True
 
   ### SWEPT KNOBS — four levers (grid: 2^4 = 16 trials) -----------------------
-  # Original two ceiling levers (unchanged):
-  MODEL.RGB_ENCODER.IMAGE_SIZE:
-    values: [448, 512]
   LOSS.ROLLOUT_WEIGHT:
     values: [2.0, 4.0]
   # Added fine-localization levers (target the tight-threshold delta gap):

@@ -27,6 +27,14 @@ Two ways in -- both go through the same scoring code:
 Outputs: a CSV under the run dir (rows = datasets + a ``MEAN`` row, cols =
 metrics) and, when a W&B run is active, a ``wandb.Table`` (same shape) plus
 per-dataset/mean scalars for time-series tracking.
+
+Alongside, unless ``EVAL_RECOVERY`` is off, the **Post-Occlusion Recovery** (POR)
+metric is reported in its *own* artifacts (so the table above stays
+CoTracker-comparable): ``recovery.csv`` (headline POR/THO scalars),
+``recovery_by_length.csv`` (the recovery-vs-occlusion-length curve), and
+``recovery_drift.csv`` (Case-B through-occlusion drift). Datasets that store
+valid GT on occluded frames are flagged ``HAS_OCCLUDED_GT: True`` in the registry
+to enable the through-occlusion (Case B) measures. See :mod:`models.metrics`.
 """
 
 from __future__ import annotations
@@ -45,7 +53,12 @@ from dataset.wrappers import (
     OVERRIDE_ALL_DATASETS_KEY,
     reader_class_for,
 )
-from models import tracking_metrics
+from models import (
+    finalize_recovery,
+    merge_recovery_stats,
+    recovery_metrics,
+    tracking_metrics,
+)
 from utilities.config import (
     _as_dict,
     _collate_for,
@@ -61,6 +74,10 @@ logger = get_logger(__name__).set_context("EVAL")
 
 # Per-dataset config flag (default False) that opts a dataset into evaluation.
 IS_EVAL_DATASET_KEY = "IS_EVAL_DATASET"
+# Per-dataset config flag (default False): the dataset stores valid GT coords even
+# on occluded frames (synthetic full GT, not the (0,0) placeholder). Enables the
+# Post-Occlusion-Recovery through-occlusion + drift measures (Case B) for it.
+HAS_OCCLUDED_GT_KEY = "HAS_OCCLUDED_GT"
 
 # Reported metrics: machine key -> human header (CSV / W&B table columns).
 # Order here is the column order everywhere.
@@ -74,6 +91,27 @@ METRIC_HEADERS = {
 }
 # The quality metrics come from tracking_metrics; ms_per_frame is timed here.
 _QUALITY_KEYS = ["epe", "delta_avg", "average_jaccard", "occlusion_accuracy"]
+
+# Post-Occlusion Recovery (POR) — TWIST-specific occlusion-recovery metric
+# (models.recovery_metrics), reported in its *own* artifacts so the TAP table
+# above stays CoTracker-comparable. Quality keys are length-weighted means; count
+# keys sum across datasets. ``tho_*`` (through-occlusion) appear only for
+# full-GT (Case B) datasets, NaN elsewhere.
+RECOVERY_QUALITY_KEYS = ["por_epe_snap", "por_epe_w8", "por_delta_snap", "por_delta_w8",
+                         "tho_epe", "tho_delta"]
+RECOVERY_COUNT_KEYS = ["n_recovery_events", "n_through_occlusion_events"]
+RECOVERY_HEADERS = {
+    "por_epe_snap": "POR-EPE snap (px)",
+    "por_epe_w8": "POR-EPE w8 (px)",
+    "por_delta_snap": "POR-delta snap",
+    "por_delta_w8": "POR-delta w8",
+    "tho_epe": "THO-EPE (px)",
+    "tho_delta": "THO-delta",
+    "n_recovery_events": "n recovery events",
+    "n_through_occlusion_events": "n occlusion events",
+}
+# Nested per-dataset structured recovery output (by_length / tho_by_length / drift_epe).
+RECOVERY_DETAIL_KEY = "_recovery_detail"
 
 
 def _nanmean(xs: List[float]) -> float:
@@ -217,6 +255,9 @@ def evaluate_model_on_dataset(
     max_steps: int = 0,
     query_frame: int = 0,
     query_mode: str = "first",
+    compute_recovery: bool = True,
+    has_occluded_gt: bool = False,
+    recovery_window: int = 8,
 ) -> Dict[str, float]:
     """Run ``model`` over ``dataset`` and return the reported metric means.
 
@@ -225,6 +266,11 @@ def evaluate_model_on_dataset(
     processed; on CUDA a warm-up forward runs first (outside timing) so cudnn
     autotune isn't charged to it. Returns ``delta_avg``, ``average_jaccard``,
     ``occlusion_accuracy``, ``ms_per_frame`` plus ``n_clips`` / ``n_frames``.
+
+    With ``compute_recovery`` (default on) it also pools Post-Occlusion-Recovery
+    stats over the clips and adds the finalized POR scalars (``por_epe_snap`` /
+    ``por_epe_w8`` / ``por_delta_*``, plus ``tho_*`` when ``has_occluded_gt``) and
+    a nested ``_recovery_detail`` (per-length curve + drift) to the result.
 
     ``query_mode``: ``"first"`` (TAP-Vid "queried first" — each point queried at its
     first visible frame, scored only after it; the comparable-to-CoTracker default)
@@ -247,6 +293,7 @@ def evaluate_model_on_dataset(
 
     agg: Dict[str, float] = {k: 0.0 for k in _QUALITY_KEYS}
     cnt: Dict[str, int] = {k: 0 for k in _QUALITY_KEYS}
+    rec_stats: Dict[str, float] = {}                     # POR sufficient stats, pooled over clips
     compute_s = 0.0
     timed_frames = 0
     n_clips = 0
@@ -299,14 +346,22 @@ def evaluate_model_on_dataset(
                 model, frames, gt_tracks, gt_vis, point_mask, autocast_ctx=autocast_ctx)
             m = tracking_metrics(e_coords, gt_tracks, e_vislog, gt_vis,
                                  eval_mask=e_mask, query_frame=query_frame)
+            rec_coords, rec_vislog = e_coords, e_vislog
         else:
             m = tracking_metrics(out["coords"], gt_tracks, out["vis_logits"], gt_vis,
                                  time_mask, point_mask, query_frame=query_frame)
+            rec_coords, rec_vislog = out["coords"], out["vis_logits"]
         for k in _QUALITY_KEYS:
             v = m.get(k, float("nan"))
             if v == v:                                  # NaN-safe
                 agg[k] += v
                 cnt[k] += 1
+        # Post-occlusion recovery: pool sufficient stats over clips (events are
+        # per-point, so they must accumulate globally, not be averaged per clip).
+        if compute_recovery:
+            rec_stats = merge_recovery_stats(rec_stats, recovery_metrics(
+                rec_coords, gt_tracks, rec_vislog, gt_vis, point_mask=point_mask,
+                has_occluded_gt=has_occluded_gt, window=recovery_window))
         n_clips += int(frames.shape[0])
         n_frames += nf
 
@@ -314,6 +369,14 @@ def evaluate_model_on_dataset(
     result["ms_per_frame"] = (1e3 * compute_s / timed_frames) if timed_frames else float("nan")
     result["n_clips"] = n_clips
     result["n_frames"] = n_frames
+    if compute_recovery:
+        rec = finalize_recovery(rec_stats)
+        for k in RECOVERY_QUALITY_KEYS + RECOVERY_COUNT_KEYS:
+            if k in rec:
+                result[k] = rec[k]
+        result[RECOVERY_DETAIL_KEY] = {
+            kk: rec[kk] for kk in ("by_length", "tho_by_length", "drift_epe") if kk in rec
+        }
     return result
 
 
@@ -349,28 +412,47 @@ def evaluate(
         logger.warning("no datasets flagged IS_EVAL_DATASET -- nothing to evaluate")
         return {}
     qm = (query_mode or str(config.get("EVAL_QUERY_MODE", "first"))).lower()
-    logger.info(f"evaluating on {len(names)} dataset(s) [query_mode={qm}]: {names}")
+    compute_recovery = bool(config.get("EVAL_RECOVERY", True))
+    recovery_window = int(config.get("EVAL_RECOVERY_WINDOW", 8))
+    datasets_cfg = _as_dict(config.get("DATASETS"))
+    logger.info(f"evaluating on {len(names)} dataset(s) [query_mode={qm}, "
+                f"recovery={'on' if compute_recovery else 'off'}]: {names}")
 
     results: Dict[str, Dict[str, float]] = {}
     for name in names:
         ds = build_eval_dataset(name, config, max_clips=max_clips)
         if ds is None or len(ds) == 0:
             continue
+        has_occ = bool(_merged_dataset_cfg(name, datasets_cfg).get(HAS_OCCLUDED_GT_KEY, False))
         logger.info(f"  {name}: {len(ds)} clips ...")
         m = evaluate_model_on_dataset(
             model, ds, device, batch_size=batch_size, num_workers=num_workers,
             amp=amp, amp_dtype=amp_dtype, max_steps=max_steps, query_frame=query_frame,
-            query_mode=qm,
+            query_mode=qm, compute_recovery=compute_recovery, has_occluded_gt=has_occ,
+            recovery_window=recovery_window,
         )
         results[name] = m
+        rec_suffix = ""
+        if compute_recovery and m.get("n_recovery_events"):
+            rec_suffix = (f" | POR-EPE w8={m.get('por_epe_w8', float('nan')):.1f}px "
+                          f"snap={m.get('por_epe_snap', float('nan')):.1f}px "
+                          f"({int(m['n_recovery_events'])} ev"
+                          + (f", THO={m['tho_epe']:.1f}px" if m.get("tho_epe") == m.get("tho_epe")
+                             and "tho_epe" in m else "") + ")")
         logger.info(
             f"  {name}: EPE={m['epe']:.2f}px δ_avg={m['delta_avg']:.3f} "
             f"AJ={m['average_jaccard']:.3f} OA={m['occlusion_accuracy']:.3f} "
-            f"{m['ms_per_frame']:.2f} ms/frame ({m['n_clips']} clips)"
+            f"{m['ms_per_frame']:.2f} ms/frame ({m['n_clips']} clips){rec_suffix}"
         )
 
     if results:
-        results["MEAN"] = {k: _nanmean([r[k] for r in results.values()]) for k in METRIC_KEYS}
+        mean = {k: _nanmean([r[k] for r in results.values()]) for k in METRIC_KEYS}
+        if compute_recovery:
+            for k in RECOVERY_QUALITY_KEYS:
+                mean[k] = _nanmean([r.get(k, float("nan")) for r in results.values()])
+            for k in RECOVERY_COUNT_KEYS:                # counts sum, not mean
+                mean[k] = sum(int(r.get(k, 0) or 0) for r in results.values())
+        results["MEAN"] = mean
     return results
 
 
@@ -447,6 +529,121 @@ def log_wandb_table(
 
 
 # --------------------------------------------------------------------------- #
+# Reporting: Post-Occlusion Recovery (its own artifacts, separate from the TAP table)
+# --------------------------------------------------------------------------- #
+def _has_recovery(results: Dict[str, Dict[str, float]]) -> bool:
+    return any(RECOVERY_DETAIL_KEY in m or "n_recovery_events" in m for m in results.values())
+
+
+def _fmt(m: Dict[str, Any], k: str) -> str:
+    v = m.get(k, float("nan"))
+    if v != v:                                          # NaN
+        return ""
+    return str(int(v)) if k in RECOVERY_COUNT_KEYS else f"{v:.4f}"
+
+
+def write_recovery_csv(results: Dict[str, Dict[str, float]], path: Path) -> Path:
+    """Recovery headline scalars (rows = datasets then ``MEAN``, cols = POR/THO)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    keys = RECOVERY_QUALITY_KEYS + RECOVERY_COUNT_KEYS
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["dataset"] + [RECOVERY_HEADERS[k] for k in keys])
+        for name, m in results.items():
+            w.writerow([name] + [_fmt(m, k) for k in keys])
+    return path
+
+
+def write_recovery_curve_csv(results: Dict[str, Dict[str, float]], path: Path) -> Path:
+    """The recovery-vs-occlusion-length curve (one row per dataset x length bin)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["dataset", "occlusion_length", "por_epe_snap", "por_epe_w8",
+                    "por_delta_snap", "por_delta_w8", "por_n", "tho_epe", "tho_delta", "tho_n"])
+        for name, m in results.items():
+            detail = m.get(RECOVERY_DETAIL_KEY) or {}
+            por = detail.get("by_length") or {}
+            tho = detail.get("tho_by_length") or {}
+            bins = list(por.keys()) + [b for b in tho if b not in por]
+            for b in bins:
+                p, t = por.get(b, {}), tho.get(b, {})
+                cell = lambda d, k: (f"{d[k]:.4f}" if k in d else "")
+                w.writerow([name, b, cell(p, "epe_snap"), cell(p, "epe_w8"),
+                            cell(p, "delta_snap"), cell(p, "delta_w8"), p.get("n", ""),
+                            cell(t, "epe"), cell(t, "delta"), t.get("n", "")])
+    return path
+
+
+def write_recovery_drift_csv(results: Dict[str, Dict[str, float]], path: Path) -> bool:
+    """Case-B through-occlusion drift (EPE vs frames-since-onset). Returns whether
+    anything was written (only full-GT datasets have a drift curve)."""
+    rows = []
+    for name, m in results.items():
+        drift = (m.get(RECOVERY_DETAIL_KEY) or {}).get("drift_epe") or {}
+        rows += [[name, int(k), f"{drift[k]:.4f}"] for k in sorted(drift)]
+    if not rows:
+        return False
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["dataset", "frames_since_onset", "epe_px"])
+        w.writerows(rows)
+    return True
+
+
+def format_recovery_table(results: Dict[str, Dict[str, float]]) -> str:
+    """A monospace console table of the recovery headline scalars."""
+    keys = RECOVERY_QUALITY_KEYS + RECOVERY_COUNT_KEYS
+    cols = [RECOVERY_HEADERS[k] for k in keys]
+    name_w = max([len("dataset")] + [len(n) for n in results]) if results else len("dataset")
+    col_w = max(16, *[len(c) for c in cols])
+    head = f"{'dataset':<{name_w}}  " + "  ".join(f"{c:>{col_w}}" for c in cols)
+    lines = [head, "-" * len(head)]
+    for name, m in results.items():
+        cells = [(f"{s:>{col_w}}" if (s := _fmt(m, k)) else f"{'-':>{col_w}}") for k in keys]
+        lines.append(f"{name:<{name_w}}  " + "  ".join(cells))
+    return "\n".join(lines)
+
+
+def log_recovery_wandb(
+    results: Dict[str, Dict[str, float]],
+    wandb_run: Any,
+    *,
+    key: str = "eval/recovery",
+    epoch: Optional[int] = None,
+) -> None:
+    """Log a recovery ``wandb.Table`` plus per-dataset/mean scalars
+    (``eval/<dataset>/por_epe_w8`` ...). No-op when ``wandb_run`` is None."""
+    if wandb_run is None or not results:
+        return
+    try:
+        import wandb
+        keys = RECOVERY_QUALITY_KEYS + RECOVERY_COUNT_KEYS
+        table = wandb.Table(columns=["dataset"] + [RECOVERY_HEADERS[k] for k in keys])
+        row: Dict[str, Any] = {}
+        for name, m in results.items():
+            cells = []
+            for k in keys:
+                v = m.get(k, float("nan"))
+                cells.append((int(v) if k in RECOVERY_COUNT_KEYS else round(v, 5)) if v == v else None)
+            table.add_data(name, *cells)
+            for k in RECOVERY_QUALITY_KEYS:
+                v = m.get(k, float("nan"))
+                if v == v:
+                    row[f"eval/{name}/{k}"] = v
+        row[key] = table
+        if epoch is not None:
+            row["eval/epoch"] = epoch
+        wandb_run.log(row)
+    except Exception as e:  # noqa: BLE001 -- logging must never crash a run
+        logger.warning(f"W&B recovery table log skipped ({e})")
+
+
+# --------------------------------------------------------------------------- #
 # Orchestrator (used by the engine + the standalone CLI)
 # --------------------------------------------------------------------------- #
 def evaluate_and_report(
@@ -490,6 +687,21 @@ def evaluate_and_report(
     logger.info(f"evaluation results ({len(results) - 1} datasets + MEAN):\n{format_table(results)}")
     logger.info(f"evaluation CSV -> {csv_path}")
     log_wandb_table(results, wandb_run, epoch=epoch)
+
+    # Post-occlusion recovery: its own CSVs + console table + W&B table, so the
+    # TAP table above stays exactly the CoTracker-comparable headline.
+    if _has_recovery(results):
+        sfx = f"_{tag}" if tag else ""
+        rec_csv = Path(run_dir) / f"recovery{sfx}.csv"
+        curve_csv = Path(run_dir) / f"recovery_by_length{sfx}.csv"
+        drift_csv = Path(run_dir) / f"recovery_drift{sfx}.csv"
+        write_recovery_csv(results, rec_csv)
+        write_recovery_curve_csv(results, curve_csv)
+        wrote_drift = write_recovery_drift_csv(results, drift_csv)
+        logger.info(f"post-occlusion recovery:\n{format_recovery_table(results)}")
+        logger.info(f"recovery CSV -> {rec_csv} (by-length -> {curve_csv}"
+                    + (f", drift -> {drift_csv}" if wrote_drift else "") + ")")
+        log_recovery_wandb(results, wandb_run, epoch=epoch)
     return results
 
 

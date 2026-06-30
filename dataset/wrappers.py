@@ -37,6 +37,8 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "KUBRIC": {
         "ROOT_DIR": "/anvme/workspace/v120bb18-kubric/gt_tracks",
         "READER": _COTRACKER_READER,
+        # Synthetic: valid GT coords on occluded frames -> POR through-occlusion (Case B).
+        "HAS_OCCLUDED_GT": True,
         # Sensible training defaults; override per-experiment in the YAML.
         "CLIP_LEN": 24,
         "FRAME_STRIDE": 1,
@@ -51,6 +53,7 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "POINTODYSSEY": {
         "ROOT_DIR": "$DATASET_DIR/PointOdissey/gt_tracks",
         "READER": _COTRACKER_READER,
+        "HAS_OCCLUDED_GT": True,        # synthetic full GT -> POR Case B
         "CLIP_LEN": 48,
         "FRAME_STRIDE": 1,
         "MAX_POINTS": 256,
@@ -65,6 +68,7 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "DYNAMICREPLICA": {
         "ROOT_DIR": "$DATASET_DIR/DynamicReplica/gt_tracks",
         "READER": _COTRACKER_READER,
+        "HAS_OCCLUDED_GT": True,        # synthetic full GT -> POR Case B
         "CLIP_LEN": 48,
         "FRAME_STRIDE": 1,
         "MAX_POINTS": 256,

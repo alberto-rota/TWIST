@@ -18,7 +18,12 @@ from .encoder import (
     sample_window,
 )
 from .losses import TrackerLoss, kl_diag_gauss, masked_mean
-from .metrics import tracking_metrics
+from .metrics import (
+    finalize_recovery,
+    merge_recovery_stats,
+    recovery_metrics,
+    tracking_metrics,
+)
 from .world_model import (
     ObservationModel,
     ParticleState,
@@ -44,4 +49,7 @@ __all__ = [
     "kl_diag_gauss",
     "masked_mean",
     "tracking_metrics",
+    "recovery_metrics",
+    "merge_recovery_stats",
+    "finalize_recovery",
 ]

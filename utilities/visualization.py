@@ -307,8 +307,14 @@ def overlay_tracks_on_frame(
     Points share a per-identity colour; the **prediction is a circle** and the
     **GT is a triangle**, and a thin line connects each GT→prediction (the
     endpoint error). For both layers visibility is shown by *fill*: visible points
-    are filled, occluded points are edge-only (hollow). Reuses
-    :func:`draw_tracks_on_frame` for the GT (triangle) layer.
+    are filled, occluded points are edge-only (hollow).
+
+    **GT-absent handling.** When a GT point is occluded and the reader stored it
+    as the ``(0, 0)`` / off-frame *sentinel* (no real position this frame), there
+    is nothing to compare against: we drop its triangle (so it never snaps to the
+    top-left corner), drop its error line (so no streak runs into ``(0, 0)``), and
+    instead ring the prediction with a thin hollow **white** circle — the bare
+    ``O`` then reads as "tracked, but no GT here" rather than a confirmed hit.
     """
     import matplotlib.pyplot as plt
 
@@ -320,21 +326,41 @@ def overlay_tracks_on_frame(
     if ax is None:
         _, ax = plt.subplots(figsize=(img.shape[1] / 100, img.shape[0] / 100))
 
+    H, W = img.shape[0], img.shape[1]
+    # Which GT points actually have a position to compare against this frame? A
+    # point the reader pads with the (0,0)/off-frame sentinel while occluded has no
+    # GT here — `_present_mask` flags the slots that carry a real position (visible,
+    # or occluded-but-genuine as Kubric/PointOdyssey keep).
+    gv = (_to_numpy(gt_visibility).astype(bool) if gt_visibility is not None
+          else np.ones(gt.shape[0], bool))               # (N,)
+    gt_present = _present_mask(gt[None], gv[None], hw=(H, W))[0]   # (N,) bool
+
     # Draw the frame ONCE here, then both layers via `_draw_markers` so GT and
     # pred share the same raw scatter-area `point_size` semantics. (Routing the
     # GT layer through `draw_tracks_on_frame` reinterpreted `point_size` as a
     # fraction of image height, blowing the GT triangles up to cover the frame.)
     ax.imshow(img)
-    # GT layer: triangles (filled where visible, hollow where occluded)
-    _draw_markers(ax, gt, colors, gt_visibility, marker="^",
+    # GT layer: triangles (filled where visible, hollow where occluded). Sentinel
+    # slots are NaN'd so no triangle anchors to the (0,0) corner.
+    gt_draw = gt.copy()
+    gt_draw[~gt_present] = np.nan
+    _draw_markers(ax, gt_draw, colors, gv, marker="^",
                   size=point_size, show_occluded=show_occluded)
     if draw_error:
         for i in range(gt.shape[0]):
+            if not gt_present[i]:                         # no real GT -> no error line
+                continue
             ax.plot([gt[i, 0], pr[i, 0]], [gt[i, 1], pr[i, 1]],
                     color=colors[i], linewidth=0.4, alpha=0.5)
     # prediction layer: circles (filled where visible, hollow where occluded)
     _draw_markers(ax, pr, colors, pred_visibility, marker="o",
                   size=point_size, show_occluded=show_occluded)
+    # GT-absent predictions: a thin hollow white halo so the lone 'O' is unmistakably
+    # "no GT to compare against" (a real position is missing for these this frame).
+    missing = ~gt_present
+    if missing.any():
+        ax.scatter(pr[missing, 0], pr[missing, 1], s=point_size * 9.0, marker="o",
+                   facecolors="none", edgecolors="white", linewidths=0.6)
     ax.set_xlim(0, img.shape[1])
     ax.set_ylim(img.shape[0], 0)
     ax.axis("off")

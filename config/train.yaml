@@ -31,7 +31,7 @@ parameters:
       TOKEN_DIM: 256  # Particle token width
       RGB_ENCODER:
         ENCODER: facebook/dinov3-vitl16-pretrain-lvd1689m  # DINOv3 ViT-L/16 (dim 1024, patch 16); or "cnn"
-        IMAGE_SIZE: 448  # Encoder's internal square resize -> 16x16 feature grid (16px/cell); QUALITY LEVER: 512 -> 32x32 grid (8px/cell) ~doubles localization precision at ~2.5x encoder cost; independent of DATASETS.*.TARGET_SIZE (256)
+        IMAGE_SIZE: 512  # Encoder's internal square resize -> 16x16 feature grid (16px/cell); QUALITY LEVER: 512 -> 32x32 grid (8px/cell) ~doubles localization precision at ~2.5x encoder cost; independent of DATASETS.*.TARGET_SIZE (256)
         FREEZE_BACKBONE: true  # Freeze encoder weights
         RGB_ENCODER_LR: 0.0  # Learning rate for RGB encoder (0.0 = frozen; engine reads this for param groups)
       OBSERVATION:  # Local cost-volume soft-argmax localizer
@@ -58,7 +58,7 @@ parameters:
       ### OVERRIDE — APPLIED TO ALL DATASETS
       OVERRIDE_ALL_DATASETS:
         SPLIT_SEED: 42  # Deterministic train/val split seed
-        TARGET_SIZE: [448, 448]  # Resize all loaded frames to [H, W]
+        TARGET_SIZE: [512, 512]  # Resize all loaded frames to [H, W]
         CLIP_LEN: 24  # Output frames per clip (== train clip length)
         LOAD_FRAMES: true  # Load RGB frames
         LOAD_DEPTHS: false  # Load depth maps (model-unused)
@@ -70,7 +70,7 @@ parameters:
         FRAME_STRIDE: 1  # Keep every Nth frame
         REQUIRE_VISIBLE_AT_QUERY: true  # Drop points not visible at the query frame
         MIN_VISIBLE_FRAMES: 1  # Drop points visible in fewer than this many frames
-        MAX_CLIPS: 100
+        # MAX_CLIPS: 100
         
       # ----------------------------------------------------------------
 
