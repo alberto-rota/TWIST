@@ -627,9 +627,16 @@ def create_model_from_config(config: "DotMap", device, verbose: bool = True):
         obs_radius_px=float(obs.get("RADIUS_PX", 24.0)),
         obs_heads=int(obs.get("HEADS", 4)),
         obs_max_corr=float(obs.get("MAX_CORR", 0.0)),
+        # v2 flags (all default OFF = the v1 architecture, checkpoint-compatible):
+        # STATS feeds detached correlation statistics to the vis/gate/logvar heads,
+        # COARSE enables the global re-acquisition stage, VIS_INPUT gives the
+        # transition the point's visibility belief.
+        obs_stats=bool(obs.get("STATS", False)),
+        obs_coarse=bool(obs.get("COARSE", False)),
         trans_heads=int(trans.get("HEADS", 4)),
         trans_depth=int(trans.get("DEPTH", 2)),
         trans_max_step=float(trans.get("MAX_STEP", 0.12)),
+        trans_vis_input=bool(trans.get("VIS_INPUT", False)),
         uncertainty=bool(heads.get("UNCERTAINTY", True)),
         encode_chunk=int(mc.get("ENCODE_CHUNK", 32)),
         rollout_vel_decay=float(mc.get("ROLLOUT_VEL_DECAY", 1.0)),
@@ -662,5 +669,9 @@ def create_loss_from_config(config: "DotMap", device=None):
         unc_weight=float(lc.get("UNC_WEIGHT", 0.0)),
         prior_weight=float(lc.get("PRIOR_WEIGHT", 0.5)),
         rollout_weight=float(lc.get("ROLLOUT_WEIGHT", 0.0)),
+        ce_weight=float(lc.get("CE_WEIGHT", 0.0)),
+        global_ce_weight=(None if lc.get("GLOBAL_CE_WEIGHT") is None
+                          else float(lc.get("GLOBAL_CE_WEIGHT"))),
+        use_occluded_gt=bool(lc.get("USE_OCCLUDED_GT", True)),
     )
     return loss.to(device) if device is not None else loss
