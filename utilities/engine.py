@@ -282,18 +282,36 @@ class Engine:
         self.rollout_eval = bool(config.get("ROLLOUT_EVAL", False))
         self.rollout_observe = int(config.get("ROLLOUT_OBSERVE_STEPS", 4))
         # multi-step rollout TRAINING loss: when LOSS.ROLLOUT_WEIGHT>0 the model also
-        # forecasts frame-free from a clean observed state (same ROLLOUT_OBSERVE_STEPS
-        # as eval) and the loss supervises it vs GT -- trains the prior to forecast
-        # through occlusion, the cure for the rollout divergence the eval exposes.
+        # forecasts frame-free from a clean observed state and the loss supervises it
+        # vs GT -- trains the prior to forecast through occlusion, the cure for the
+        # rollout divergence the eval exposes. Optional ROLLOUT_OBSERVE_MIN/MAX
+        # randomize the TRAIN-time observe length per batch, so the prior practices
+        # coasting from varied state quality rather than always from the same step;
+        # eval keeps the fixed ROLLOUT_OBSERVE_STEPS protocol for comparability.
         self.rollout_loss = float(getattr(loss_fn, "rollout_weight", 0.0)) > 0.0
+        ro_min, ro_max = config.get("ROLLOUT_OBSERVE_MIN"), config.get("ROLLOUT_OBSERVE_MAX")
+        self.rollout_observe_range = (
+            (int(ro_min), int(ro_max)) if ro_min is not None and ro_max is not None else None)
+        if self.rollout_observe_range and not (1 <= self.rollout_observe_range[0]
+                                               <= self.rollout_observe_range[1]):
+            raise ValueError(f"ROLLOUT_OBSERVE_MIN/MAX invalid: {self.rollout_observe_range}")
 
-        # observation-dropout curriculum: per-step prob of dropping the frame
-        # correction during TRAINING so the loss at those steps trains the prior
-        # directly (forces a competent, load-bearing prior instead of letting the
-        # gate open to ~1 and bypass it). Ramped 0 -> OBS_DROPOUT over
-        # OBS_DROPOUT_EPOCHS so the model first learns to observe, then to coast.
+        # observation-dropout curriculum: drop the frame correction during TRAINING
+        # so the loss at those steps trains the prior directly (forces a competent,
+        # load-bearing prior instead of letting the gate open to ~1 and bypass it).
+        # Dropping is PER-POINT in contiguous spans of OBS_DROPOUT_SPAN=[lo,hi]
+        # frames — simulated occlusion: a masked point coasts on the transition
+        # (and on its still-observing neighbours via the inter-point attention),
+        # exactly the regime real occlusion puts it in at inference. OBS_DROPOUT is
+        # the expected dropped fraction of post-query steps, ramped 0 -> OBS_DROPOUT
+        # over OBS_DROPOUT_EPOCHS (the model first learns to observe, then to coast).
         self.obs_dropout = float(config.get("OBS_DROPOUT", 0.0))
         self.obs_dropout_epochs = int(config.get("OBS_DROPOUT_EPOCHS", 0))
+        span = config.get("OBS_DROPOUT_SPAN", [3, 8])
+        span = [int(v) for v in (span if isinstance(span, (list, tuple)) else [span, span])]
+        if not (1 <= span[0] <= span[1]):
+            raise ValueError(f"OBS_DROPOUT_SPAN must be [lo, hi] with 1 <= lo <= hi, got {span}")
+        self.obs_dropout_span = (span[0], span[1])
 
         # benchmark evaluation (utilities.evaluation): the standalone TAP metrics
         # (Delta AVG / Average Jaccard / Occlusion Accuracy / ms-per-frame) on the
@@ -418,7 +436,7 @@ class Engine:
             "tracks": batch["tracks"].float().to(d, non_blocking=True),
             "visibility": batch["visibility"].to(d, non_blocking=True),
         }
-        for k in ("time_mask", "point_mask"):
+        for k in ("time_mask", "point_mask", "pos_valid"):
             if k in batch and batch[k] is not None:
                 tgt[k] = batch[k].to(d, non_blocking=True)
         return frames, queries, tgt
@@ -432,13 +450,65 @@ class Engine:
             torch.cuda.synchronize(self.device)
 
     # -- train / validate ---------------------------------------------------- #
-    def _build_observe_mask(self, T: int, qf: int, p: float) -> Optional[torch.Tensor]:
-        """``(T,)`` bool mask for observation dropout: each post-query step is observed
-        with prob ``1-p``. Pre-query / query frames stay True (no correction runs there
-        anyway). Returns None when ``p<=0`` (forward then observes every step)."""
-        if p <= 0:
+    @torch.no_grad()
+    def _gate_by_visibility(self, out: Dict[str, torch.Tensor], tgt: Dict[str, torch.Tensor],
+                            qf: int) -> Tuple[float, float]:
+        """Mean Kalman gate split by GT visibility — the gate-health diagnostic.
+
+        A functioning gate should sit HIGH on visible points (trust the match) and
+        drop toward 0 on GT-occluded ones (coast on the prior; the window shows
+        the occluder, not the point). Only post-query steps where the observation
+        was actually APPLIED count (dropout-masked steps have a forced -10 logit
+        that would fake a healthy occluded gate). Returns NaN where a batch has
+        no qualifying entries.
+        """
+        if "gate_logits" not in out:
+            return float("nan"), float("nan")
+        g = torch.sigmoid(out["gate_logits"].float())        # (B,T,N)
+        vis = tgt["visibility"].bool()
+        b, t, n = vis.shape
+        mask = torch.ones_like(vis)
+        if tgt.get("time_mask") is not None:
+            mask &= tgt["time_mask"].bool()[:, :, None]
+        if tgt.get("point_mask") is not None:
+            mask &= tgt["point_mask"].bool()[:, None, :]
+        mask &= torch.arange(t, device=vis.device)[None, :, None] > qf   # post-query only
+        if "observed" in out:
+            mask &= out["observed"] > 0.5
+        m_vis, m_occ = mask & vis, mask & ~vis
+        gate_vis = float(g[m_vis].mean()) if bool(m_vis.any()) else float("nan")
+        gate_occ = float(g[m_occ].mean()) if bool(m_occ.any()) else float("nan")
+        return gate_vis, gate_occ
+
+    def _build_observe_mask(self, T: int, n_points: int, qf: int, p: float
+                            ) -> Optional[torch.Tensor]:
+        """``(T, N)`` bool keep-mask for PER-POINT, occlusion-shaped observation
+        dropout.
+
+        Each post-query (step, point) starts a dropped span with probability
+        ``p / mean(span)`` and the span lasts ``Uniform[span_lo, span_hi]`` steps,
+        so the expected dropped fraction of post-query steps is ~``p`` (slightly
+        less where spans overlap or clip at the end). Spans are per-POINT: a
+        masked point must coast on the transition — and on its still-observing
+        neighbours through the inter-point attention — while the rest of the
+        batch keeps observing, which is the regime real occlusion creates at
+        inference (the old mask dropped whole frames, so neighbours were always
+        blind together and the carry-your-neighbour mechanism went untrained).
+        Pre-query / query frames stay True. ``OBS_DROPOUT_SPAN: [1, 1]``
+        degenerates to i.i.d. per-point dropout. Returns None when ``p <= 0``.
+        """
+        if p <= 0 or T <= qf + 1:
             return None
-        keep = torch.rand(T, device=self.device) >= p
+        lo, hi = self.obs_dropout_span
+        q = min(1.0, p / max(0.5 * (lo + hi), 1.0))     # span-start rate -> ~p dropped
+        starts = torch.rand(T, n_points, device=self.device) < q
+        starts[:qf + 1] = False
+        lengths = torch.randint(lo, hi + 1, (T, n_points), device=self.device)
+        dropped = torch.zeros(T, n_points, dtype=torch.bool, device=self.device)
+        for off in range(hi):                            # unroll spans (hi is small)
+            active = starts & (lengths > off)
+            dropped[off:] |= active[:T - off] if off else active
+        keep = ~dropped
         keep[:qf + 1] = True
         return keep
 
@@ -451,13 +521,19 @@ class Engine:
         self.model.train()
         if getattr(self.model, "encoder", None) is not None and getattr(self.model.encoder, "frozen", False):
             self.model.encoder.eval()                    # keep the frozen backbone in eval
-        agg = {"loss": 0.0, "pos": 0.0, "prior": 0.0, "unc": 0.0, "vis": 0.0, "kl": 0.0, "epe": 0.0,
+        agg = {"loss": 0.0, "pos": 0.0, "prior": 0.0, "unc": 0.0, "unc_prior": 0.0,
+               "vis": 0.0, "kl": 0.0, "kl_raw": 0.0, "ce": 0.0, "gce": 0.0, "epe": 0.0,
                "rollout": 0.0, "rollout_epe": 0.0, "w_rollout": 0.0,
                "w_pos": 0.0, "w_prior": 0.0, "w_unc": 0.0, "w_vis": 0.0, "w_kl": 0.0,
+               "w_ce": 0.0, "w_gce": 0.0,
                "gate": 0.0, "motion_ratio": 0.0, "obs_kept": 0.0}
-        # full TAP metrics on the train batches, NaN-safe (separate counters since a
-        # batch with no visible points yields NaN that must not poison the average).
-        m_keys = ("average_jaccard", "delta_avg", "occlusion_accuracy")
+        # NaN-safe means (separate counters, since a batch can legitimately lack the
+        # entries — e.g. no visible points, no occluded-but-supervised frames):
+        # the TAP metrics + the occlusion diagnostics (epe_occ from the loss;
+        # gate|visible vs gate|occluded — THE gate-health chart: a working Kalman
+        # gate should sit high on visible points and drop toward 0 on occluded ones).
+        m_keys = ("average_jaccard", "delta_avg", "occlusion_accuracy",
+                  "epe_occ", "gate_vis", "gate_occ", "coarse_gate")
         m_sum = {k: 0.0 for k in m_keys}
         m_cnt = {k: 0 for k in m_keys}
         n = 0
@@ -471,11 +547,22 @@ class Engine:
             if self.max_steps and step >= self.max_steps:
                 break
             frames, queries, tgt = self._prep(batch)
-            # observation-dropout curriculum: drop the frame correction at random
-            # post-query steps so the loss there trains the prior directly.
+            # observation-dropout curriculum: per-point contiguous spans of dropped
+            # frame corrections (simulated occlusion) — the loss there trains the
+            # prior + the neighbour-carry attention directly.
             qf0 = max(0, min(int(queries[0, 0, 0].item()), frames.shape[1] - 1))
-            observe_mask = self._build_observe_mask(frames.shape[1], qf0, obs_dropout)
+            observe_mask = self._build_observe_mask(frames.shape[1], queries.shape[1],
+                                                    qf0, obs_dropout)
             obs_kept = float(observe_mask[qf0 + 1:].float().mean()) if observe_mask is not None else 1.0
+            # rollout-loss observe length: fixed (eval protocol) or, with
+            # ROLLOUT_OBSERVE_MIN/MAX, resampled per batch for varied coast starts.
+            if not self.rollout_loss:
+                rollout_observe = None
+            elif self.rollout_observe_range is not None:
+                lo, hi = self.rollout_observe_range
+                rollout_observe = int(torch.randint(lo, hi + 1, (1,)).item())
+            else:
+                rollout_observe = self.rollout_observe
             self.optimizer.zero_grad(set_to_none=True)
             self._sync()
             _t0 = time.perf_counter()
@@ -484,10 +571,7 @@ class Engine:
                                  observe_mask=observe_mask,
                                  tf_prob=tf_prob,
                                  gt_tracks=tgt["tracks"] if tf_prob > 0.0 else None,
-                                 # multi-step rollout supervision: observe the same
-                                 # ROLLOUT_OBSERVE_STEPS the eval uses, then forecast
-                                 # the rest frame-free (only when LOSS.ROLLOUT_WEIGHT>0)
-                                 rollout_observe=self.rollout_observe if self.rollout_loss else None)
+                                 rollout_observe=rollout_observe)
                 total, parts = self.loss_fn(out, tgt)
             grad_norm = 0.0
             if self.use_scaler:
@@ -512,6 +596,9 @@ class Engine:
             # mean Kalman gate (diagnostic: now free to learn a low gain where the
             # observation is noisier than the motion; not pinned open as before)
             gate = float(torch.sigmoid(out["gate_logits"]).mean().detach()) if "gate_logits" in out else float("nan")
+            gate_vis, gate_occ = self._gate_by_visibility(out, tgt, qf0)
+            coarse_gate = (float(out["coarse_gate"].mean().detach())
+                           if "coarse_gate" in out else float("nan"))
             # train motion_ratio: how far the model's OWN predictions travel vs GT
             # (inflated while tf_prob>0 since the state is GT-fed; judge once tf->0).
             with torch.no_grad():
@@ -524,13 +611,17 @@ class Engine:
             # model's own predictions, so this is valid even while teacher-forced)
             tm = tracking_metrics(out["coords"], tgt["tracks"], out["vis_logits"],
                                   tgt["visibility"], tgt.get("time_mask"), tgt.get("point_mask"))
+            tm = {**tm, "epe_occ": parts["epe_occ"], "gate_vis": gate_vis,
+                  "gate_occ": gate_occ, "coarse_gate": coarse_gate}
             for k in m_keys:
                 v = tm.get(k, float("nan"))
                 if v == v:                                   # finite
                     m_sum[k] += v; m_cnt[k] += 1
             agg["loss"] += float(total.detach())
-            for k in ("pos", "prior", "unc", "vis", "kl", "epe", "rollout", "rollout_epe",
-                      "w_pos", "w_prior", "w_unc", "w_vis", "w_kl", "w_rollout"):
+            for k in ("pos", "prior", "unc", "unc_prior", "vis", "kl", "kl_raw", "ce", "gce",
+                      "epe", "rollout", "rollout_epe",
+                      "w_pos", "w_prior", "w_unc", "w_vis", "w_kl", "w_ce", "w_gce",
+                      "w_rollout"):
                 agg[k] += float(parts[k])
             agg["gate"] += gate
             agg["motion_ratio"] += motion_ratio
@@ -550,10 +641,14 @@ class Engine:
                         "train/step_vis": float(parts["vis"]),
                         "train/step_kl": float(parts["kl"]),
                         "train/step_unc": float(parts["unc"]),
+                        "train/step_ce": float(parts["ce"]),
+                        "train/step_epe_occ": float(parts["epe_occ"]),
                         "train/step_rollout": float(parts["rollout"]),
                         "train/step_rollout_epe": float(parts["rollout_epe"]),
                         "train/step_grad_norm": grad_norm,
                         "train/step_gate": gate,
+                        "train/step_gate_vis": gate_vis,
+                        "train/step_gate_occ": gate_occ,
                         "train/step_motion_ratio": motion_ratio,
                         "schedules/lr": self.optimizer.param_groups[0]["lr"],
                         "schedules/kl_weight": self.loss_fn.kl_weight,
@@ -660,9 +755,14 @@ class Engine:
             frames, queries, tgt = self._prep(batch)
             with self._autocast():
                 out = self.model(frames, queries, point_mask=tgt.get("point_mask"))
-                total, _ = self.loss_fn(out, tgt)
+                total, parts = self.loss_fn(out, tgt)
             m = tracking_metrics(out["coords"], tgt["tracks"], out["vis_logits"],
                                  tgt["visibility"], tgt.get("time_mask"), tgt.get("point_mask"))
+            qf0 = max(0, min(int(queries[0, 0, 0].item()), frames.shape[1] - 1))
+            gate_vis, gate_occ = self._gate_by_visibility(out, tgt, qf0)
+            m = {**m, "epe_occ": parts["epe_occ"], "gate_vis": gate_vis, "gate_occ": gate_occ}
+            if "coarse_gate" in out:
+                m["coarse_gate"] = float(out["coarse_gate"].mean())
             agg["loss"] += float(total.detach()); cnt["loss"] += 1
             for k, v in m.items():                       # epe, delta_avg, OA, AJ, per-threshold deltas
                 if v == v:                               # drop NaN
