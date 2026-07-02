@@ -97,6 +97,13 @@ EVAL_THRESHOLDS_KEY = "EVAL_THRESHOLDS"
 # or crashed resume without re-running (and re-timing) datasets it already
 # finished. Set False to force a clean re-evaluation of everything.
 EVAL_SKIP_COMPLETED_KEY = "EVAL_SKIP_COMPLETED"
+# Per-dataset config key (default []): metric keys this dataset must NOT
+# contribute to the MEAN row. STIR excludes average_jaccard/occlusion_accuracy:
+# its GT visibility is only defined on the annotated endpoint frames, so AJ/OA
+# degenerate (~0.005 for EVERY method — a scoring artifact, not signal) and were
+# silently deflating everyone's mean. The excluded values still appear on the
+# dataset's own row.
+EVAL_EXCLUDE_FROM_MEAN_KEY = "EVAL_EXCLUDE_FROM_MEAN"
 
 # Reported metrics: machine key -> human header (CSV / W&B table columns).
 # Order here is the column order everywhere.
@@ -645,14 +652,34 @@ def evaluate(
             torch.cuda.empty_cache()
 
     if results:
-        mean = {k: _nanmean([r[k] for r in results.values()]) for k in METRIC_KEYS}
-        if compute_recovery:
-            for k in RECOVERY_QUALITY_KEYS:
-                mean[k] = _nanmean([r.get(k, float("nan")) for r in results.values()])
-            for k in RECOVERY_COUNT_KEYS:                # counts sum, not mean
-                mean[k] = sum(int(r.get(k, 0) or 0) for r in results.values())
-        results["MEAN"] = mean
+        results["MEAN"] = compute_mean_row(results, datasets_cfg, compute_recovery)
     return results
+
+
+def compute_mean_row(results: Dict[str, Dict[str, float]], datasets_cfg: dict,
+                     compute_recovery: bool = True) -> Dict[str, float]:
+    """The cross-dataset ``MEAN`` row, honouring per-dataset exclusions.
+
+    A dataset listing a metric key under ``EVAL_EXCLUDE_FROM_MEAN`` (registry or
+    config) keeps the value on its own row but does not contribute it to the mean
+    — e.g. STIR's degenerate AJ/OA (visibility GT only exists on its endpoint
+    frames, so those two are a scoring artifact for every method). Quality keys
+    are nan-means; recovery counts sum.
+    """
+    excl = {n: set(_merged_dataset_cfg(n, datasets_cfg).get(EVAL_EXCLUDE_FROM_MEAN_KEY) or ())
+            for n in results}
+
+    def _mean_over(k: str) -> float:
+        return _nanmean([r.get(k, float("nan")) for n, r in results.items()
+                         if k not in excl[n]])
+
+    mean = {k: _mean_over(k) for k in METRIC_KEYS}
+    if compute_recovery:
+        for k in RECOVERY_QUALITY_KEYS:
+            mean[k] = _mean_over(k)
+        for k in RECOVERY_COUNT_KEYS:                    # counts sum, not mean
+            mean[k] = sum(int(r.get(k, 0) or 0) for r in results.values())
+    return mean
 
 
 # --------------------------------------------------------------------------- #

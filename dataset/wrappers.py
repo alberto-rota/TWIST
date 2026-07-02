@@ -227,7 +227,11 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "VAL_FRACTION": 1.0,       # eval-only
         "SPLIT_SEED": 42,
         "IS_EVAL_DATASET": True,
-        "EVAL_THRESHOLDS": [4, 8, 16, 32, 64],  #W
+        "EVAL_THRESHOLDS": [4, 8, 16, 32, 64],  # official STIR 2D-accuracy thresholds
+        # STIR GT visibility exists only on the annotated endpoint frames, so
+        # AJ / OA degenerate (~0.005 / ~0.06 for EVERY method — scoring artifact).
+        # Keep them on STIR's own row but out of the cross-dataset MEAN.
+        "EVAL_EXCLUDE_FROM_MEAN": ["average_jaccard", "occlusion_accuracy"],
     },
     # This is the full non-annotated STIR dataset. Do not use.
     # "STIR_FULL": {                           

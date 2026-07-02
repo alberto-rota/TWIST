@@ -14,6 +14,11 @@ Returned item -- the canonical TWIST tracking dict::
     frames      (T, 3, H, W)  uint8 | float[0,1]   (only if ``load_frames``)
     tracks      (T, N, 2)     float32  pixel coords (x, y)
     visibility  (T, N)        bool     per-point visibility
+    pos_valid   (T, N)        bool     frames whose COORDS are supervisable: visible,
+                                       or (``has_occluded_gt``) occluded-but-in-frame.
+                                       The loss masks its position terms with this, so
+                                       synthetic sets with full GT (Kubric/PO/DynRep)
+                                       supervise tracking *through* occlusion.
     queries     (N, 3)        float32  (t, x, y) at the clip's query frame
     frame_size  (2,)          long     final (H, W) of the (cropped/resized) clip
     video       str                    sequence / video id
@@ -78,10 +83,18 @@ class BaseTracksDataset(torch.utils.data.Dataset):
         Candidate filters for point selection (see :func:`candidate_mask`).
     target_size : (int, int) | None
         Resize frames to ``(H, W)`` and scale track coordinates to match.
+    resize_mode : str
+        ``"cover"`` (default): aspect-preserving resize-to-cover then center-crop
+        — the TWIST-internal geometry. ``"stretch"``: anisotropic resize straight
+        to ``target_size`` with NO crop — the canonical TAP-Vid protocol (256x256
+        squash), needed for numbers comparable to published tables.
     crop : (int, int, int, int) | None
         ``(x0, y0, x1, y1)`` pixel box applied *before* resize.
     mark_offscreen_invisible : bool
         Mark points outside the final frame not-visible (trails fade at edges).
+    has_occluded_gt : bool
+        The source stores *valid* GT coordinates on occluded frames (synthetic
+        full GT, not a placeholder). Emits them as supervisable in ``pos_valid``.
     load_frames, load_depths, frames_as_float :
         IO toggles. ``frames_as_float`` returns frames in ``[0, 1]``.
     seed : int
@@ -105,8 +118,10 @@ class BaseTracksDataset(torch.utils.data.Dataset):
         require_visible_at_query: bool = True,
         min_visible_frames: int = 1,
         target_size: Optional[Tuple[int, int]] = None,
+        resize_mode: str = "cover",
         crop: Optional[Tuple[int, int, int, int]] = None,
         mark_offscreen_invisible: bool = True,
+        has_occluded_gt: bool = False,
         load_frames: bool = True,
         load_depths: bool = False,
         frames_as_float: bool = False,
@@ -126,7 +141,11 @@ class BaseTracksDataset(torch.utils.data.Dataset):
         self.require_visible_at_query = require_visible_at_query
         self.min_visible_frames = int(min_visible_frames)
         self.target_size = tuple(target_size) if target_size is not None else None
+        if resize_mode not in ("cover", "stretch"):
+            raise ValueError(f"resize_mode must be 'cover' or 'stretch', got {resize_mode!r}")
+        self.resize_mode = resize_mode
         self.mark_offscreen_invisible = mark_offscreen_invisible
+        self.has_occluded_gt = bool(has_occluded_gt)
         self.load_frames = load_frames
         self.load_depths = load_depths
         self.frames_as_float = frames_as_float
@@ -172,20 +191,30 @@ class BaseTracksDataset(torch.utils.data.Dataset):
         return frames, depths, tracks, queries
 
     def _apply_resize(self, frames, depths, tracks, queries, cur_hw):
-        """Aspect-preserving resize-to-cover the target, **then** center-crop to it.
+        """Resize to ``target_size`` in one of two geometries.
 
-        Uniform-scales (single factor, so no aspect distortion) until the frame
-        *covers* ``target_size``, then center-crops to exactly ``target_size``.
-        Track coordinates follow the same scale + crop offset. (The previous
-        version anisotropically squashed straight to the target, distorting any
-        non-square source — e.g. 540x960 -> 448x448 — which is the aspect-ratio
-        warping seen on PointOdyssey / DAVIS clips.)
+        ``"cover"`` (default): aspect-preserving resize-to-cover, **then**
+        center-crop. Uniform-scales (single factor, so no aspect distortion)
+        until the frame *covers* ``target_size``, then center-crops to exactly
+        ``target_size``; coordinates follow the same scale + crop offset. (An
+        older version anisotropically squashed straight to the target, distorting
+        any non-square source — the aspect-ratio warping once seen on
+        PointOdyssey / DAVIS clips.)
+
+        ``"stretch"``: anisotropic resize straight to ``target_size`` with NO
+        crop — the canonical TAP-Vid benchmark geometry (e.g. DAVIS 854x480 ->
+        256x256 squash). Nothing leaves the frame, so numbers are comparable to
+        published TAP-Vid tables; use for benchmark-table evals only.
         """
         th, tw = self.target_size
         ch, cw = cur_hw
-        s = max(th / ch, tw / cw)                            # uniform cover scale
-        rh, rw = max(int(round(ch * s)), th), max(int(round(cw * s)), tw)  # resized size
-        oy, ox = (rh - th) // 2, (rw - tw) // 2              # center-crop offsets
+        if self.resize_mode == "stretch":
+            rh, rw = th, tw                                  # direct anisotropic resize
+            oy = ox = 0                                      # no crop
+        else:                                                # "cover"
+            s = max(th / ch, tw / cw)                        # uniform cover scale
+            rh, rw = max(int(round(ch * s)), th), max(int(round(cw * s)), tw)  # resized size
+            oy, ox = (rh - th) // 2, (rw - tw) // 2          # center-crop offsets
         # use the *actual* per-axis ratio (rounding rh/rw makes it differ from s
         # by <1px) so coords stay registered to the resized pixels, then offset.
         scale = tracks.new_tensor([rw / cw, rh / ch])        # (2,)
@@ -245,18 +274,31 @@ class BaseTracksDataset(torch.utils.data.Dataset):
                 frames, depths, tracks, queries, cur_hw
             )
 
-        # ---- fade out points that leave the final frame ----
-        if self.mark_offscreen_invisible and cur_hw is not None:
+        # ---- offscreen test + position-supervision validity ----
+        # ``inframe`` is needed even when offscreen points stay "visible":
+        # coordinates outside the frame are never supervisable (the feature
+        # sampler border-clamps there) and must not enter the position loss.
+        if cur_hw is not None:
             h, w = cur_hw
             inframe = (
                 (tracks[..., 0] >= 0) & (tracks[..., 0] < w)
                 & (tracks[..., 1] >= 0) & (tracks[..., 1] < h)
             )  # (T, N)
+        else:
+            inframe = torch.ones_like(visibility)
+        # pos_valid: where the COORDS carry usable supervision. Visible-in-frame
+        # always does; occluded-but-in-frame does IFF the source stores real GT
+        # through occlusion (has_occluded_gt: Kubric/PointOdyssey/DynamicReplica)
+        # rather than a (0,0)/pseudo-label placeholder. This is what lets the
+        # loss train tracking *through* occlusion — the project's core skill.
+        pos_valid = (visibility | self.has_occluded_gt) & inframe
+        if self.mark_offscreen_invisible:
             visibility = visibility & inframe
 
         out = dict(
             tracks=tracks,
             visibility=visibility,
+            pos_valid=pos_valid,
             queries=queries,
             frame_size=torch.tensor(cur_hw if cur_hw is not None else (-1, -1), dtype=torch.long),
             video=raw["video"],
