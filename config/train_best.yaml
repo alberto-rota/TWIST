@@ -1,16 +1,43 @@
+# TWIST — long "best" run: full KUBRIC pretraining at the WINNING hyperparameters.
+#
+# PROVENANCE — hyperparameters copied from the best sweep run by the standardized,
+# CoTracker-comparable benchmark (eval/MEAN, TAP-Vid "queried first"):
+#
+#   BEST RUN: twisteam/twist/fqbpeml7  (snowy-sweep-1)
+#     eval/MEAN  EPE 11.19 (lowest)   AJ 0.258 (highest)   delta_avg 0.377
+#     -> alone on the Pareto front: lowest EPE AND highest AJ of every run that
+#        completed EVAL_AT_END. This is the fine-loc cell RAD=24 / MAX_CORR=0 /
+#        ROLLOUT_WEIGHT=2 that config/sweep_ablations.yaml designated as the winner.
+#
+#   NOT t7imej6u (eternal-sweep-2): it CRASHED at epoch 14/25 so it produced NO
+#   benchmark score (eval/MEAN absent); its only numbers are train-set val metrics
+#   on a different (uncapped-PointOdyssey) mix, and it is a RAD=16 cell — the
+#   inferior fine-loc half (RAD=16/MC=0 = neat-sweep-2 scored eval EPE 13.78 / AJ
+#   0.194, decisively worse than this RAD=24/MC=0 cell).
+#
+# WHAT CHANGED vs config/train_r512_dynrep.yaml (the prior long-run template):
+#   * TRAIN DATA = KUBRIC ONLY, UNCAPPED (full dataset). PointOdyssey,
+#     DynamicReplica and Cholec80 are removed from the TRAIN mix. The held-out
+#     benchmark datasets (TAP-Vid / RoboTAP / surgical / STIR) are kept as
+#     IS_EVAL_DATASET so EPE/AJ are still scored — they are never trained on.
+#   * Everything else (model, loss, engine, schedule) is the validated winner,
+#     verbatim from snowy-sweep-1.
+#
+# Launch (A100-80, one GPU; re-submit same EXPERIMENT_NAME to auto-resume last.pt):
+#   sbatch .sbatch_scripts/train_a100.sbatch                 # edit it to point at this config, or:
+#   python train.py config/train_best.yaml
+# Memory: BATCH_SIZE 6 @ 512 measured ~75 GB peak on A100-80. Kubric-only drops the
+# per-epoch wall a lot vs the mix (PointOdyssey was ~80% of the old train compute).
+
 parameters:
 
   ###===========================================================================================================================
   ### RUN / GENERAL
   ###===========================================================================================================================
   EXPERIMENT_NAME:
-    # FIXED name + RESUME=last: a SLURM-timeout resubmit CONTINUES from last.pt.
-    # (The blank-name + scratch combo lost absurd-dust-35 and both 640/768
-    # resolution-sweep runs to the 24h wall: every resubmit restarted from zero
-    # under a new auto-name.)
-    value: twist_r512_dynrep
+    value:    # fresh run dir; re-submitting this name auto-resumes its own last.pt
   RESUME:
-    value: last     # in-stage resume from last.pt (fresh dir on first run)
+    value: scratch  # fresh init (NOT warmed from another run)
   WORKERS:
     value: 8
   PIN_MEMORY:
@@ -28,7 +55,7 @@ parameters:
     value: 512
 
   ###===========================================================================================================================
-  ### MODEL
+  ### MODEL — validated winner (snowy-sweep-1): OBSERVATION RAD=24 / MAX_CORR=0, K=9
   ###===========================================================================================================================
   MODEL:
     value:
@@ -43,9 +70,9 @@ parameters:
         RGB_ENCODER_LR: 0.0
       OBSERVATION:
         K: 9
-        RADIUS_PX: 24.0
+        RADIUS_PX: 24.0     # winning fine-loc window (RAD=16 was the worse half)
         HEADS: 4
-        MAX_CORR: 0.0
+        MAX_CORR: 0.0       # pure soft-argmax (0.05 sub-cell residual did not help)
       TRANSITION:
         DEPTH: 2
         HEADS: 4
@@ -55,7 +82,7 @@ parameters:
         UNCERTAINTY: true
 
   ###===========================================================================================================================
-  ### DATA — train mix now includes DynamicReplica (was eval-only) for diversity
+  ### DATA — TRAIN: full KUBRIC only.  EVAL: held-out benchmarks (never trained on).
   ###===========================================================================================================================
   DATASETS:
     value:
@@ -74,19 +101,11 @@ parameters:
         REQUIRE_VISIBLE_AT_QUERY: true
         MIN_VISIBLE_FRAMES: 1
 
-      ### TRAINING + VALIDATION
+      ### TRAINING + VALIDATION — KUBRIC ONLY, full dataset (no MAX_CLIPS cap)
       KUBRIC:
-        VAL_FRACTION: 0.1
-        MAX_CLIPS: 1000
-      POINTODYSSEY:
-        VAL_FRACTION: 0.1
-      DYNAMICREPLICA:          # moved into TRAIN (was eval-only) for data diversity
-        VAL_FRACTION: 0.1
-      CHOLEC80:
-        VAL_FRACTION: 1.0      # eval-only surgical validation
-        MAX_CLIPS: 20
+        VAL_FRACTION: 0.1   # 90% train / 10% in-training val; UNCAPPED = full Kubric
 
-      ### BENCHMARK EVALUATION (held-out; scored by utilities.evaluation)
+      ### BENCHMARK EVALUATION (held-out; scored by utilities.evaluation; not trained on)
       TAPVID_DAVIS:
         VAL_FRACTION: 1.0
         IS_EVAL_DATASET: True
@@ -108,23 +127,15 @@ parameters:
       STIR_FULL:                 # larger STIR train/val release
         VAL_FRACTION: 1.0
         IS_EVAL_DATASET: True
-      # SurgT is intentionally absent: only CoTracker pseudo-labels exist here
-      # (no GT), so it is a TRAIN-only adaptation set, not an eval benchmark.
       # TAPVID_KINETICS: left out of the in-training monitor (large); score it
       # offline with evaluate.py for the final headline number.
-      # NOTE: ENDOTAPP_GT / STIR_* are also auto-selected from DATASET_DEFAULTS
-      # (IS_EVAL_DATASET=True there); listed explicitly here for visibility.
 
   ###===========================================================================================================================
-  ### TRAINING (ENGINE)
+  ### TRAINING (ENGINE) — validated winner schedule
   ###===========================================================================================================================
   BATCH_SIZE:
-    value: 6  # Now TARGET=IMAGE=512: frames are LOADED at 512 (was 448, ~+31% raw-frame
-              # memory) instead of being upsampled inside the encoder. The encoder feature
-              # grid is 32x32 either way (it already ran at IMAGE_SIZE=512), so the trainable
-              # graph is ~unchanged; the only growth is the larger raw frame tensor. bs6 fit
-              # at 512 with headroom before, so it should still fit. VERIFY peak_mem_gb on a
-              # 2-step smoke; drop to 4 if OOM, push to 8 if there's room.
+    value: 4  # ~75 GB peak @ 512 on A100-80. Kubric-only train tensor is unchanged vs the mix;
+              # VERIFY peak_mem_gb on a 2-step smoke; drop to 4 if OOM, push to 8 if there's room.
   EPOCHS:
     value: 50
   LR:
@@ -163,7 +174,7 @@ parameters:
       HUBER_DELTA: 0.2
       UNC_WEIGHT: 0.0
       PRIOR_WEIGHT: 0.5
-      ROLLOUT_WEIGHT: 2.0  # A/B-validated; keep
+      ROLLOUT_WEIGHT: 2.0  # A/B-validated winner; keep
 
   ###===========================================================================================================================
   ### VALIDATION
