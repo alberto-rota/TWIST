@@ -80,7 +80,9 @@ def _build_parser() -> argparse.ArgumentParser:
                         "(legacy, all points at frame 0). Default: config EVAL_QUERY_MODE / 'first'")
     p.add_argument("--tag", default="", help="CSV name tag -> evaluation_<tag>.csv")
     p.add_argument("--out-dir", default=None, help="override where the CSV is written")
-    p.add_argument("--wandb", action="store_true", help="open a W&B run and log the table")
+    p.add_argument("--wandb", action="store_true",
+                   help="log the table to W&B -- resumes the checkpoint's original "
+                        "training run when its wandb_run_id is resolvable, else opens a new run")
     p.add_argument("--cpu", action="store_true", help="force CPU")
     return p
 

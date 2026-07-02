@@ -52,13 +52,19 @@ logger = get_logger(__name__).set_context("ENGINE")
 # --------------------------------------------------------------------------- #
 # W&B (optional; shared by a whole run, not per stage)
 # --------------------------------------------------------------------------- #
-def init_wandb(config: Any, run_dir: Optional[Path] = None) -> Tuple[Any, bool]:
+def init_wandb(config: Any, run_dir: Optional[Path] = None, run_id: Optional[str] = None) -> Tuple[Any, bool]:
     """Return ``(run, owned)``. ``owned`` is True only when *we* started the run.
 
     Disabled by ``NO_WANDB``. Inside a sweep (``sweep_agent.py`` already opened a
     run) the active run is reused and ``owned`` is False, so we don't finish it.
     Any failure (offline node, import error) degrades to ``(None, False)`` — the
     engine simply trains without logging.
+
+    ``run_id`` (optional — e.g. a checkpoint's saved ``wandb_run_id``) resumes that
+    *exact* run instead of opening a new one, so out-of-process logging (standalone
+    ``evaluate.py``) lands on the same run/chart as training rather than a
+    same-named duplicate. Falls back to opening a fresh run if the resume fails
+    (run id stale/deleted, offline, etc.).
     """
     if bool(config.get("NO_WANDB", False)):
         return None, False
@@ -69,14 +75,23 @@ def init_wandb(config: Any, run_dir: Optional[Path] = None) -> Tuple[Any, bool]:
         return None, False
     if getattr(wandb, "run", None) is not None:
         return wandb.run, False                          # sweep already opened it
+    project = str(config.get("WANDB_PROJECT", "Twist"))
+    entity = str(config.get("WANDB_ENTITY", "twisteam"))
+    wdir = str(run_dir) if run_dir is not None else None
+    if run_id:
+        try:
+            run = wandb.init(project=project, entity=entity, id=run_id, resume="must", dir=wdir)
+            return run, True
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"could not resume W&B run '{run_id}' ({e}); opening a new run instead")
     try:
         cfg = config.toDict() if hasattr(config, "toDict") else dict(config)
         run = wandb.init(
-            project=str(config.get("WANDB_PROJECT", "Twist")),
+            project=project,
             name=config.get("EXPERIMENT_NAME", None),
-            entity=str(config.get("WANDB_ENTITY", "twisteam")),
+            entity=entity,
             config=cfg,
-            dir=str(run_dir) if run_dir is not None else None,
+            dir=wdir,
         )
         return run, True
     except Exception as e:  # noqa: BLE001

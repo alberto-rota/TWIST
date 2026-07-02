@@ -1,42 +1,10 @@
-# TWIST — single "best-bet" run to break the val plateau (from scratch).
-#
-# Rationale (from the lap32y0x/8c5afg1k A/B + plateau analysis):
-#   * val EPE plateaus ~22px by epoch 6 while train EPE keeps dropping -> a
-#     representation/data CEILING, not under-training. The plateau is TWO failures:
-#       - delta_avg is fine-localization-limited (only 9%/21% of pts within 1/2px,
-#         but 89% within 16px) -> a feature-granularity / sub-cell-refinement issue.
-#       - mean EPE is tail-limited (~11% lost/drifting pts dominate the average)
-#         -> a data-diversity / matching-robustness issue, NOT a resolution one.
-#   * IMAGE_SIZE 448 -> 512   : MODEST lever. DINOv3 patch=16 -> grid 28x28 -> 32x32,
-#                               i.e. 16px/cell -> 14px/cell in the 448 eval space (~14%
-#                               finer, NOT 2x). And since TARGET_SIZE=448 this UPSAMPLES
-#                               a 448 frame (no new detail). Expect a small delta bump at
-#                               best; a real localization gain needs TARGET_SIZE raised
-#                               too + sub-cell refinement (OBSERVATION.MAX_CORR>0) +
-#                               a tighter window (RADIUS_PX). See the sweep notes.
-#   * +DynamicReplica in TRAIN: data diversity to close the widening train/val gap
-#                               (it was eval-only before) -- the main lever for the EPE tail.
-#   * ROLLOUT_WEIGHT 2.0      : kept — the A/B validated it (much better frame-free
-#                               forecast at ~zero cost to observed tracking).
-#
-# RESUME: scratch — this is a fresh ceiling test; we deliberately do NOT warm-start
-# from the plateaued live runs (that basin + cross-run confounds would cap it; and
-# there is no clean cross-run init knob). Re-submitting the SAME EXPERIMENT_NAME
-# auto-resumes this run's own last.pt.
-#
-# Memory: DINOv3 ViT-L at 512 ~2.5x the 448 encoder cost -> BATCH_SIZE dropped 4->2
-# for A100-40. On A100-80 / DDP you can raise it back (see .sbatch_scripts/).
-#
-# Headline number: run `python evaluate.py --run twist_r512_dynrep --query-mode first`
-# (uncapped) on best.pt — the in-training eval below is a capped monitor only.
-
 parameters:
 
   ###===========================================================================================================================
   ### RUN / GENERAL
   ###===========================================================================================================================
   EXPERIMENT_NAME:
-    value: twist_r512_dynrep  # fresh run dir; re-submitting this name auto-resumes its own last.pt
+    value:   # fresh run dir; re-submitting this name auto-resumes its own last.pt
   RESUME:
     value: scratch  # fresh init (NOT warmed from another run; see header)
   WORKERS:
@@ -52,6 +20,9 @@ parameters:
   SEED:
     value: 42
 
+  IMAGE_SIZE:
+    value: 512
+
   ###===========================================================================================================================
   ### MODEL
   ###===========================================================================================================================
@@ -63,7 +34,7 @@ parameters:
       TOKEN_DIM: 256
       RGB_ENCODER:
         ENCODER: facebook/dinov3-vitl16-pretrain-lvd1689m
-        IMAGE_SIZE: 512  # 28x28 -> 32x32 grid (16px/cell -> 14px/cell in the 448 eval space; ~14% finer, upsamples a 448 frame). Modest; see header.
+        # IMAGE_SIZE set by the top-level IMAGE_SIZE knob (see RUN / GENERAL)
         FREEZE_BACKBONE: true
         RGB_ENCODER_LR: 0.0
       OBSERVATION:
@@ -86,7 +57,7 @@ parameters:
     value:
       OVERRIDE_ALL_DATASETS:
         SPLIT_SEED: 42
-        TARGET_SIZE: [448, 448]  # frames fed to the model (encoder resizes to IMAGE_SIZE internally)
+        # TARGET_SIZE set by the top-level IMAGE_SIZE knob (-> [512, 512]; no upsample)
         CLIP_LEN: 24
         LOAD_FRAMES: true
         LOAD_DEPTHS: false
@@ -124,17 +95,32 @@ parameters:
       SURGICALMOTION:
         VAL_FRACTION: 1.0
         IS_EVAL_DATASET: True
+      ENDOTAPP_GT:               # surgical TAP GT (EndoTAPP)
+        VAL_FRACTION: 1.0
+        IS_EVAL_DATASET: True
+      STIR_CHALLENGE:            # headline surgical benchmark (MICCAI 2024 held-out)
+        VAL_FRACTION: 1.0        # native-res; delta over [4,8,16,32,64]px (EVAL_THRESHOLDS in registry)
+        IS_EVAL_DATASET: True
+      STIR_FULL:                 # larger STIR train/val release
+        VAL_FRACTION: 1.0
+        IS_EVAL_DATASET: True
+      # SurgT is intentionally absent: only CoTracker pseudo-labels exist here
+      # (no GT), so it is a TRAIN-only adaptation set, not an eval benchmark.
       # TAPVID_KINETICS: left out of the in-training monitor (large); score it
       # offline with evaluate.py for the final headline number.
+      # NOTE: ENDOTAPP_GT / STIR_* are also auto-selected from DATASET_DEFAULTS
+      # (IS_EVAL_DATASET=True there); listed explicitly here for visibility.
 
   ###===========================================================================================================================
   ### TRAINING (ENGINE)
   ###===========================================================================================================================
   BATCH_SIZE:
-    value: 6  # 512 grows only the stored feats (28x28->32x32, +31%) + encoder transient;
-              # the trainable graph is tied to TARGET_SIZE=448 (unchanged). From a bs8@448
-              # OOM-edge, ~6 fits at 512 with headroom. VERIFY via the per-epoch peak_mem_gb
-              # log on a 2-step smoke; drop to 4 if OOM, push to 8 if there's room.
+    value: 6  # Now TARGET=IMAGE=512: frames are LOADED at 512 (was 448, ~+31% raw-frame
+              # memory) instead of being upsampled inside the encoder. The encoder feature
+              # grid is 32x32 either way (it already ran at IMAGE_SIZE=512), so the trainable
+              # graph is ~unchanged; the only growth is the larger raw frame tensor. bs6 fit
+              # at 512 with headroom before, so it should still fit. VERIFY peak_mem_gb on a
+              # 2-step smoke; drop to 4 if OOM, push to 8 if there's room.
   EPOCHS:
     value: 50
   LR:

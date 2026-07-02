@@ -1,39 +1,3 @@
-# TWIST — resolution / feature-granularity sweep (the REAL fine-localization gap).
-#
-# WHY THIS, NOT MORE OF sweep_ablations (0kg2atga): that 2^3 grid settled the
-# fine-localization levers it tried (ROLLOUT_WEIGHT=2, RADIUS_PX=24, MAX_CORR~0)
-# and FALSIFIED their hypothesis — tightening RADIUS hurt, MAX_CORR did nothing,
-# and the tight-threshold gap did NOT move (delta_1px stayed ~0.09, delta_2px
-# ~0.19 across all 8 cells). Conclusion: sub-2px localization is NOT bottlenecked
-# by the cost-volume window/sub-cell knobs. The structural suspect is feature
-# spatial resolution: DINOv3 ViT-L is patch-16, so at IMAGE_SIZE=512 the cost
-# volume is built on a 32x32 grid (~16px/cell) — that alone caps how finely a
-# point can be localized regardless of RADIUS/MAX_CORR.
-#
-# So this sweep raises the thing that 0kg2atga held fixed:
-#   * IMAGE_SIZE (encoder input)   512 / 768   -> 32x32 vs 48x48 patch grid
-#   * MODEL.OBSERVATION.K          9 / 15      -> denser local matching
-#   3x... no: 2 levers x 2 = 4 cells, plus a 768 mid-tier => see grid below (6 cells).
-#
-# CRITICAL: IMAGE_SIZE alone just UPSAMPLES the TARGET_SIZE frame inside the
-# encoder (no new detail). TARGET_SIZE is therefore raised to [512,512] as the
-# base for ALL cells (0kg2atga already validated bs6 @ TARGET=512/IMAGE=512), so
-# the 768 arm gets a genuine resolution increase, not an upsample.
-#
-# Levers settled by 0kg2atga and HELD here: ROLLOUT_WEIGHT=2, RADIUS_PX=24,
-# MAX_CORR=0. Config is otherwise the same 20-epoch / capped-PO / EVAL_AT_END
-# ranking harness — these trials RANK resolution tiers, they are not the headline
-# (the winner gets trained long on the full mix, like train_r512_dynrep).
-#
-# MEMORY: BATCH_SIZE dropped 6 -> 4. The 768 encoder is ~2.25x the patch count of
-# 512; the encoder runs frozen/no_grad (small activation cost) but stores a larger
-# feature map for the observation model. 4 is the safe pick across all cells on
-# A100-80; VERIFY peak_mem_gb on a 2-step smoke before committing 8 agents, and
-# raise to 6 if the 768 arm shows headroom.
-#
-# Launch (one cell per A100-80 GPU; 6 cells -> submit 6+ agents):
-#   wandb sweep config/sweep_resolution.yaml                                  # -> twisteam/twist/<SWEEP_ID>
-#   for i in $(seq 6); do jsub -w 'wandb agent twisteam/twist/<SWEEP_ID>' .sbatch_scripts/agent_gpu/singlegpu/A100_80GB.sbatch; done
 
 program: sweep_agent.py
 method: grid
@@ -93,7 +57,6 @@ parameters:
       TOKEN_DIM: 256
       RGB_ENCODER:
         ENCODER: facebook/dinov3-vitl16-pretrain-lvd1689m
-        IMAGE_SIZE: 512         # swept below
         FREEZE_BACKBONE: true
         RGB_ENCODER_LR: 0.0
       OBSERVATION: { K: 9, RADIUS_PX: 24.0, HEADS: 4, MAX_CORR: 0.0 }   # K swept below; RADIUS/MAX_CORR settled by 0kg2atga
@@ -114,12 +77,10 @@ parameters:
       PRIOR_WEIGHT: 0.5
       ROLLOUT_WEIGHT: 2.0
 
-  ### DATA — TARGET_SIZE raised to 512 so IMAGE_SIZE=768 is a real res bump (see header)
   DATASETS:
     value:
       OVERRIDE_ALL_DATASETS:
         SPLIT_SEED: 42
-        TARGET_SIZE: [512, 512]
         CLIP_LEN: 24
         LOAD_FRAMES: true
         LOAD_DEPTHS: false
@@ -139,7 +100,7 @@ parameters:
       SURGICALMOTION: { VAL_FRACTION: 1.0, IS_EVAL_DATASET: True }
 
   ### SWEPT KNOBS — resolution x cost-volume density (grid: 3 x 2 = 6 cells) -------
-  MODEL.RGB_ENCODER.IMAGE_SIZE:
-    values: [512, 640, 768]    # 32x32 / 40x40 / 48x48 patch grid (16 / 12.8 / 10.7 px/cell in the 512 space)
+  IMAGE_SIZE:                  # single top-level res knob -> drives TARGET_SIZE + encoder IMAGE_SIZE
+    values: [512, 640, 768]    # 32x32 / 40x40 / 48x48 patch grid (16 / 12.8 / 10.7 px/cell)
   MODEL.OBSERVATION.K:
     values: [9, 15]            # local cost-volume sample count (denser matching)

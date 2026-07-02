@@ -116,6 +116,73 @@ def _apply_dotted_override(config_dict: dict, dotted_key: str, value: str) -> No
         node[leaf] = value
 
 
+def _apply_top_level_image_size(config_dict: dict) -> None:
+    """Propagate a single top-level ``IMAGE_SIZE`` to both the dataset loader and
+    the encoder, so frames are loaded at exactly the size the encoder consumes and
+    are never resampled inside the encoder.
+
+    When ``IMAGE_SIZE`` is present it sets:
+      * ``DATASETS.OVERRIDE_ALL_DATASETS.TARGET_SIZE -> [IMAGE_SIZE, IMAGE_SIZE]``
+        (the size every reader produces), and
+      * ``MODEL.RGB_ENCODER.IMAGE_SIZE -> IMAGE_SIZE`` (what the encoder expects).
+
+    Companion: top-level ``CROP`` (see :func:`_apply_top_level_crop`) selects a
+    native-pixel box applied *before* this resize. No-op if absent. Runs after the
+    dotted-key fold so a swept/CLI ``IMAGE_SIZE`` override is the value used."""
+    size = config_dict.get("IMAGE_SIZE")
+    if size is None:
+        return
+    try:
+        size = int(size)
+    except (TypeError, ValueError):
+        logger.warning(f"top-level IMAGE_SIZE={size!r} is not an int; ignoring")
+        return
+    if size % 16 != 0:
+        logger.warning(
+            f"IMAGE_SIZE={size} is not divisible by the DINOv3 patch size 16; "
+            "the encoder requires H,W % 16 == 0 and will assert at runtime")
+    datasets = config_dict.setdefault("DATASETS", {})
+    if isinstance(datasets, dict):
+        oad = datasets.setdefault(OVERRIDE_ALL_DATASETS_KEY, {})
+        if isinstance(oad, dict):
+            oad["TARGET_SIZE"] = [size, size]
+    model = config_dict.setdefault("MODEL", {})
+    if isinstance(model, dict):
+        enc = model.setdefault("RGB_ENCODER", {})
+        if isinstance(enc, dict):
+            enc["IMAGE_SIZE"] = size
+    logger.info(f"resolution: IMAGE_SIZE={size} -> TARGET_SIZE=[{size},{size}] + encoder IMAGE_SIZE")
+
+
+def _apply_top_level_crop(config_dict: dict) -> None:
+    """Propagate top-level ``CROP`` to ``DATASETS.OVERRIDE_ALL_DATASETS.CROP``.
+
+    ``CROP`` is ``[x0, y0, x1, y1]`` in native pixels, applied *before* the
+    resize-to-cover + center-crop to ``TARGET_SIZE`` (see ``dataset.base``). No-op
+    if absent. Runs after the dotted-key fold so a swept/CLI override wins."""
+    crop = config_dict.get("CROP")
+    if crop is None:
+        return
+    if not isinstance(crop, (list, tuple)) or len(crop) != 4:
+        logger.warning(f"top-level CROP={crop!r} must be [x0, y0, x1, y1]; ignoring")
+        return
+    try:
+        crop = tuple(int(v) for v in crop)
+    except (TypeError, ValueError):
+        logger.warning(f"top-level CROP={crop!r} must be four ints; ignoring")
+        return
+    x0, y0, x1, y1 = crop
+    if not (x1 > x0 and y1 > y0):
+        logger.warning(f"top-level CROP={list(crop)} invalid (need x1>x0, y1>y0); ignoring")
+        return
+    datasets = config_dict.setdefault("DATASETS", {})
+    if isinstance(datasets, dict):
+        oad = datasets.setdefault(OVERRIDE_ALL_DATASETS_KEY, {})
+        if isinstance(oad, dict):
+            oad["CROP"] = list(crop)
+    logger.info(f"geometry: CROP={list(crop)} (native px, applied before TARGET_SIZE resize)")
+
+
 def load_and_process_config(
     config_path: Optional[str] = None,
     config: Optional[Dict[str, Any]] = None,
@@ -184,6 +251,14 @@ def load_and_process_config(
     # params sweepable without flattening the whole config.
     for key in [k for k in config_dict if isinstance(k, str) and "." in k]:
         _apply_dotted_override(config_dict, key, str(config_dict.pop(key)))
+
+    # Single-knob resolution: a top-level ``IMAGE_SIZE`` drives both the loaded
+    # frame size (DATASETS TARGET_SIZE) and the encoder, so frames are read at the
+    # encoder's size and never resampled. ``CROP`` is the companion native-pixel box
+    # applied before that resize. Both run after the dotted-key fold so swept/CLI
+    # overrides are the values that propagate.
+    _apply_top_level_image_size(config_dict)
+    _apply_top_level_crop(config_dict)
 
     if boot_mode:
         config_dict["BATCH_SIZE"] = 1

@@ -310,6 +310,16 @@ class TrackerWorldModel(nn.Module):
         feats = torch.cat(outs, dim=0)
         return feats.reshape(b, t, *feats.shape[1:])
 
+    def encode(self, frames: torch.Tensor) -> torch.Tensor:
+        """Public frozen-encoder pass -- ``frames (B,T,3,H,W)`` -> ``(B,T,C,Hf,Wf)``.
+
+        Exposed so callers that invoke :meth:`forward` multiple times over the
+        *same* clip with different queries (e.g. the "queried first" eval protocol,
+        which groups points by first-visible frame and runs one forward per group)
+        can encode once and pass the result via ``forward(..., feats=...)`` instead
+        of paying the frozen backbone's cost again per group."""
+        return self._encode(frames)
+
     # -- forward -------------------------------------------------------------- #
     def forward(
         self,
@@ -322,11 +332,12 @@ class TrackerWorldModel(nn.Module):
         gt_tracks: Optional[torch.Tensor] = None,
         rollout_observe: Optional[int] = None,
         rollout_horizon: Optional[int] = None,
+        feats: Optional[torch.Tensor] = None,    # precomputed self.encode(frames); skips re-encoding when given
     ) -> Dict[str, torch.Tensor]:
         b, t = frames.shape[:2]
         h, w = int(frames.shape[-2]), int(frames.shape[-1])
         hw = (h, w)
-        feats = self._encode(frames)                              # (B,T,C,Hf,Wf)
+        feats = feats if feats is not None else self._encode(frames)  # (B,T,C,Hf,Wf)
 
         qf = int(queries[0, 0, 0].item())                         # query frame (constant per clip)
         qf = max(0, min(qf, t - 1))
