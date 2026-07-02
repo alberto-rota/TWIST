@@ -252,6 +252,15 @@ class FrozenFrameEncoder(nn.Module):
                 p.requires_grad = False
             self.eval()
 
+        # ImageNet statistics as (non-persistent) buffers: the dino path
+        # preprocesses ON-DEVICE (resize when needed + normalize) instead of the
+        # HF processor's GPU->CPU->PIL->GPU round-trip, which throttled every
+        # training step and inflated the timed ms/frame at eval.
+        self.register_buffer("_img_mean", torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1),
+                             persistent=False)
+        self.register_buffer("_img_std", torch.tensor(IMAGENET_STD).view(1, 3, 1, 1),
+                             persistent=False)
+
     @staticmethod
     def _to_unit(frames: torch.Tensor) -> torch.Tensor:
         """uint8 or float frames -> float in ``[0, 1]``."""
@@ -260,6 +269,20 @@ class FrozenFrameEncoder(nn.Module):
         f = frames.float()
         return f / 255.0 if float(f.max()) > 1.5 else f
 
+    def _preprocess_dino(self, x: torch.Tensor) -> torch.Tensor:
+        """``(B,3,H,W)`` in ``[0,1]`` -> DINOv3 input, entirely on-device.
+
+        Matches the HF processor semantics (resize to the square ``image_size``
+        with bicubic + antialias, then ImageNet-normalize). With the standard
+        config the dataset already loads frames at ``IMAGE_SIZE`` (the top-level
+        knob sets both), so the resize is skipped and this is a pure normalize.
+        """
+        size = int(self.backbone.config["image_size"])
+        if x.shape[-2:] != (size, size):
+            x = F.interpolate(x, size=(size, size), mode="bicubic",
+                              align_corners=False, antialias=True).clamp(0, 1)
+        return (x - self._img_mean) / self._img_std
+
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
         """``frames (B,3,H,W)`` -> dense features ``(B, C, Hf, Wf)``."""
         ctx = torch.no_grad() if self.frozen else nullcontext()
@@ -267,5 +290,5 @@ class FrozenFrameEncoder(nn.Module):
             x = self._to_unit(frames)
             if self.variant == "cnn":
                 return self.backbone(x)
-            x = self.backbone.preprocess_image(x)          # resize + ImageNet normalize
+            x = self._preprocess_dino(x)                   # on-device resize + normalize
             return self.backbone(x)["last_hidden_state"]   # (B, C, Hf, Wf)
