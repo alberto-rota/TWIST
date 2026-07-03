@@ -1,0 +1,62 @@
+# Benchmark config: LocoTrack (PyTorch) on the TWIST eval datasets.
+#
+# W&B-sweep format (parameters: {KEY: {value: ...}}) like every config in the
+# repo, loaded through utilities.config.load_and_process_config. The benchmark
+# script runs LocoTrack through the *same* evaluator the TWIST model uses
+# (utilities.evaluation), so the logged metrics are directly comparable.
+#
+#   python benchmark/locotrack/locotrack.py                       # uses this file
+#   python benchmark/locotrack/locotrack.py --image-size 256      # override IMAGE_SIZE
+#   python benchmark/locotrack/locotrack.py --datasets TAPVID_DAVIS --max-clips 5   # smoke
+parameters:
+
+  ###===========================================================================
+  ### RUN / W&B  (same project/entity as the TWIST runs; tagged 'benchmark')
+  ###===========================================================================
+  EXPERIMENT_NAME:
+    value: locotrack
+  WANDB_PROJECT:
+    value: twist
+  WANDB_ENTITY:
+    value: twisteam
+  WANDB_TAGS:
+    value: [benchmark]
+
+  ###===========================================================================
+  ### GEOMETRY  (same crop-then-resize knobs as the TWIST train/eval pipeline)
+  ###===========================================================================
+  CROP:
+    value: null
+  IMAGE_SIZE:
+    value: 512               # -> DATASETS.OVERRIDE_ALL_DATASETS.TARGET_SIZE [512, 512]
+
+  ###===========================================================================
+  ### LOCOTRACK MODEL
+  ###===========================================================================
+  LOCOTRACK:
+    value:
+      MODEL_SIZE: base          # 'base' or 'small'
+      CHECKPOINT: weights/locotrack/locotrack_base.ckpt
+      CHECKPOINT_URL: https://huggingface.co/datasets/hamacojr/LocoTrack-pytorch-weights/resolve/main/locotrack_base.ckpt
+      QUERY_CHUNK_SIZE: 64      # break queries into chunks for the cost volume (memory)
+      FEATURE_EXTRACTOR_CHUNK_SIZE: 8   # ResNet frames per pass (default 256 OOMs @ 512²)
+      MAX_TEMPORAL_FRAMES: 128          # tile longer clips (RoboTAP ~1.2k frames) — memory is O(T)
+      # REFINEMENT_RESOLUTIONS: null     # default: [(256,256)] when IMAGE_SIZE>256
+
+  ###===========================================================================
+  ### EVAL PROTOCOL  (must match the TWIST evaluator to stay comparable)
+  ###===========================================================================
+  EVAL_QUERY_MODE:
+    value: first             # TAP-Vid "queried first"
+  EVAL_TIMING_BATCHES:
+    value: 0                # skip extra timing forward (LocoTrack is already heavy on long clips)
+  EVAL_RECOVERY:
+    value: true
+  EVAL_RECOVERY_WINDOW:
+    value: 8
+  EVAL_AMP:
+    value: false
+  EVAL_BATCH_SIZE:
+    value: 1
+  EVAL_WORKERS:
+    value: 6

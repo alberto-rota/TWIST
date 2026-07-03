@@ -228,9 +228,15 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "SPLIT_SEED": 42,
         "IS_EVAL_DATASET": True,
         "EVAL_THRESHOLDS": [4, 8, 16, 32, 64],  # official STIR 2D-accuracy thresholds
-        # STIR GT visibility exists only on the annotated endpoint frames, so
-        # AJ / OA degenerate (~0.005 / ~0.06 for EVERY method — scoring artifact).
-        # Keep them on STIR's own row but out of the cross-dataset MEAN.
+        # STIR GT visibility/position exist ONLY on the annotated endpoint frames;
+        # every interior frame is marked occluded merely because it is unlabelled,
+        # not genuinely hidden. Score only those annotated (visible) frames -- else
+        # the model's (probably-correct) visible predictions on unlabelled interiors
+        # become Jaccard false-positives / OA misses and collapse AJ/OA to ~0.
+        "EVAL_VISIBLE_ONLY": True,
+        # AJ/OA are now meaningful but endpoint-only (a single frame per point at
+        # thresholds [4..64]) -- a different regime from dense TAP-Vid AJ, so keep
+        # them out of the cross-dataset MEAN. They remain on STIR's own row.
         "EVAL_EXCLUDE_FROM_MEAN": ["average_jaccard", "occlusion_accuracy"],
     },
     # This is the full non-annotated STIR dataset. Do not use.

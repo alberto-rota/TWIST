@@ -55,7 +55,8 @@ def _frames_to_hwc_uint8(frames) -> np.ndarray:
     return f
 
 
-def _present_mask(pos, vis, hw=None, eps: float = 1e-3) -> np.ndarray:
+def _present_mask(pos, vis, hw=None, eps: float = 1e-3,
+                  occluded_coords_real: bool = True) -> np.ndarray:
     """``(T, N)`` bool: where each point has a *real* position to draw.
 
     A point queried/born mid-clip (or that has already left) stores a padding
@@ -66,11 +67,24 @@ def _present_mask(pos, vis, hw=None, eps: float = 1e-3) -> np.ndarray:
     carries a genuine in-frame position (Kubric / PointOdyssey keep real coords
     through occlusion, which we still want to show as hollow rings).
 
+    ``occluded_coords_real`` gates that occluded-but-in-frame case. It is only true
+    for datasets that keep genuine coordinates through occlusion (the
+    ``HAS_OCCLUDED_GT`` readers -- Kubric / DynamicReplica / PointOdyssey). For every
+    other dataset the coordinate stored while a point is invisible is a **placeholder,
+    not a sentinel**: STIR repeats the start/query position on every unannotated
+    interior frame (GT exists only at the first and last frame), so ``~sentinel`` is
+    ``True`` there and the point would otherwise be drawn frozen at its start for the
+    whole clip. Pass ``occluded_coords_real=False`` for those readers so occluded
+    slots are dropped (drawn only where ``visibility`` is true), regardless of the
+    stored coordinate.
+
     Shapes: ``pos (T, N, 2)``, ``vis (T, N)``; ``hw=(H, W)`` enables the off-frame
     sentinel test (skip it when frame size is unknown).
     """
     pos = _to_numpy(pos).astype(np.float32)                      # (T, N, 2)
     vis = _to_numpy(vis).astype(bool)                            # (T, N)
+    if not occluded_coords_real:
+        return vis                                               # occluded coords are placeholders -> draw only visible
     at_origin = np.abs(pos).sum(-1) < eps                        # (T, N) the (0,0) sentinel
     sentinel = at_origin
     if hw is not None:
@@ -183,6 +197,7 @@ def animate_tracks(
     dpi: int = 80,
     show_occluded: bool = True,
     title: Optional[str] = None,
+    occluded_coords_real: bool = True,
     save_path: Optional[str] = None,
 ):
     """Animate point tracks over a clip.
@@ -211,7 +226,8 @@ def animate_tracks(
 
     H, W = imgs.shape[1], imgs.shape[2]
     # NaN out padding/sentinel slots so they never anchor a marker or trail to (0,0)
-    present = _present_mask(pos, vis, hw=(H, W))                  # (T, N) bool
+    present = _present_mask(pos, vis, hw=(H, W),
+                            occluded_coords_real=occluded_coords_real)  # (T, N) bool
     pos_draw = pos.copy()
     pos_draw[~present] = np.nan                                   # (T, N, 2)
     base_rgb = _point_colors(pos, cmap)[:, :3]       # (N, 3)
@@ -301,6 +317,7 @@ def overlay_tracks_on_frame(
     point_size: float = 20.0,
     show_occluded: bool = True,
     draw_error: bool = True,
+    occluded_coords_real: bool = True,
 ):
     """Overlay GT (triangles △) and predicted (circles ○) points on one frame.
 
@@ -333,7 +350,8 @@ def overlay_tracks_on_frame(
     # or occluded-but-genuine as Kubric/PointOdyssey keep).
     gv = (_to_numpy(gt_visibility).astype(bool) if gt_visibility is not None
           else np.ones(gt.shape[0], bool))               # (N,)
-    gt_present = _present_mask(gt[None], gv[None], hw=(H, W))[0]   # (N,) bool
+    gt_present = _present_mask(gt[None], gv[None], hw=(H, W),
+                               occluded_coords_real=occluded_coords_real)[0]   # (N,) bool
 
     # Draw the frame ONCE here, then both layers via `_draw_markers` so GT and
     # pred share the same raw scatter-area `point_size` semantics. (Routing the
@@ -382,6 +400,7 @@ def animate_comparison(
     dpi: int = 80,
     title: Optional[str] = None,
     draw_error: bool = True,
+    occluded_coords_real: bool = True,
     save_path: Optional[str] = None,
 ):
     """Animate predicted (circles ○) vs ground-truth (triangles △) tracks over a clip.
@@ -418,6 +437,7 @@ def animate_comparison(
             gt_visibility=gv[ti] if gv is not None else None,
             pred_visibility=pv[ti] if pv is not None else None,
             ax=ax, colors=colors, point_size=point_size, draw_error=draw_error,
+            occluded_coords_real=occluded_coords_real,
         )
         label = f"frame {ti + 1}/{t}  (○ pred  △ GT)"
         ax.set_title(f"{title} | {label}" if title else label, fontsize=9)
@@ -462,8 +482,14 @@ def render_comparison_frames(
     out_size: Optional[int] = None,
     title: Optional[str] = None,
     draw_error: bool = True,
+    occluded_coords_real: bool = True,
 ) -> np.ndarray:
     """Render a pred-vs-GT comparison clip to a ``(T, 3, H, W)`` uint8 array.
+
+    ``occluded_coords_real`` (see :func:`_present_mask`) must be ``False`` for
+    datasets whose GT is annotated only on some frames and pads the rest with a
+    placeholder coordinate (STIR: GT only at first/last frame). Leaving it ``True``
+    for those draws the GT triangle frozen at its start position for the whole clip.
 
     A non-interactive (Agg) sibling of :func:`animate_comparison` that returns the
     rendered RGB frames directly — the per-frame RGB the engine logs one frame at a
@@ -504,6 +530,7 @@ def render_comparison_frames(
             gt_visibility=gv[ti] if gv is not None else None,
             pred_visibility=pv[ti] if pv is not None else None,
             ax=ax, colors=colors, point_size=point_size, draw_error=draw_error,
+            occluded_coords_real=occluded_coords_real,
         )
         if title:
             ax.set_title(f"{title} | {ti + 1}/{t}", fontsize=8)
@@ -527,6 +554,7 @@ def render_track_frames(
     out_size: Optional[int] = None,
     title: Optional[str] = None,
     show_occluded: bool = True,
+    occluded_coords_real: bool = True,
 ) -> np.ndarray:
     """Render *tracks* (per-point fading motion trails) to ``(T, 3, H, W)`` uint8.
 
@@ -551,7 +579,8 @@ def render_track_frames(
 
     h, w = imgs.shape[1], imgs.shape[2]
     # NaN out padding/sentinel slots so markers/trails never anchor to (0,0)
-    present = _present_mask(pos, vis, hw=(h, w))         # (T, N) bool
+    present = _present_mask(pos, vis, hw=(h, w),
+                            occluded_coords_real=occluded_coords_real)  # (T, N) bool
     pos_draw = pos.copy()
     pos_draw[~present] = np.nan                          # (T, N, 2)
     if out_size is not None:

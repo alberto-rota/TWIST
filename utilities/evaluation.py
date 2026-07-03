@@ -91,6 +91,14 @@ HAS_OCCLUDED_GT_KEY = "HAS_OCCLUDED_GT"
 # delta/Jaccard pixel thresholds for this dataset. STIR sets [4,8,16,32,64] to
 # match its official 2D accuracy metric.
 EVAL_THRESHOLDS_KEY = "EVAL_THRESHOLDS"
+# Per-dataset config flag (default False): the dataset's visibility GT is *sparse* —
+# present only on annotated frames, with every other frame marked occluded merely
+# because it is unlabelled (STIR: GT only at first/last frame). When set, the metric
+# scores only the visible (annotated) frames (tracking_metrics(visible_only=True)), so
+# AJ/OA are not collapsed to ~0 by treating unlabelled interior frames as occluded and
+# counting the model's (probably-correct) visible predictions there as false positives.
+# EPE/δ are unaffected (already visible-only).
+EVAL_VISIBLE_ONLY_KEY = "EVAL_VISIBLE_ONLY"
 # Top-level config flag (default True): skip datasets whose metrics were already
 # finished (and reported) in a previous call over this run dir + tag -- see
 # _load_eval_state / _save_eval_state. Lets a benchmark job that got pre-empted
@@ -377,6 +385,7 @@ def evaluate_model_on_dataset(
     has_occluded_gt: bool = False,
     recovery_window: int = 8,
     eval_thresholds: Optional[Sequence[float]] = None,
+    visible_only: bool = False,
     name: Optional[str] = None,
     log_every: int = 50,
     timing_batches: int = 10,
@@ -503,11 +512,13 @@ def evaluate_model_on_dataset(
             e_coords, e_vislog, e_mask = _first_visible_eval(
                 model, frames, gt_tracks, gt_vis, point_mask, autocast_ctx=autocast_ctx)
             m = tracking_metrics(e_coords, gt_tracks, e_vislog, gt_vis,
-                                 eval_mask=e_mask, query_frame=query_frame, **thr_kw)
+                                 eval_mask=e_mask, query_frame=query_frame,
+                                 visible_only=visible_only, **thr_kw)
             rec_coords, rec_vislog = e_coords, e_vislog
         else:
             m = tracking_metrics(out["coords"], gt_tracks, out["vis_logits"], gt_vis,
-                                 time_mask, point_mask, query_frame=query_frame, **thr_kw)
+                                 time_mask, point_mask, query_frame=query_frame,
+                                 visible_only=visible_only, **thr_kw)
             rec_coords, rec_vislog = out["coords"], out["vis_logits"]
         for k in _QUALITY_KEYS:
             v = m.get(k, float("nan"))
@@ -624,13 +635,16 @@ def evaluate(
         merged = _merged_dataset_cfg(name, datasets_cfg)
         has_occ = bool(merged.get(HAS_OCCLUDED_GT_KEY, False))
         eval_thr = merged.get(EVAL_THRESHOLDS_KEY)        # e.g. STIR [4,8,16,32,64]; None -> TAP default
+        vis_only = bool(merged.get(EVAL_VISIBLE_ONLY_KEY, False))  # sparse-GT (STIR): score annotated frames only
         logger.info(f"  {name}: {len(ds)} clips ..."
-                    + (f" [thresholds={list(eval_thr)}]" if eval_thr else ""))
+                    + (f" [thresholds={list(eval_thr)}]" if eval_thr else "")
+                    + (" [visible-only]" if vis_only else ""))
         m = evaluate_model_on_dataset(
             model, ds, device, batch_size=batch_size, num_workers=num_workers,
             amp=amp, amp_dtype=amp_dtype, max_steps=max_steps, query_frame=query_frame,
             query_mode=qm, compute_recovery=compute_recovery, has_occluded_gt=has_occ,
-            recovery_window=recovery_window, eval_thresholds=eval_thr, name=name,
+            recovery_window=recovery_window, eval_thresholds=eval_thr,
+            visible_only=vis_only, name=name,
             timing_batches=int(config.get("EVAL_TIMING_BATCHES", 10)),
         )
         results[name] = m

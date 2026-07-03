@@ -21,3 +21,5 @@ logs/
 wandb/
 *.ipynb_checkpoints
 workshops/
+
+benchmark/methods/
