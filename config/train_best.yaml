@@ -15,6 +15,14 @@
 #   inferior fine-loc half (RAD=16/MC=0 = neat-sweep-2 scored eval EPE 13.78 / AJ
 #   0.194, decisively worse than this RAD=24/MC=0 cell).
 #
+#   PROTOCOL NOTE (2026-07-07): the 11.19 / 13.78 numbers above are OLD-protocol
+#   (pre-2026-06-30 24-frame-chopped, capped-clip eval). They remain valid as the
+#   fine-loc sweep's INTERNAL ranking (same era, controlled) -> RAD=24 stands.
+#   They are NOT comparable to whole-video numbers: t7imej6u was later scored
+#   MEAN EPE 38.58 under the post-fix whole-video protocol (where CoTracker3
+#   zero-shot = 20.12), so "decisively worse"/"eval/MEAN absent" above is stale.
+#   fqbpeml7 has NO whole-video score yet (re-eval: python evaluate.py --run snowy-sweep-1).
+#
 # WHAT CHANGED vs config/train_r512_dynrep.yaml (the prior long-run template):
 #   * TRAIN DATA = KUBRIC ONLY, UNCAPPED (full dataset). PointOdyssey,
 #     DynamicReplica and Cholec80 are removed from the TRAIN mix. The held-out
@@ -35,9 +43,12 @@ parameters:
   ### RUN / GENERAL
   ###===========================================================================================================================
   EXPERIMENT_NAME:
-    value:    # fresh run dir; re-submitting this name auto-resumes its own last.pt
+    # FIXED name + RESUME=last so a SLURM-timeout resubmit CONTINUES from last.pt
+    # (blank-name + scratch randomizes the name each submit and lost 3 prior runs
+    # to the 24h wall — see CLAUDE.md). First submit still inits fresh (no last.pt).
+    value: twist_best_kubric_r512
   RESUME:
-    value: scratch  # fresh init (NOT warmed from another run)
+    value: last     # in-stage resume from last.pt; fresh init on the first run
   WORKERS:
     value: 8
   PIN_MEMORY:
@@ -134,8 +145,8 @@ parameters:
   ### TRAINING (ENGINE) — validated winner schedule
   ###===========================================================================================================================
   BATCH_SIZE:
-    value: 4  # ~75 GB peak @ 512 on A100-80. Kubric-only train tensor is unchanged vs the mix;
-              # VERIFY peak_mem_gb on a 2-step smoke; drop to 4 if OOM, push to 8 if there's room.
+    value: 6  # snowy-sweep-1 (provenance) value; ~75 GB peak @ 512 on A100-80. Kubric-only
+              # train tensor is unchanged vs the mix; drop to 4 if OOM, push to 8 if there's room.
   EPOCHS:
     value: 50
   LR:

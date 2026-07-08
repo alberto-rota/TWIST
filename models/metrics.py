@@ -95,6 +95,7 @@ def tracking_metrics(
         stuck_frac = ((pred_disp < 2.0) & moving).float().sum().item() / moving.float().sum().clamp_min(1).item()
     else:
         motion_ratio = float("nan"); stuck_frac = float("nan")
+        pred_travel = float("nan"); gt_travel = float("nan")
 
     deltas, jaccards = [], []
     per_threshold: Dict[str, float] = {}
@@ -123,7 +124,13 @@ def tracking_metrics(
         "delta_avg": _nanmean(deltas),
         "occlusion_accuracy": occ_acc,
         "average_jaccard": _nanmean(jaccards),
-        "motion_ratio": motion_ratio,
+        "motion_ratio": motion_ratio,          # per-batch ratio-of-means (unstable; see below)
+        # pred/GT travel are returned separately so callers can POOL across batches
+        # (Σpred/Σgt) instead of averaging the per-batch ratio — a single near-static
+        # clip drives gt_travel→0 and blows the per-batch ratio into the hundreds,
+        # which the arithmetic mean-of-ratios then inflates (the ~40 artifact).
+        "pred_travel": pred_travel,
+        "gt_travel": gt_travel,
         "stuck_frac": stuck_frac,
         **per_threshold,
     }

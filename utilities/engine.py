@@ -526,7 +526,8 @@ class Engine:
                "rollout": 0.0, "rollout_epe": 0.0, "w_rollout": 0.0,
                "w_pos": 0.0, "w_prior": 0.0, "w_unc": 0.0, "w_vis": 0.0, "w_kl": 0.0,
                "w_ce": 0.0, "w_gce": 0.0,
-               "gate": 0.0, "motion_ratio": 0.0, "obs_kept": 0.0}
+               "gate": 0.0, "obs_kept": 0.0}
+        pt_sum, gt_travel_sum = 0.0, 0.0   # pooled travel for a stable epoch motion_ratio
         # NaN-safe means (separate counters, since a batch can legitimately lack the
         # entries — e.g. no visible points, no occluded-but-supervised frames):
         # the TAP metrics + the occlusion diagnostics (epe_occ from the loss;
@@ -601,12 +602,19 @@ class Engine:
                            if "coarse_gate" in out else float("nan"))
             # train motion_ratio: how far the model's OWN predictions travel vs GT
             # (inflated while tf_prob>0 since the state is GT-fed; judge once tf->0).
+            # The per-batch ratio-of-means is the step-log value; the EPOCH number is
+            # POOLED (Σpred/Σgt below) so a near-static clip can't blow it up.
             with torch.no_grad():
                 c = out["coords"].float()
                 pd = torch.linalg.norm(c - c[:, :1], dim=-1)
                 gd = torch.linalg.norm(tgt["tracks"] - tgt["tracks"][:, :1], dim=-1)
                 vm = tgt["visibility"].bool()
-                motion_ratio = float((pd[vm].mean() / gd[vm].mean().clamp_min(1e-6))) if vm.any() else float("nan")
+                if vm.any():
+                    pd_sum = float(pd[vm].sum()); gd_sum = float(gd[vm].sum())
+                    motion_ratio = pd_sum / gd_sum if gd_sum > 1e-6 else float("nan")
+                    pt_sum += pd_sum; gt_travel_sum += gd_sum
+                else:
+                    motion_ratio = float("nan")
             # full TAP metrics on the train batch (recorded coords are ALWAYS the
             # model's own predictions, so this is valid even while teacher-forced)
             tm = tracking_metrics(out["coords"], tgt["tracks"], out["vis_logits"],
@@ -624,7 +632,6 @@ class Engine:
                       "w_rollout"):
                 agg[k] += float(parts[k])
             agg["gate"] += gate
-            agg["motion_ratio"] += motion_ratio
             agg["obs_kept"] += obs_kept
             if grad_norm == grad_norm:                   # finite (GradScaler overflow steps -> NaN, skipped)
                 gn_sum += grad_norm; gn_cnt += 1
@@ -665,6 +672,7 @@ class Engine:
                     self.model.encoder.eval()
                 self._barrier()
         out = {k: v / max(n, 1) for k, v in agg.items()}
+        out["motion_ratio"] = pt_sum / gt_travel_sum if gt_travel_sum > 1e-6 else float("nan")
         for k in m_keys:                                     # NaN-safe TAP metric means
             out[k] = m_sum[k] / m_cnt[k] if m_cnt[k] else float("nan")
         out["grad_norm"] = gn_sum / gn_cnt if gn_cnt else float("nan")
@@ -782,7 +790,16 @@ class Engine:
                         agg[rk] = agg.get(rk, 0.0) + v
                         cnt[rk] = cnt.get(rk, 0) + 1
         local = {k: (agg[k] / cnt[k] if cnt.get(k) else float("nan")) for k in agg}
-        return self._all_reduce_dict(local)
+        reduced = self._all_reduce_dict(local)
+        # pooled motion_ratio = mean(pred_travel)/mean(gt_travel), robust to near-static
+        # clips (which blow up the per-batch ratio-of-means). Same for rollout eval.
+        for pre in ("", "rollout/"):
+            pt, gt = reduced.get(pre + "pred_travel"), reduced.get(pre + "gt_travel")
+            if pt is not None and gt is not None and gt == gt and gt > 1e-6:
+                reduced[pre + "motion_ratio"] = pt / gt
+            reduced.pop(pre + "pred_travel", None)
+            reduced.pop(pre + "gt_travel", None)
+        return reduced
 
     # -- benchmark evaluation ------------------------------------------------ #
     @torch.no_grad()

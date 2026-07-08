@@ -1,44 +1,43 @@
-# TWIST v2 — full Kubric pretraining with the 2026-07 diagnosis improvements ON.
-# ============================================================================================
+# TWIST ABLATION — F3+F4b full re-detection stack (coarse + local & global CE)
+# Base = config/train_best.yaml (stable v1 recipe, KUBRIC-only). One v2 block added.
+# 20-epoch ranking run (matches config/sweep_supervision.yaml protocol).
 #
-# Base = config/train_best.yaml (the validated snowy-sweep-1 winner, Kubric-only,
-# uncapped). Everything below marked [v2] is new; the rationale is the 2026-07-02
-# diagnosis (see CLAUDE.md "v2 improvements"):
+# PROVENANCE — hyperparameters copied from the best sweep run by the standardized,
+# CoTracker-comparable benchmark (eval/MEAN, TAP-Vid "queried first"):
 #
-#   [v2-F1] THROUGH-OCCLUSION SUPERVISION — the loss position terms (pos / prior /
-#        rollout) now use the reader's `pos_valid` mask: visible frames PLUS
-#        occluded-but-in-frame frames on HAS_OCCLUDED_GT datasets (Kubric stores
-#        real coords on its ~28% occluded frames — previously all discarded).
-#        Automatic via the registry; LOSS.USE_OCCLUDED_GT=true (the default).
-#   [v2-F4a] HUBER_DELTA 0.2 -> 0.02 (~51px -> ~5px @512): errors beyond ~5px now
-#        get L1 (constant) instead of L2 (vanishing-toward-0) gradients — the
-#        untested tight-threshold precision lever (delta_1px/2px were stuck).
-#   [v2-F4b] CE_WEIGHT / GLOBAL_CE_WEIGHT: direct cross-entropy on the local cost
-#        volume + the global map — matcher supervision that bypasses the Kalman
-#        gate (a shy gate can no longer starve the matcher of gradient).
-#   [v2-F2] OBS_DROPOUT is now PER-POINT in contiguous 3-8 frame spans (simulated
-#        occlusion; neighbours keep observing and carry the masked point through
-#        the transition attention) instead of whole-frame i.i.d.
-#   [v2-F3] MODEL.OBSERVATION.COARSE: global template re-acquisition stage —
-#        confidence-gated window re-centering, so a point whose prior drifted
-#        beyond the 24px window during occlusion can still snap back.
-#   [v2-F5] Functional uncertainty: UNC_WEIGHT 0.5 trains the (decoupled) post +
-#        prior log-variances; MODEL.OBSERVATION.STATS feeds them + correlation
-#        peak/entropy/margin to the vis/gate/logvar heads; KL_WEIGHT -> 0 (it
-#        pinned at the free-bits floor and contributed nothing — kl_raw is still
-#        logged). TRANSITION.VIS_INPUT gives the dynamics the visibility belief.
-#   [v2] ROLLOUT_OBSERVE_MIN/MAX randomize the train-time coast start (eval keeps
-#        the fixed 4-step protocol).
+#   BEST RUN: twisteam/twist/fqbpeml7  (snowy-sweep-1)
+#     eval/MEAN  EPE 11.19 (lowest)   AJ 0.258 (highest)   delta_avg 0.377
+#     -> alone on the Pareto front: lowest EPE AND highest AJ of every run that
+#        completed EVAL_AT_END. This is the fine-loc cell RAD=24 / MAX_CORR=0 /
+#        ROLLOUT_WEIGHT=2 that config/sweep_ablations.yaml designated as the winner.
 #
-# NEW ARCHITECTURE = NEW STATE_DICT (trunk/coarse/to_token shapes change with the
-# flags): do NOT resume a v1 checkpoint into this config — fresh EXPERIMENT_NAME.
+#   NOT t7imej6u (eternal-sweep-2): it CRASHED at epoch 14/25 so it produced NO
+#   benchmark score (eval/MEAN absent); its only numbers are train-set val metrics
+#   on a different (uncapped-PointOdyssey) mix, and it is a RAD=16 cell — the
+#   inferior fine-loc half (RAD=16/MC=0 = neat-sweep-2 scored eval EPE 13.78 / AJ
+#   0.194, decisively worse than this RAD=24/MC=0 cell).
 #
-# Launch (A100-80, one GPU; re-submit the same EXPERIMENT_NAME to auto-resume):
-#   python train.py config/train_v2.yaml
-# Memory: v1 measured ~75 GB peak @ bs6/512. The coarse stage adds the global-map
-# activations (~1-2 GB) — VERIFY peak_mem_gb on a 2-step smoke; drop to 4 if OOM.
-# CLIP_LEN stays 24 to isolate the v2 deltas; 48 (longer occlusions per clip) is
-# the next lever after this run baselines.
+#   PROTOCOL NOTE (2026-07-07): the 11.19 / 13.78 numbers above are OLD-protocol
+#   (pre-2026-06-30 24-frame-chopped, capped-clip eval). They remain valid as the
+#   fine-loc sweep's INTERNAL ranking (same era, controlled) -> RAD=24 stands.
+#   They are NOT comparable to whole-video numbers: t7imej6u was later scored
+#   MEAN EPE 38.58 under the post-fix whole-video protocol (where CoTracker3
+#   zero-shot = 20.12), so "decisively worse"/"eval/MEAN absent" above is stale.
+#   fqbpeml7 has NO whole-video score yet (re-eval: python evaluate.py --run snowy-sweep-1).
+#
+# WHAT CHANGED vs config/train_r512_dynrep.yaml (the prior long-run template):
+#   * TRAIN DATA = KUBRIC ONLY, UNCAPPED (full dataset). PointOdyssey,
+#     DynamicReplica and Cholec80 are removed from the TRAIN mix. The held-out
+#     benchmark datasets (TAP-Vid / RoboTAP / surgical / STIR) are kept as
+#     IS_EVAL_DATASET so EPE/AJ are still scored — they are never trained on.
+#   * Everything else (model, loss, engine, schedule) is the validated winner,
+#     verbatim from snowy-sweep-1.
+#
+# Launch (A100-80, one GPU; re-submit same EXPERIMENT_NAME to auto-resume last.pt):
+#   sbatch .sbatch_scripts/train_a100.sbatch                 # edit it to point at this config, or:
+#   python train.py config/train_best.yaml
+# Memory: BATCH_SIZE 6 @ 512 measured ~75 GB peak on A100-80. Kubric-only drops the
+# per-epoch wall a lot vs the mix (PointOdyssey was ~80% of the old train compute).
 
 parameters:
 
@@ -46,12 +45,12 @@ parameters:
   ### RUN / GENERAL
   ###===========================================================================================================================
   EXPERIMENT_NAME:
-    # FIXED name + RESUME=last: a SLURM-timeout resubmit CONTINUES from last.pt
-    # (the blank-name + scratch combo lost absurd-dust-35 and both 640/768
-    # resolution-sweep runs to the 24h wall).
-    value: 
+    # FIXED name + RESUME=last so a SLURM-timeout resubmit CONTINUES from last.pt
+    # (blank-name + scratch randomizes the name each submit and lost 3 prior runs
+    # to the 24h wall — see CLAUDE.md). First submit still inits fresh (no last.pt).
+    value: abl_redetect_r512
   RESUME:
-    value: scratch     # in-stage resume from last.pt (fresh init on first run)
+    value: scratch  # ablation arch/loss differs from baseline -> fresh init
   WORKERS:
     value: 8
   PIN_MEMORY:
@@ -69,7 +68,7 @@ parameters:
     value: 512
 
   ###===========================================================================================================================
-  ### MODEL — v1 winner geometry (K=9 / RAD=24 / MC=0) + the v2 blocks
+  ### MODEL — validated winner (snowy-sweep-1): OBSERVATION RAD=24 / MAX_CORR=0, K=9
   ###===========================================================================================================================
   MODEL:
     value:
@@ -87,20 +86,17 @@ parameters:
         RADIUS_PX: 24.0     # winning fine-loc window (RAD=16 was the worse half)
         HEADS: 4
         MAX_CORR: 0.0       # pure soft-argmax (0.05 sub-cell residual did not help)
-        STATS: true         # [v2-F5] corr peak/entropy/margin + prior logvar -> heads
-        COARSE: true        # [v2-F3] global re-acquisition stage (gated re-centering)
+        COARSE: true        # [ablation F3] global template re-acquisition stage
       TRANSITION:
         DEPTH: 2
         HEADS: 4
         MAX_STEP: 0.12
-        VIS_INPUT: true     # [v2-F5] dynamics sees the visibility belief
       ROLLOUT_VEL_DECAY: 1.0
       HEADS:
         UNCERTAINTY: true
 
   ###===========================================================================================================================
-  ### DATA — TRAIN: full KUBRIC only (HAS_OCCLUDED_GT in registry -> pos_valid).
-  ###          EVAL: held-out benchmarks (never trained on).
+  ### DATA — TRAIN: full KUBRIC only.  EVAL: held-out benchmarks (never trained on).
   ###===========================================================================================================================
   DATASETS:
     value:
@@ -140,19 +136,22 @@ parameters:
         VAL_FRACTION: 1.0
         IS_EVAL_DATASET: True
       STIR_CHALLENGE:            # headline surgical benchmark (MICCAI 2024 held-out)
-        VAL_FRACTION: 1.0        # AJ/OA excluded from eval/MEAN (registry), delta@[4..64] kept
+        VAL_FRACTION: 1.0        # native-res; delta over [4,8,16,32,64]px (EVAL_THRESHOLDS in registry)
+        IS_EVAL_DATASET: True
+      STIR_FULL:                 # larger STIR train/val release
+        VAL_FRACTION: 1.0
         IS_EVAL_DATASET: True
       # TAPVID_KINETICS: left out of the in-training monitor (large); score it
       # offline with evaluate.py for the final headline number.
 
   ###===========================================================================================================================
-  ### TRAINING (ENGINE)
+  ### TRAINING (ENGINE) — validated winner schedule
   ###===========================================================================================================================
   BATCH_SIZE:
-    value: 4  # v1 measured ~75 GB peak @ 512; the coarse stage adds ~1-2 GB of global-map
-              # activations. VERIFY peak_mem_gb on a 2-step smoke; drop to 4 if OOM.
+    value: 6  # snowy-sweep-1 (provenance) value; ~75 GB peak @ 512 on A100-80. Kubric-only
+              # train tensor is unchanged vs the mix; drop to 4 if OOM, push to 8 if there's room.
   EPOCHS:
-    value: 50
+    value: 20
   LR:
     value: 3.0e-4
   WEIGHT_DECAY:
@@ -172,29 +171,26 @@ parameters:
   KL_WEIGHT_START:
     value: 0.0
   KL_ANNEAL_EPOCHS:
-    value: 0      # [v2-F5] KL retired (target 0 below) — nothing to anneal
+    value: 5
   TEACHER_FORCING_EPOCHS:
     value: 3
   OBS_DROPOUT:
-    value: 0.3    # expected dropped fraction of post-query steps (now per-point spans)
+    value: 0.3
   OBS_DROPOUT_EPOCHS:
     value: 5
-  OBS_DROPOUT_SPAN:
-    value: [3, 8] # [v2-F2] contiguous per-point span length (frames) — simulated occlusion
   LOSS:
     value:
       POS_WEIGHT: 10.0
       VIS_WEIGHT: 0.5
-      KL_WEIGHT: 0.0        # [v2-F5] retired (pinned at free-bits floor, zero gradient);
-      KL_FREE_BITS: 0.02    #         kl/kl_raw still logged for the record
+      KL_WEIGHT: 0.05
+      KL_FREE_BITS: 0.02
       KL_BALANCE_ALPHA: 0.8
-      HUBER_DELTA: 0.02     # [v2-F4a] ~5px @512: L1-like beyond that -> tight-threshold pressure
-      UNC_WEIGHT: 0.5       # [v2-F5] decoupled NLL trains post+prior logvars (calibration)
+      HUBER_DELTA: 0.2
+      UNC_WEIGHT: 0.0
       PRIOR_WEIGHT: 0.5
-      ROLLOUT_WEIGHT: 2.0   # A/B-validated winner; now also supervised through occlusion
-      CE_WEIGHT: 0.5        # [v2-F4b] local cost-volume cross-entropy (gate-independent)
-      GLOBAL_CE_WEIGHT: 0.25  # [v2-F4b] global-map CE (trains re-detection; coarse stage)
-      USE_OCCLUDED_GT: true   # [v2-F1] position terms use pos_valid (occluded GT)
+      ROLLOUT_WEIGHT: 2.0  # A/B-validated winner; keep
+      CE_WEIGHT: 0.5       # [ablation F4b] local cost-volume cross-entropy (matcher)
+      GLOBAL_CE_WEIGHT: 0.25  # [ablation F4b] global-map CE (needs coarse stage)
 
   ###===========================================================================================================================
   ### VALIDATION
@@ -206,11 +202,7 @@ parameters:
   ROLLOUT_EVAL:
     value: true
   ROLLOUT_OBSERVE_STEPS:
-    value: 4      # eval protocol: FIXED (comparable to every previous run)
-  ROLLOUT_OBSERVE_MIN:
-    value: 2      # [v2] train-time rollout loss resamples observe length per batch
-  ROLLOUT_OBSERVE_MAX:
-    value: 8
+    value: 4
 
   ###===========================================================================================================================
   ### BENCHMARK EVALUATION
