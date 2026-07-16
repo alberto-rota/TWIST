@@ -6,8 +6,19 @@ what varies for an experiment (sampling density, clip length, split, ...).
 
 Add a dataset: drop an entry here (``ROOT_DIR`` + ``READER`` + any default
 sampling), then list its name under ``DATASETS:`` in the config. The surgical
-CoTracker datasets (Cholec80 / EndoTAPP / SurgT, served by the shared
-``index.json`` reader) and STIR slot in the same way in a later step.
+CoTracker datasets (Cholec80 / EndoTAPP / SurgT) and the STIR benchmark
+(STIR_CHALLENGE / STIR_FULL) are all served by the shared ``index.json``
+reader; STIR is repacked from raw stereo by ``assets/dataprep/stir_data_prep.py``.
+
+Per-dataset eval knobs: ``IS_EVAL_DATASET`` opts a dataset into the standalone
+benchmark evaluation (utilities.evaluation); ``EVAL_THRESHOLDS`` overrides the
+delta/Jaccard pixel thresholds for that dataset (e.g. STIR's official
+``[4,8,16,32,64]``); both default to off / TAP-Vid ``{1,2,4,8,16}``.
+
+``VAL_FRACTION`` splits a dataset into train/val (0 -> all train, 1 -> all val).
+A **negative** ``VAL_FRACTION`` (e.g. ``-1``) is a hard disable: the dataset is
+dropped from both the train and val splits AND from benchmark eval (even if it
+carries ``IS_EVAL_DATASET``), so it is completely ignored for that experiment.
 """
 
 from __future__ import annotations
@@ -31,9 +42,7 @@ OVERRIDE_ALL_DATASETS_KEY = "OVERRIDE_ALL_DATASETS"
 _COTRACKER_READER = "dataset.cotracker.CoTrackerTracksDataset"
 
 DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
-    # Phase 1 — synthetic out-of-domain pretraining (dense GT tracks). CT3Kubric
-    # is converted to the shared CoTracker layout by ``ct3kubric_data_prep.py``
-    # and read through the same reader as every other dataset (no bespoke reader).
+    
     "KUBRIC": {
         "ROOT_DIR": "/anvme/workspace/v120bb18-kubric/gt_tracks",
         "READER": _COTRACKER_READER,
@@ -48,8 +57,6 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "VAL_FRACTION": 0.1,
         "SPLIT_SEED": 42,
     },
-    # Long-horizon synthetic phase. Folder on disk is spelled "PointOdissey" and
-    # ships ground-truth tracks under gt_tracks/ (same index.json + .npz layout).
     "POINTODYSSEY": {
         "ROOT_DIR": "$DATASET_DIR/PointOdissey/gt_tracks",
         "READER": _COTRACKER_READER,
@@ -62,9 +69,6 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "VAL_FRACTION": 0.1,
         "SPLIT_SEED": 42,
     },
-    # Long-horizon synthetic phase (sibling of PointOdyssey). Dynamic Replica
-    # ships ground-truth tracks, converted to gt_tracks/ by
-    # dynamicreplica_data_prep.py (same index.json + .npz layout).
     "DYNAMICREPLICA": {
         "ROOT_DIR": "$DATASET_DIR/DynamicReplica/gt_tracks",
         "READER": _COTRACKER_READER,
@@ -76,8 +80,9 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "QUERY_FRAME": 0,
         "VAL_FRACTION": 0.1,
         "SPLIT_SEED": 42,
+        "IS_EVAL_DATASET": True,
+        
     },
-    # Surgical adaptation datasets (pre-tracked offline, shared CoTracker layout).
     "CHOLEC80": {
         "ROOT_DIR": "$DATASET_DIR/cholec80/cotracker_tracks",
         "READER": _COTRACKER_READER,
@@ -89,29 +94,6 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "VAL_FRACTION": 0.1,
         "SPLIT_SEED": 42,
     },
-    "ENDOTAPP": {
-        "ROOT_DIR": "$DATASET_DIR/EndoTAPP/cotracker_tracks",
-        "READER": _COTRACKER_READER,
-        "CLIP_LEN": 24,
-        "FRAME_STRIDE": 1,
-        "MAX_POINTS": 256,
-        "POINT_SAMPLE_MODE": "even",
-        "QUERY_FRAME": 0,
-        "VAL_FRACTION": 0.1,
-        "SPLIT_SEED": 42,
-    },
-    "SURGT": {
-        "ROOT_DIR": "$DATASET_DIR/SurgT/cotracker_tracks",
-        "READER": _COTRACKER_READER,
-        "CLIP_LEN": 24,
-        "FRAME_STRIDE": 1,
-        "MAX_POINTS": 256,
-        "POINT_SAMPLE_MODE": "even",
-        "QUERY_FRAME": 0,
-        "VAL_FRACTION": 0.1,
-        "SPLIT_SEED": 42,
-    },
-
     "SURGICALMOTION": {
         "ROOT_DIR": "$DATASET_DIR/SurgicalMotion/gt_tracks",
         "READER": _COTRACKER_READER,
@@ -125,7 +107,76 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
             "val_case3_1", "val_case3_2",
         ],
         "SPLIT_SEED": 42,
+        "IS_EVAL_DATASET": True,
     },
+    "ENDOTAPP_GT": {
+        "ROOT_DIR": "$DATASET_DIR/EndoTAPP/gt_tracks",
+        "READER": _COTRACKER_READER,
+        "CLIP_LEN": None,
+        "MAX_POINTS": None,
+        "POINT_SAMPLE_MODE": "even",
+        "QUERY_FRAME": 0,
+        "REQUIRE_VISIBLE_AT_QUERY": False,
+        "VAL_FRACTION": 1.0,
+        "SPLIT_SEED": 42,
+        "IS_EVAL_DATASET": True,
+    },
+  
+    "VLSURGPT": {
+        "ROOT_DIR": "$DATASET_DIR/VLsurgPT/gt_tracks",
+        "READER": _COTRACKER_READER,
+        "CLIP_LEN": None,          # whole (keyframe) sequence as one clip
+        "MAX_POINTS": None,        # keep all GT points
+        "POINT_SAMPLE_MODE": "even",
+        "QUERY_FRAME": 0,
+        "REQUIRE_VISIBLE_AT_QUERY": False,  # some GT points start occluded
+        "VAL_FRACTION": 1.0,       # eval-only: all sequences -> val
+        "SPLIT_SEED": 42,
+        "IS_EVAL_DATASET": True,
+    },
+
+    "STIR_CHALLENGE": {                       # MICCAI 2024 held-out challenge set (headline)
+        "ROOT_DIR": "$DATASET_DIR/STIRChallenge_2024/gt_tracks",
+        "READER": _COTRACKER_READER,
+        "CLIP_LEN": None,          # whole clip (start -> end) as one sequence
+        "MAX_POINTS": None,        # keep all GT tattoo points
+        "POINT_SAMPLE_MODE": "even",
+        "QUERY_FRAME": 0,
+        "REQUIRE_VISIBLE_AT_QUERY": False,
+        "VAL_FRACTION": 1.0,       # eval-only
+        "SPLIT_SEED": 42,
+        "IS_EVAL_DATASET": True,
+        "EVAL_THRESHOLDS": [4, 8, 16, 32, 64],  # official STIR 2D-accuracy thresholds
+        "EVAL_VISIBLE_ONLY": True,
+        "EVAL_EXCLUDE_FROM_MEAN": ["average_jaccard", "occlusion_accuracy"],
+    },
+    # This is the full non-annotated STIR dataset. Do not use.
+    # "STIR_FULL": {                           
+    #     "ROOT_DIR": "$DATASET_DIR/STIRFull/gt_tracks",
+    #     "READER": _COTRACKER_READER,
+    #     "CLIP_LEN": None,
+    #     "MAX_POINTS": None,
+    #     "POINT_SAMPLE_MODE": "even",
+    #     "QUERY_FRAME": 0,
+    #     "REQUIRE_VISIBLE_AT_QUERY": False,
+    #     "VAL_FRACTION": 1.0,
+    #     "SPLIT_SEED": 42,
+    #     "IS_EVAL_DATASET": True,
+    #     "EVAL_THRESHOLDS": [4, 8, 16, 32, 64],
+    # },
+    "SURGT": {
+        "ROOT_DIR": "$DATASET_DIR/SurgT/cotracker_tracks",
+        "READER": _COTRACKER_READER,
+        "CLIP_LEN": 24,
+        "FRAME_STRIDE": 1,
+        "MAX_POINTS": 256,
+        "POINT_SAMPLE_MODE": "even",
+        "QUERY_FRAME": 0,
+        "VAL_FRACTION": 0.1,
+        "SPLIT_SEED": 42,
+    },
+
+
     # --- Evaluation-only benchmarks (ground-truth point tracks) -----------
     # Converted from TAP-Vid pickles by tapvid_data_prep.py.
     # VAL_FRACTION=1.0 -> all sequences are validation, none are training.
@@ -157,9 +208,6 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "SPLIT_SEED": 42,
         "IS_EVAL_DATASET": True,
     },
-    # TAP-Vid-Kinetics: converted from the sharded generate_tapvid.py pickles by
-    # tapvid_kinetics_data_prep.py (see assets/dataprep/TAPVID_KINETICS.md for the
-    # download + processing runbook). Same eval-only conventions as DAVIS.
     "TAPVID_KINETICS": {
         "ROOT_DIR": "$DATASET_DIR/tapvid_kinetics/gt_tracks",
         "READER": _COTRACKER_READER,
@@ -170,7 +218,7 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "REQUIRE_VISIBLE_AT_QUERY": False,  # some GT points start occluded
         "VAL_FRACTION": 1.0,       # eval-only: all sequences -> val
         "SPLIT_SEED": 42,
-        "IS_EVAL_DATASET": True,
+        "IS_EVAL_DATASET": False,
     },
     "ROBOTAP": {
         "ROOT_DIR": "$DATASET_DIR/robotap/gt_tracks",
@@ -184,31 +232,20 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "SPLIT_SEED": 42,
         "IS_EVAL_DATASET": True,
     },
-    "ENDOTAPP_GT": {
-        "ROOT_DIR": "$DATASET_DIR/EndoTAPP/gt_tracks",
-        "READER": _COTRACKER_READER,
-        "CLIP_LEN": None,
-        "MAX_POINTS": None,
-        "POINT_SAMPLE_MODE": "even",
-        "QUERY_FRAME": 0,
-        "REQUIRE_VISIBLE_AT_QUERY": False,
-        "VAL_FRACTION": 1.0,
-        "SPLIT_SEED": 42,
-        "IS_EVAL_DATASET": True,
-    },
-  
-    "VLSURGPT": {
-        "ROOT_DIR": "$DATASET_DIR/VLsurgPT/gt_tracks",
-        "READER": _COTRACKER_READER,
-        "CLIP_LEN": None,          # whole (keyframe) sequence as one clip
-        "MAX_POINTS": None,        # keep all GT points
-        "POINT_SAMPLE_MODE": "even",
-        "QUERY_FRAME": 0,
-        "REQUIRE_VISIBLE_AT_QUERY": False,  # some GT points start occluded
-        "VAL_FRACTION": 1.0,       # eval-only: all sequences -> val
-        "SPLIT_SEED": 42,
-        "IS_EVAL_DATASET": True,
-    },
+    # EndoTAPP dataset processed by cotracker. We use EndoTAPP_gt because it contains the real tracks from the ground truth.
+    # "ENDOTAPP": {
+    #     "ROOT_DIR": "$DATASET_DIR/EndoTAPP/cotracker_tracks",
+    #     "READER": _COTRACKER_READER,
+    #     "CLIP_LEN": 24,
+    #     "FRAME_STRIDE": 1,
+    #     "MAX_POINTS": 256,
+    #     "POINT_SAMPLE_MODE": "even",
+    #     "QUERY_FRAME": 0,
+    #     "VAL_FRACTION": 0.1,
+    #     "SPLIT_SEED": 42,
+    #     "IS_EVAL_DATASET": True,
+    # },
+    
 }
 
 

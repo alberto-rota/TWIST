@@ -1,0 +1,295 @@
+# TWIST — v3 FLAGSHIP: 8-GPU DDP long run, validated-levers-only, champion data mix.
+#
+# EVIDENCE (2026-07-07 synthesis; PROTOCOL-CORRECTED — see eval-eras note below):
+#
+#   0. EVAL PROTOCOL ERAS (why older "champion" claims were wrong). Evals before
+#      2026-07-02 chopped every eval clip to 24 FRAMES and capped clips (30/ds,
+#      6 datasets); evals from 07-01/02 on score WHOLE SEQUENCES (RoboTAP ~268
+#      f/clip, 212 clips) on 8 datasets incl. the hard surgical ones. Numbers
+#      from different eras are INCOMPARABLE. fqbpeml7's celebrated 11.19 is a
+#      dead-protocol number. The only current-protocol standings (Jul 1-2):
+#        CoTracker3 zs 20.12 EPE / 0.589 delta / 0.420 AJ   <- the real bar
+#        BootsTAPIR 23.38, Chrono 26.72, TAPNext 30.26
+#        TWIST t7imej6u (ep14, RAD16) 38.58 / 0.297 / 0.169 <- TWIST today
+#      fqbpeml7 (RAD24) has NO current-protocol score yet (re-eval queued).
+#      TWIST does NOT currently beat the baselines in-harness; long-sequence
+#      drift is the visible failure mode (RoboTAP 59 EPE over ~268 frames).
+#
+#   1. ARCHITECTURE — RAD=24 / MAX_CORR=0 / ROLLOUT_WEIGHT=2 on the v1 model:
+#      from the fine-loc sweep's INTERNAL ranking (same era, same protocol:
+#      snowy-sweep-1 11.19 vs RAD16 sibling neat-sweep-2 13.78) — a controlled
+#      comparison, so it survives the protocol correction; caveat: it was
+#      established on 24-frame windows. t7imej6u (RAD16) vs fqbpeml7 (RAD24)
+#      is a CONFOUNDED pair (they differ in both RAD and PO amount) and their
+#      val curves end at different points of different cosine schedules —
+#      neither run can rank the other's recipe.
+#
+#   2. SUPERVISION — sweep ass3sjyy (2x2 USE_OCCLUDED_GT x HUBER_DELTA, ep3-of-20
+#      before the 24h wall, all four cells stable; internally controlled):
+#        - USE_OCCLUDED_GT=true never hurts, wins the epe_occ trajectory
+#          (32->19) and is the project's thesis skill  -> ON (explicit).
+#        - HUBER_DELTA 0.02 FALSIFIED: delta_1px/2px identical in all cells
+#          (~0.14/0.27), val/epe mildly worse, w_pos shrunk ~3x, and the
+#          occGT=F+0.02 corner was the only one with diverging rollout  -> 0.2.
+#
+#   3. STABILITY — xrj5v46a (train_v2 all-on, 8-GPU DDP) collapsed from ep9;
+#      root cause = HUBER 0.02 + UNC_WEIGHT 0.5 breaking position dominance.
+#      Therefore: UNC_WEIGHT 0, KL retired (KL_WEIGHT 0 — it pinned at the
+#      free-bits floor, zero gradient), and the UNVALIDATED v2 architecture
+#      blocks (COARSE / STATS / VIS_INPUT / CE) stay OFF until the pending
+#      single-lever ablations (abl_ce / abl_coarse / abl_redetect) rank them.
+#      xrj5v46a also proves the 8-GPU DDP path mechanically (30 epochs ran).
+#
+#   4. DATA — BOTH strong runs trained the MIX (Kubric-1000 + PointOdyssey +
+#      DynReplica + Cholec80-20 as surgical val monitor); Kubric-ONLY
+#      (train_best / run ngdpapij) is an untested compute-economy bet, still
+#      running — keep it alive as the data-mix A/B arm. This flagship keeps the
+#      mix and removes BOTH arbitrary caps: Kubric uncapped (1000 was sweep
+#      economy) and PointOdyssey uncapped (t7imej6u trained PO-uncapped and
+#      posted the strongest val of any run on a PO-heavier — i.e. harder — val
+#      set; fqbpeml7's 1500 cap was also sweep economy). 8-GPU DDP absorbs the
+#      compute. Bonus synergy: PointOdyssey (31% occluded GT) + DynReplica
+#      (2.5%) are HAS_OCCLUDED_GT datasets, so USE_OCCLUDED_GT supervises
+#      through-occlusion on them — Kubric-only cannot.
+#
+# SCALE — DDP 8x A100-80 on one node: per-rank BATCH_SIZE 6 (~75 GB peak @512,
+# measured) -> effective batch 48. LR stays 3e-4: proven stable at eff-48 for
+# xrj5v46a's healthy phase; Adam + frozen encoder make linear LR scaling
+# unnecessary risk. ~50 epochs ≈ 1.5–2 24h windows; fixed EXPERIMENT_NAME +
+# RESUME=last auto-continues from last.pt on resubmit (first submit inits fresh).
+#
+# Launch:
+#   sbatch .sbatch_scripts/train_v3_8gpu.sbatch
+#
+# Watch: val/epoch/epe + delta_1px/2px, epe_occ (falling), gate_vis vs gate_occ
+# (split opening), val/rollout/epe, train grad_norm (~0.2-0.5; spikes = alarm).
+# Eval monitor (ep10/20/...): rank PER-DATASET (delta_avg/AJ up, RoboTAP EPE =
+# the long-horizon drift proxy, surgical rows) — MEAN EPE is drift-dominated.
+# The bar: beat TWIST's only current-protocol score (t7imej6u 38.58 MEAN EPE /
+# 0.297 delta / 0.169 AJ) and chase CoTracker3 zero-shot (20.12 / 0.589 / 0.420).
+# Final quotable numbers: uncapped evaluate.py, then canonical stretch@256.
+
+parameters:
+
+  ###===========================================================================================================================
+  ### RUN / GENERAL
+  ###===========================================================================================================================
+  EXPERIMENT_NAME:
+    # FIXED name + RESUME=last so a SLURM-timeout resubmit CONTINUES from last.pt
+    # (blank-name + scratch randomizes the name each submit and lost 3 prior runs
+    # to the 24h wall — see CLAUDE.md). First submit still inits fresh (no last.pt).
+    value: twist_v3_mix8_r512
+  RESUME:
+    value: last     # in-stage resume from last.pt; fresh init on the first run
+  WORKERS:
+    value: 12       # per-rank loader workers (node gives 16 cores/GPU; 12 + OMP fits)
+  PIN_MEMORY:
+    value: true
+  NO_WANDB:
+    value: false
+  SMOKE:
+    value: false
+  WANDB_PROJECT:
+    value: twist
+  SEED:
+    value: 42
+
+  IMAGE_SIZE:
+    value: 512
+
+  ###===========================================================================================================================
+  ### MODEL — validated winner (snowy-sweep-1), v1 architecture. The unvalidated v2
+  ### blocks (OBSERVATION.STATS / OBSERVATION.COARSE / TRANSITION.VIS_INPUT) stay OFF
+  ### pending the abl_ce / abl_coarse / abl_redetect single-lever rankings.
+  ###===========================================================================================================================
+  MODEL:
+    value:
+      MODEL_CLASS: TrackerWorldModel
+      MODEL_MODULE: models
+      HIDDEN_DIM: 256
+      TOKEN_DIM: 256
+      RGB_ENCODER:
+        ENCODER: facebook/dinov3-vitl16-pretrain-lvd1689m
+        # IMAGE_SIZE set by the top-level IMAGE_SIZE knob (see RUN / GENERAL)
+        FREEZE_BACKBONE: true
+        RGB_ENCODER_LR: 0.0
+      OBSERVATION:
+        K: 9
+        RADIUS_PX: 24.0     # winning fine-loc window (RAD=16 was the worse half)
+        HEADS: 4
+        MAX_CORR: 0.0       # pure soft-argmax (0.05 sub-cell residual did not help)
+      TRANSITION:
+        DEPTH: 2
+        HEADS: 4
+        MAX_STEP: 0.12
+      ROLLOUT_VEL_DECAY: 1.0
+      HEADS:
+        UNCERTAINTY: true
+
+  ###===========================================================================================================================
+  ### DATA — the champion's mix with Kubric UNCAPPED. Cholec80 = surgical VAL
+  ### monitor only (VAL_FRACTION 1.0 — never trained on, same as fqbpeml7).
+  ###===========================================================================================================================
+  DATASETS:
+    value:
+      OVERRIDE_ALL_DATASETS:
+        SPLIT_SEED: 42
+        # TARGET_SIZE set by the top-level IMAGE_SIZE knob (-> [512, 512])
+        CLIP_LEN: 24
+        LOAD_FRAMES: true
+        LOAD_DEPTHS: false
+        FRAMES_AS_FLOAT: false
+        MARK_OFFSCREEN_INVISIBLE: true
+        POINT_SAMPLE_MODE: even
+        QUERY_FRAME: 0
+        CLIP_STRIDE: null
+        FRAME_STRIDE: 1
+        REQUIRE_VISIBLE_AT_QUERY: true
+        MIN_VISIBLE_FRAMES: 1
+
+      ### TRAINING + VALIDATION
+      KUBRIC:
+        VAL_FRACTION: 0.1        # UNCAPPED (champion capped at 1000 for sweep economy only)
+      POINTODYSSEY:
+        VAL_FRACTION: 0.1        # UNCAPPED (t7imej6u's regime; 1500 was sweep economy —
+                                 # Kubric-uncapped now dominates the epoch wall anyway)
+      DYNAMICREPLICA:
+        VAL_FRACTION: 0.1
+      CHOLEC80:
+        MAX_CLIPS: 20            # surgical val monitor (never trained on)
+        VAL_FRACTION: 1.0
+
+      ### BENCHMARK EVALUATION (held-out; scored by utilities.evaluation; not trained on)
+      TAPVID_DAVIS:
+        VAL_FRACTION: 1.0
+        IS_EVAL_DATASET: True
+      TAPVID_RGB_STACKING:
+        VAL_FRACTION: 1.0
+        IS_EVAL_DATASET: True
+      ROBOTAP:
+        VAL_FRACTION: 1.0
+        IS_EVAL_DATASET: True
+      SURGICALMOTION:
+        VAL_FRACTION: 1.0
+        IS_EVAL_DATASET: True
+      ENDOTAPP_GT:
+        VAL_FRACTION: 1.0
+        IS_EVAL_DATASET: True
+      STIR_CHALLENGE:
+        VAL_FRACTION: 1.0
+        IS_EVAL_DATASET: True
+      STIR_FULL:
+        VAL_FRACTION: 1.0
+        IS_EVAL_DATASET: True
+      # TAPVID_KINETICS: large; score offline with evaluate.py for the headline table.
+
+  ###===========================================================================================================================
+  ### TRAINING (ENGINE) — validated winner schedule; per-rank batch (DDP eff = 6 x 8 = 48)
+  ###===========================================================================================================================
+  BATCH_SIZE:
+    value: 6  # PER RANK. ~75 GB peak @ 512 on A100-80 (measured); eff. 48 across 8 GPUs.
+  EPOCHS:
+    value: 50
+  LR:
+    value: 3.0e-4   # proven at eff-48 (xrj5v46a healthy phase); do NOT linear-scale
+  WEIGHT_DECAY:
+    value: 1.0e-4
+  OPTIMIZER:
+    value: adamw
+  GRAD_CLIP:
+    value: 1.0
+  AMP:
+    value: true     # bf16 on A100
+  LR_SCHEDULER:
+    value: cosine
+  WARMUP_EPOCHS:
+    value: 3
+  MIN_LR_RATIO:
+    value: 0.05
+  KL_WEIGHT_START:
+    value: 0.0      # KL retired (see LOSS.KL_WEIGHT)
+  KL_ANNEAL_EPOCHS:
+    value: 0
+  TEACHER_FORCING_EPOCHS:
+    value: 3
+  OBS_DROPOUT:
+    value: 0.3
+  OBS_DROPOUT_EPOCHS:
+    value: 5
+  OBS_DROPOUT_SPAN:
+    value: [3, 8]   # per-point occlusion-shaped spans (engine default; explicit here)
+
+  ###===========================================================================================================================
+  ### LOSS — position-dominant (the invariant xrj5v46a violated), F1 on, KL retired
+  ###===========================================================================================================================
+  LOSS:
+    value:
+      POS_WEIGHT: 10.0
+      VIS_WEIGHT: 0.5
+      KL_WEIGHT: 0.0        # retired: pinned at the free-bits floor (zero gradient); kl_raw still logged
+      KL_FREE_BITS: 0.02
+      KL_BALANCE_ALPHA: 0.8
+      HUBER_DELTA: 0.2      # 0.02 falsified by sweep ass3sjyy (delta_1px/2px unmoved, epe worse)
+      UNC_WEIGHT: 0.0       # 0.5 was collapse culprit #2 (xrj5v46a: w_unc ~ -45 dominated the loss)
+      PRIOR_WEIGHT: 0.5
+      ROLLOUT_WEIGHT: 2.0   # A/B-validated winner (lap32y0x vs 8c5afg1k); keep
+      CE_WEIGHT: 0.0        # unvalidated alone — pending abl_ce ranking
+      GLOBAL_CE_WEIGHT: 0.0 # needs COARSE — pending abl_redetect ranking
+      USE_OCCLUDED_GT: true # [F1] validated by ass3sjyy: never worse, epe_occ falls; thesis skill
+
+  ###===========================================================================================================================
+  ### VALIDATION
+  ###===========================================================================================================================
+  VAL_EVERY:
+    value: 1
+  VAL_SUBSAMPLE:
+    value: 0.15   # per-epoch val = this fraction of EACH dataset's val clips (evenly spread, deterministic),
+                  # decoupled from VAL_FRACTION (the split ratio). Bounds validate() to minutes AND keeps it
+                  # representative. Per-dataset override: set VAL_SUBSAMPLE inside a DATASETS entry (0 = drop
+                  # that set from per-epoch val). Full benchmarks are still scored by EVAL_AT_END.
+  EARLY_STOP_PATIENCE:
+    value: 20
+  ROLLOUT_EVAL:
+    value: true
+  ROLLOUT_OBSERVE_STEPS:
+    value: 4        # fixed protocol (randomized MIN/MAX unvalidated — off)
+
+  ###===========================================================================================================================
+  ### BENCHMARK EVALUATION (rank-0; other ranks wait — DDP_TIMEOUT_MIN raised in sbatch)
+  ###===========================================================================================================================
+  EVAL_QUERY_MODE:
+    value: first    # TAP-Vid "queried first" (CoTracker-comparable)
+  EVAL_AT_END:
+    value: true
+  EVAL_EVERY:
+    value: 10       # capped monitor during training (headline number: evaluate.py uncapped)
+  EVAL_MAX_CLIPS:
+    value: 30
+  EVAL_BATCH_SIZE:
+    value: 1
+  EVAL_WORKERS:
+    value: 4
+
+  ###===========================================================================================================================
+  ### LOGGING & VISUALIZATION (lean — 8x throughput makes per-batch viz expensive)
+  ###===========================================================================================================================
+  LOG_EVERY:
+    value: 10
+  VIZ_EVERY:
+    value: 2
+  VIZ_VAL_CLIPS:
+    value: 1
+  VIZ_EVERY_BATCHES:
+    value: 0
+  VIZ_DENSE_SPACING:
+    value: 0
+  VIZ_FRAMES:
+    value: 24
+  VIZ_MAX_POINTS:
+    value: 48
+  VIZ_SIZE:
+    value: 256
+  VIZ_TAIL:
+    value: 12
+  VIZ_FPS:
+    value: 8

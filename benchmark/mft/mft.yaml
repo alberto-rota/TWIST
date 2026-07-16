@@ -1,0 +1,59 @@
+# Benchmark config: MFT (Multi-Flow dense Tracker, WACV 2024) on the TWIST eval
+# datasets.
+#
+# W&B-sweep format like every config in the repo. The benchmark script runs MFT
+# through the *same* evaluator the TWIST model uses, so the metrics are directly
+# comparable. MFT is a dense, online/causal flow-chaining tracker; it works at
+# the native (fed) frame resolution, so predictions line up with GT at TARGET_SIZE
+# with no rescale (see benchmark/mft/mft.py).
+#
+#   python benchmark/mft/mft.py                       # uses this file
+#   python benchmark/mft/mft.py --datasets TAPVID_DAVIS --max-clips 5   # smoke
+parameters:
+
+  ###===========================================================================
+  ### RUN / W&B
+  ###===========================================================================
+  EXPERIMENT_NAME:
+    value: mft
+  WANDB_PROJECT:
+    value: twist
+  WANDB_ENTITY:
+    value: twisteam
+  WANDB_TAGS:
+    value: [benchmark]
+
+  ###===========================================================================
+  ### GEOMETRY  (MFT tracks at the fed resolution; no internal resize.)
+  ###===========================================================================
+  CROP:
+    value: null
+  IMAGE_SIZE:
+    value: 512
+
+  ###===========================================================================
+  ### MFT MODEL. CONFIG is resolved relative to the clone root
+  ### (benchmark/methods/MFT); the RAFT-OU flow checkpoint it names ships inside
+  ### the clone under checkpoints/. OCCLUSION_THRESHOLD: a point is visible when
+  ### MFT's occlusion score (0..1, higher = more occluded) is <= this (demo: 0.5).
+  ###===========================================================================
+  MFT:
+    value:
+      CONFIG: configs/MFT_cfg.py
+      OCCLUSION_THRESHOLD: 0.5
+
+  ###===========================================================================
+  ### EVAL PROTOCOL
+  ###===========================================================================
+  EVAL_QUERY_MODE:
+    value: first
+  EVAL_RECOVERY:
+    value: true
+  EVAL_RECOVERY_WINDOW:
+    value: 8
+  EVAL_AMP:
+    value: false
+  EVAL_BATCH_SIZE:
+    value: 1
+  EVAL_WORKERS:
+    value: 6

@@ -12,8 +12,8 @@ writes a CSV under the run dir and (optionally) a W&B table.
     # resolve best.pt (else last.pt) inside a run by EXPERIMENT_NAME
     python evaluate.py --run <EXPERIMENT_NAME>
 
-    # restrict / cap / log to W&B
-    python evaluate.py <ckpt> --datasets TAPVID_DAVIS,ROBOTAP --max-clips 50 --wandb
+    # restrict / cap / skip W&B
+    python evaluate.py <ckpt> --datasets TAPVID_DAVIS,ROBOTAP --max-clips 50 --no-wandb
 
     # override any saved-config field (type-coerced), e.g. force the CPU encoder
     python evaluate.py <ckpt> --MODEL.RGB_ENCODER.ENCODER=cnn
@@ -80,7 +80,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         "(legacy, all points at frame 0). Default: config EVAL_QUERY_MODE / 'first'")
     p.add_argument("--tag", default="", help="CSV name tag -> evaluation_<tag>.csv")
     p.add_argument("--out-dir", default=None, help="override where the CSV is written")
-    p.add_argument("--wandb", action="store_true", help="open a W&B run and log the table")
+    p.add_argument("--no-wandb", action="store_true",
+                   help="skip W&B logging (default: log table to W&B — resumes the "
+                        "checkpoint's original training run when its wandb_run_id is "
+                        "resolvable, else opens a new run)")
     p.add_argument("--cpu", action="store_true", help="force CPU")
     return p
 
@@ -116,7 +119,7 @@ def main() -> int:
         device=device,
         unknown_args=unknown,
         out_dir=args.out_dir,
-        use_wandb=args.wandb,
+        use_wandb=not args.no_wandb,
         tag=args.tag,
         dataset_names=dataset_names,
         max_clips=args.max_clips,

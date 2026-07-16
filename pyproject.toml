@@ -6,13 +6,24 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "dotmap>=1.3.30",
+    "einops>=0.8.2",
     "flow-vis>=0.1",
     "ground-control-tui>=1.3.2",
     "imageio[ffmpeg]>=2.37.3",
+    "ipdb>=0.13.13",
     "jupyter>=1.1.1",
     "matplotlib>=3.11.0",
+    # Monocular geometry (depth + normals + intrinsics) for pseudo-GT track
+    # generation (dataset.pseudo_gt / geometry.pipeline). Pinned to the commit
+    # used by GateTracker. The model path (MoGeModel.from_pretrained + .infer)
+    # needs only ``utils3d`` + ``huggingface_hub`` at runtime; MoGe's gradio /
+    # trimesh / pipeline / click extras are CLI-only and can be skipped
+    # (install moge with --no-deps + utils3d explicitly to keep the env lean).
+    "moge @ git+https://github.com/microsoft/MoGe.git@07444410f1e33f402353b99d6ccd26bd31e469e8",
+    "utils3d @ git+https://github.com/EasternJournalist/utils3d.git@3fab839f0be9931dac7c8488eb0e1600c236e183",
     "opencv-python>=4.13.0.92",
     "python-dotenv>=1.2.2",
+    "scipy>=1.18.0",
     "tensorboard>=2.20.0",
     "torch>=2.12.0",
     "torchvision>=0.27.0",

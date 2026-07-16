@@ -34,7 +34,13 @@ from utilities.config import (
 from utilities.engine import Engine, finish_wandb, init_wandb
 from utilities.env import load_env
 from utilities.log import get_logger
-from utilities.runs import first_incomplete_stage, load_run_state, resolve_run_dir
+from utilities.runs import (
+    first_incomplete_stage,
+    load_run_state,
+    resolve_experiment_name,
+    resolve_run_dir,
+    resolve_source_run_dir,
+)
 
 logger = get_logger(__name__).set_context("MAIN")
 
@@ -116,6 +122,79 @@ def _sync_run_name(name: str, is_ddp: bool, is_main: bool, device) -> str:
     obj = [name if is_main else None]
     dist.broadcast_object_list(obj, src=0, device=device)
     return obj[0]
+
+
+def _lr_scaling_factor(mode: str, world_size: int) -> float:
+    """LR multiplier for a DDP ``world_size`` under the selected scaling rule.
+
+    - ``"none"``   -> 1.0 (LR is invariant to GPU count). Use with **Regime A**:
+      hold the *global* batch fixed by setting per-GPU ``BATCH_SIZE = global/N``.
+      DDP averages gradients, so the per-step update is *mathematically identical*
+      to the single-GPU run (no BatchNorm in this model to break the equivalence);
+      you get ~Nx wall-clock for free and lose nothing in learning quality.
+    - ``"sqrt"``   -> sqrt(N). Use with **Regime B** (per-GPU batch fixed, so the
+      effective batch grows Nx). The square-root rule is the right one for adaptive
+      optimizers (AdamW): Adam already normalizes by the gradient second moment, so
+      the batch<->LR coupling is weaker than SGD's and the linear rule overshoots.
+    - ``"linear"`` -> N. The Goyal et al. 2017 SGD rule. Kept for completeness;
+      empirically it overshoots here (2-GPU 6e-4 underperformed the 3e-4 baseline,
+      4-GPU 4e-3 diverged), so it is NOT the default.
+    """
+    if world_size <= 1:
+        return 1.0
+    mode = (mode or "none").strip().lower()
+    if mode == "linear":
+        return float(world_size)
+    if mode == "sqrt":
+        return float(world_size) ** 0.5
+    if mode == "none":
+        return 1.0
+    raise ValueError(f"Unknown LR_SCALING mode {mode!r}; expected none|sqrt|linear")
+
+
+def _apply_lr_scaling(cfg: Any, world_size: int, is_main: bool) -> None:
+    """Scale the learning rate(s) for DDP per ``cfg['LR_SCALING']`` (default ``none``).
+
+    The LR in the config is treated as the **single-GPU** value. On a single GPU
+    (``world_size <= 1``) this is always a no-op regardless of mode. The factor is
+    chosen by :func:`_lr_scaling_factor`; see its docstring for Regime A/B guidance.
+
+    Mutates ``cfg`` in place. Applied to the resolved stage config, so a non-zero
+    encoder LR (e.g. an unfrozen backbone in a fine-tuning stage) is scaled too; a
+    frozen encoder (0.0) is left untouched.
+    """
+    mode = cfg.get("LR_SCALING", "none")
+    factor = _lr_scaling_factor(mode, world_size)
+    if factor == 1.0:
+        if is_main and world_size > 1:
+            logger.info(
+                f"LR scaling: mode={mode!r} x {world_size} GPUs -> factor 1.0 "
+                f"(LR unchanged; hold global batch fixed with BATCH_SIZE=global/N)"
+            )
+        return
+
+    base_lr = cfg.get("LR", None)
+    if base_lr is not None:
+        scaled = float(base_lr) * factor
+        cfg["LR"] = scaled
+        if is_main:
+            logger.info(
+                f"LR scaling: mode={mode!r} config LR {float(base_lr):.3e} "
+                f"(single-GPU) x {world_size} GPUs (factor {factor:.3f}) -> {scaled:.3e}"
+            )
+
+    mc = cfg.get("MODEL", None)
+    enc = mc.get("RGB_ENCODER", None) if mc is not None else None
+    if enc is not None:
+        enc_lr = float(enc.get("RGB_ENCODER_LR", 0.0) or 0.0)
+        if enc_lr > 0:
+            enc_scaled = enc_lr * factor
+            enc["RGB_ENCODER_LR"] = enc_scaled
+            if is_main:
+                logger.info(
+                    f"LR scaling: mode={mode!r} config RGB_ENCODER_LR {enc_lr:.3e} "
+                    f"(single-GPU) x {world_size} GPUs (factor {factor:.3f}) -> {enc_scaled:.3e}"
+                )
 
 
 def run_pipeline(mode: str = "train", config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -207,9 +286,23 @@ def run_pipeline(mode: str = "train", config: Optional[Dict[str, Any]] = None) -
         if is_main:
             logger.warning("Could not read CPU affinity; OMP_NUM_THREADS unchanged")
 
-    # A run is identified by EXPERIMENT_NAME; --resume-run points at an existing one.
+    # Resolve output run name: explicit EXPERIMENT_NAME wins; cross-run RESUME can
+    # derive via RESUME_NAME template ({source}). --resume-run only adopts the
+    # source name when EXPERIMENT_NAME is still unset after that.
+    resolved_name = resolve_experiment_name(cfg)
+    if resolved_name is not None:
+        cfg.EXPERIMENT_NAME = resolved_name
+
+    schedule_run_dir = None
     if resume_run:
-        cfg.EXPERIMENT_NAME = resume_run
+        if not _has_experiment_name(cfg):
+            cfg.EXPERIMENT_NAME = resume_run
+        schedule_run_dir = resolve_source_run_dir(resume_run, create=False)
+        if is_main and _has_experiment_name(cfg) and str(cfg.EXPERIMENT_NAME).strip() != resume_run:
+            logger.info(
+                f"--resume-run {resume_run!r}: schedule from source run; "
+                f"writing to {cfg.EXPERIMENT_NAME!r}"
+            )
 
     # When no EXPERIMENT_NAME is given, adopt W&B's friendly run name
     # (adjective-noun-number) so the local results dir matches the W&B run. That
@@ -235,7 +328,8 @@ def run_pipeline(mode: str = "train", config: Optional[Dict[str, Any]] = None) -
     if start_stage is not None:
         start = start_stage
     elif resume_run:
-        start = first_incomplete_stage(run_dir, len(stages))
+        src = schedule_run_dir if schedule_run_dir is not None else run_dir
+        start = first_incomplete_stage(src, len(stages))
     else:
         start = 0
 
@@ -265,6 +359,8 @@ def run_pipeline(mode: str = "train", config: Optional[Dict[str, Any]] = None) -
             scfg = resolve_stage_config(cfg, i)
             if is_main:
                 logger.info(f"--- stage {i + 1}/{len(stages)} :: {scfg.STAGE_NAME} ---")
+            # Scale the LR for DDP per LR_SCALING (default 'none'; config LR == single-GPU value).
+            _apply_lr_scaling(scfg, world_size, is_main)
             datasets = create_datasets_from_config(scfg)
             loaders = build_dataloaders(scfg, datasets, rank=rank, world_size=world_size)
             if is_main:

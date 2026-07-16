@@ -1,0 +1,63 @@
+# Benchmark config: LiteTracker (MICCAI 2025, ImFusion) on the TWIST eval datasets.
+#
+# W&B-sweep format like every config in the repo. The benchmark script runs
+# LiteTracker through the *same* evaluator the TWIST model uses, so the metrics
+# are directly comparable -- in particular directly comparable to the
+# `cotracker3` benchmark run, since LiteTracker is a training-free runtime
+# re-optimisation of CoTracker3-online that loads CoTracker3's *exact* weights
+# (the state_dict matches 0 missing / 0 unexpected). It is online/causal and
+# processes one frame at a time (see benchmark/litetracker/litetracker.py).
+#
+#   python benchmark/litetracker/litetracker.py                       # uses this file
+#   python benchmark/litetracker/litetracker.py --datasets TAPVID_DAVIS --max-clips 5   # smoke
+parameters:
+
+  ###===========================================================================
+  ### RUN / W&B
+  ###===========================================================================
+  EXPERIMENT_NAME:
+    value: litetracker
+  WANDB_PROJECT:
+    value: twist
+  WANDB_ENTITY:
+    value: twisteam
+  WANDB_TAGS:
+    value: [benchmark]
+
+  ###===========================================================================
+  ### GEOMETRY  (frames are fed at TARGET_SIZE; LiteTracker internally resizes
+  ### each frame to LITETRACKER.MODEL_RESOLUTION for its forward and rescales the
+  ### predicted coords back, so predictions line up with GT at TARGET_SIZE.)
+  ###===========================================================================
+  CROP:
+    value: null
+  IMAGE_SIZE:
+    value: 512
+
+  ###===========================================================================
+  ### LITETRACKER MODEL  (online/causal only). Loads CoTracker3-online weights
+  ### verbatim -> reuses the checkpoint the cotracker/ benchmark already cached.
+  ### MODEL_RESOLUTION [H, W] is LiteTracker's internal working resolution
+  ### (CoTracker3 default (384, 512)); it is independent of IMAGE_SIZE above.
+  ###===========================================================================
+  LITETRACKER:
+    value:
+      CHECKPOINT: weights/cotracker/scaled_online.pth
+      CHECKPOINT_URL: https://huggingface.co/facebook/cotracker3/resolve/main/scaled_online.pth
+      MODEL_RESOLUTION: [384, 512]
+
+  ###===========================================================================
+  ### EVAL PROTOCOL
+  ###===========================================================================
+  EVAL_QUERY_MODE:
+    value: first
+  EVAL_RECOVERY:
+    value: true
+  EVAL_RECOVERY_WINDOW:
+    value: 8
+  EVAL_AMP:
+    value: false
+  EVAL_BATCH_SIZE:
+    value: 1
+  EVAL_WORKERS:
+    value: 6

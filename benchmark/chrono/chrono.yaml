@@ -1,0 +1,62 @@
+# Benchmark config: Chrono (DINOv2 + temporal adapter) on the TWIST eval datasets.
+#
+# W&B-sweep format like every config in the repo. The benchmark script runs Chrono
+# through the *same* evaluator the TWIST model uses, so the metrics are directly
+# comparable.
+#
+#   python benchmark/chrono/chrono.py                       # uses this file
+#   python benchmark/chrono/chrono.py --datasets TAPVID_DAVIS --max-clips 5   # smoke
+parameters:
+
+  ###===========================================================================
+  ### RUN / W&B
+  ###===========================================================================
+  EXPERIMENT_NAME:
+    value: chrono
+  WANDB_PROJECT:
+    value: twist
+  WANDB_ENTITY:
+    value: twisteam
+  WANDB_TAGS:
+    value: [benchmark]
+
+  ###===========================================================================
+  ### GEOMETRY
+  ###===========================================================================
+  CROP:
+    value: null
+  IMAGE_SIZE:
+    value: 512               # Chrono trains/evals at 256²; 512² is wasted resize + 4× I/O
+
+  ###===========================================================================
+  ### CHRONO MODEL.  Checkpoint is a PyTorch-Lightning .ckpt from Google Drive
+  ### (no direct URL -> fetch with gdown, see the sbatch note). DINOv2 backbone is
+  ### auto-downloaded via torch.hub on first construction.
+  ###===========================================================================
+  CHRONO:
+    value:
+      DINO_SIZE: base                 # 'base' (ViT-B) or 'small' (ViT-S)
+      DINO_REG: false
+      ADAPTER_INTERMED_CHANNELS: 128
+      RESOLUTION: [512, 512]          # Chrono working resolution; tracks rescaled back to input
+      QUERY_CHUNK_SIZE: 64
+      MAX_TEMPORAL_FRAMES: 128        # DINO is O(T); @256² ~10 tiles for RoboTAP (~1.2k frames)
+      CHECKPOINT: weights/chrono/chrono_base.ckpt
+
+  ###===========================================================================
+  ### EVAL PROTOCOL
+  ###===========================================================================
+  EVAL_QUERY_MODE:
+    value: first
+  EVAL_TIMING_BATCHES:
+    value: 0                # skip extra timing forward (Chrono/DINO is already heavy)
+  EVAL_RECOVERY:
+    value: true
+  EVAL_RECOVERY_WINDOW:
+    value: 8
+  EVAL_AMP:
+    value: false
+  EVAL_BATCH_SIZE:
+    value: 1
+  EVAL_WORKERS:
+    value: 8

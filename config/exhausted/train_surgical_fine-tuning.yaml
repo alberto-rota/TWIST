@@ -1,0 +1,315 @@
+# TWIST — PHASE 2: surgical fine-tuning on endoscopy video that has NO ground truth.
+# ============================================================================================
+#
+# WHY THIS IS A DISTINCT PHASE
+#   TrackerLoss is *fully supervised*: every term (position Huber, prior-mean Huber,
+#   visibility BCE, KL-on-visible, multi-step rollout) is masked to `valid = gt_vis * exist`
+#   and reads batch["tracks"] / batch["visibility"]. Surgical endoscopy has neither. So we do
+#   NOT change the loss — we change the *labels*: a strong off-the-shelf teacher (CoTracker3)
+#   is run offline on the raw endoscopy videos to produce PSEUDO-tracks, stored in the shared
+#   `<name>/cotracker_tracks/` (index.json + per-clip .npz) layout — identical to Kubric's.
+#   Phase 2 is then TEACHER-DISTILLATION / SELF-TRAINING: the same engine + same loss, but the
+#   "GT" it consumes is the teacher's pseudo-labels. (This mirrors CoTracker3's real-video
+#   scaling recipe — the model this project benchmarks against.)
+#
+#   What Phase 2 buys us over just running the teacher: (1) the world-model TRANSITION PRIOR,
+#   pretrained on clean Kubric physics, handles occlusion by rollout better than the teacher's
+#   per-frame matching — the project's core thesis; (2) specialization to surgical appearance
+#   (specular highlights, blood, smoke, low-texture deformable tissue); (3) denoising the
+#   teacher by averaging its signal over many clips. The student is otherwise upper-bounded by
+#   the teacher on the parts the teacher gets right, so we DOWN-WEIGHT the pseudo-signals the
+#   teacher is least reliable at (occlusion/visibility, through-occlusion motion) and keep the
+#   trustworthy one (position on visible, textured points) dominant.
+#
+# HOW WEIGHTS FLOW FROM PHASE 1 -> PHASE 2
+#   This is a two-STAGE schedule. The engine's cross-stage weight carry (_prev_stage_checkpoint
+#   + strict=False load) automatically initializes stage 1 (surgical) from stage 0's (Kubric)
+#   best.pt. That is the ONLY supported cross-phase warm-start in this engine (RESUME handles
+#   scratch|last|best *within* a stage; there is no RESUME=<other-run> path).
+#
+# LAUNCH
+#   (a) Full run, both phases end-to-end (stage 1 auto-inherits stage-0 Kubric weights):
+#         python train.py config/train_surgical_fine-tuning.yaml
+#         # or on GPU: point .sbatch_scripts/train_a100.sbatch at this config and sbatch it.
+#   (b) Skip re-training Kubric — reuse an existing completed pretrain (recommended if you
+#       already ran config/train_best.yaml). Seed the pretrained checkpoint into stage 0 of
+#       this run dir and jump to stage 1:
+#         RUN=twist_surgical_ft
+#         mkdir -p results/$RUN/stage0_kubric_pretrain
+#         cp results/twist_best_kubric_r512/stage0_stage0/best.pt \
+#            results/$RUN/stage0_kubric_pretrain/best.pt
+#         python train.py config/train_surgical_fine-tuning.yaml --start-stage 1
+#       (--start-stage 1 skips stage 0; the carry finds stage0_*/best.pt and loads it.)
+#
+# DIFFERENCES vs PHASE 1 (stage 0) — see the STAGES[1] block for the concrete knobs:
+#   * DATA:   Kubric synthetic GT  ->  Cholec80 + SurgT CoTracker PSEUDO-labels (train).
+#   * INIT:   scratch              ->  inherits Phase-1 weights (cross-stage carry).
+#   * LR:     3e-4                 ->  3e-5 (10x lower; short warmup) — don't wreck the prior.
+#   * EPOCHS: 50                   ->  20.
+#   * LOSS:   trust position; DOWN-WEIGHT the noisy pseudo-signals — VIS_WEIGHT 0.5->0.2,
+#             PRIOR_WEIGHT 0.5->0.25, ROLLOUT_WEIGHT 2.0->0.5 (through-occlusion pseudo-GT is a
+#             teacher guess); POS_WEIGHT stays 10 (visible-point positions are trustworthy).
+#   * CURRICULUM: teacher-forcing / obs-dropout / KL-anneal shortened (the model already tracks).
+#   * EVAL:   headline moves to the REAL surgical GT benchmarks (EndoTAPP-GT / STIR / Surgical-
+#             Motion), which are held out and NEVER trained on; TAP-Vid-DAVIS kept as a
+#             forgetting monitor. NOTE: we intentionally do NOT train on EndoTAPP/cotracker_tracks
+#             — its GT split (ENDOTAPP_GT) is an eval benchmark, so training on the same source
+#             videos would leak. On the surgical TRAIN split, val/epe measures agreement-with-
+#             teacher (distillation fidelity), NOT true accuracy — read eval/* for real accuracy.
+
+parameters:
+
+  ###===========================================================================================================================
+  ### RUN / GENERAL  (shared by both stages)
+  ###===========================================================================================================================
+  EXPERIMENT_NAME:
+    value: twist_surgical_ft   # run identity -> results/<name>/ ; re-submit same name auto-resumes
+  RESUME:
+    value: last     # in-stage resume from last.pt; cross-stage carry is automatic (see header)
+  WORKERS:
+    value: 8
+  PIN_MEMORY:
+    value: true
+  NO_WANDB:
+    value: false
+  SMOKE:
+    value: false
+  WANDB_PROJECT:
+    value: twist
+  SEED:
+    value: 42
+
+  IMAGE_SIZE:
+    value: 512
+
+  ###===========================================================================================================================
+  ### MODEL — identical to the validated Phase-1 winner (snowy-sweep-1); architecture is unchanged
+  ###          across phases so the cross-stage weight carry is a clean, shape-compatible load.
+  ###===========================================================================================================================
+  MODEL:
+    value:
+      MODEL_CLASS: TrackerWorldModel
+      MODEL_MODULE: models
+      HIDDEN_DIM: 256
+      TOKEN_DIM: 256
+      RGB_ENCODER:
+        ENCODER: facebook/dinov3-vitl16-pretrain-lvd1689m
+        FREEZE_BACKBONE: true    # DINOv3 stays frozen in BOTH phases (the design bets on general
+        RGB_ENCODER_LR: 0.0      # features). Endoscopy is OOD for DINOv3; a *tiny* encoder LR
+                                 # (e.g. 1e-6) is the lever to gently adapt appearance, but it
+                                 # risks catastrophic forgetting under noisy pseudo-labels — left
+                                 # OFF by default. (Only the encoder is freezable via config; a
+                                 # finer transition/observation freeze would need a code change —
+                                 # here we steer that balance through the LOSS weights instead.)
+      OBSERVATION:
+        K: 9
+        RADIUS_PX: 24.0
+        HEADS: 4
+        MAX_CORR: 0.0
+      TRANSITION:
+        DEPTH: 2
+        HEADS: 4
+        MAX_STEP: 0.12
+      ROLLOUT_VEL_DECAY: 1.0
+      HEADS:
+        UNCERTAINTY: true
+
+  ###===========================================================================================================================
+  ### TRAINING DEFAULTS  (shared; each stage overrides the knobs that differ)
+  ###===========================================================================================================================
+  WEIGHT_DECAY:
+    value: 1.0e-4
+  OPTIMIZER:
+    value: adamw
+  GRAD_CLIP:
+    value: 1.0
+  AMP:
+    value: true
+  LR_SCHEDULER:
+    value: cosine
+  MIN_LR_RATIO:
+    value: 0.05
+  KL_BALANCE_ALPHA:
+    value: 0.8
+
+  ###===========================================================================================================================
+  ### VALIDATION  (shared)
+  ###===========================================================================================================================
+  VAL_EVERY:
+    value: 1
+  VAL_SUBSAMPLE:
+    value: 0.15   # per-epoch val = this fraction of EACH dataset's val clips (evenly spread, deterministic).
+                  # Bounds validate() to minutes AND keeps it representative; applies across stages unless a
+                  # stage overrides it. Per-dataset override inside a DATASETS entry (0 = drop from val).
+                  # Surgical benchmarks are still scored in full by benchmark eval (eval/*).
+  EARLY_STOP_PATIENCE:
+    value: 20   # NB: on the surgical stage this monitors PSEUDO-val-epe (teacher agreement),
+                # not truth — patience >= EPOCHS effectively disables it; judge by eval/*.
+  ROLLOUT_EVAL:
+    value: true
+  ROLLOUT_OBSERVE_STEPS:
+    value: 4
+
+  ###===========================================================================================================================
+  ### BENCHMARK EVALUATION  (shared)
+  ###===========================================================================================================================
+  EVAL_QUERY_MODE:
+    value: first
+  EVAL_AT_END:
+    value: true
+  EVAL_EVERY:
+    value: 5      # watch the real-GT surgical benchmarks often during fine-tuning
+  EVAL_MAX_CLIPS:
+    value: 30     # cheap in-training monitor; final headline number via evaluate.py (uncapped)
+  EVAL_BATCH_SIZE:
+    value: 1
+  EVAL_WORKERS:
+    value: 4
+
+  ###===========================================================================================================================
+  ### LOGGING & VISUALIZATION  (shared)
+  ###===========================================================================================================================
+  LOG_EVERY:
+    value: 5
+  VIZ_EVERY:
+    value: 1
+  VIZ_VAL_CLIPS:
+    value: 1
+  VIZ_EVERY_BATCHES:
+    value: 50
+  VIZ_DENSE_SPACING:
+    value: 48
+  VIZ_DENSE_MAX_POINTS:
+    value: 400
+  VIZ_FRAMES:
+    value: 48
+  VIZ_MAX_POINTS:
+    value: 48
+  VIZ_SIZE:
+    value: 256
+  VIZ_TAIL:
+    value: 12
+  VIZ_DPI:
+    value: 56
+  VIZ_FPS:
+    value: 8
+
+  ###===========================================================================================================================
+  ### SCHEDULE — two phases. Stage-block top-level keys REPLACE the base value (so each stage's
+  ###            DATASETS / LOSS fully define that phase). Stage 1 inherits stage 0's weights.
+  ###===========================================================================================================================
+  STAGES:
+    value:
+
+      # ----------------------------------------------------------------------------------------
+      # STAGE 0 — PHASE 1: Kubric-only pretraining (real synthetic GT). Faithful mirror of
+      #           config/train_best.yaml. If you already ran that, seed its checkpoint and launch
+      #           with --start-stage 1 (see header) to skip re-training this stage.
+      # ----------------------------------------------------------------------------------------
+      - NAME: kubric_pretrain
+        BATCH_SIZE: 6
+        EPOCHS: 50
+        LR: 3.0e-4
+        WARMUP_EPOCHS: 3
+        KL_WEIGHT_START: 0.0
+        KL_ANNEAL_EPOCHS: 5
+        TEACHER_FORCING_EPOCHS: 3
+        OBS_DROPOUT: 0.3
+        OBS_DROPOUT_EPOCHS: 5
+        LOSS:
+          POS_WEIGHT: 10.0
+          VIS_WEIGHT: 0.5
+          KL_WEIGHT: 0.05
+          KL_FREE_BITS: 0.02
+          KL_BALANCE_ALPHA: 0.8
+          HUBER_DELTA: 0.2
+          UNC_WEIGHT: 0.0
+          PRIOR_WEIGHT: 0.5
+          ROLLOUT_WEIGHT: 2.0
+        DATASETS:
+          OVERRIDE_ALL_DATASETS:
+            SPLIT_SEED: 42
+            CLIP_LEN: 24
+            LOAD_FRAMES: true
+            LOAD_DEPTHS: false
+            FRAMES_AS_FLOAT: false
+            MARK_OFFSCREEN_INVISIBLE: true
+            POINT_SAMPLE_MODE: even
+            QUERY_FRAME: 0
+            CLIP_STRIDE: null
+            FRAME_STRIDE: 1
+            REQUIRE_VISIBLE_AT_QUERY: true
+            MIN_VISIBLE_FRAMES: 1
+          # TRAIN + in-domain val: full Kubric (real synthetic GT)
+          KUBRIC:
+            VAL_FRACTION: 0.1
+          # EVAL benchmarks (held out; scored, never trained on)
+          TAPVID_DAVIS:      { VAL_FRACTION: 1.0, IS_EVAL_DATASET: True }
+          TAPVID_RGB_STACKING: { VAL_FRACTION: 1.0, IS_EVAL_DATASET: True }
+          ROBOTAP:           { VAL_FRACTION: 1.0, IS_EVAL_DATASET: True }
+          ENDOTAPP_GT:       { VAL_FRACTION: 1.0, IS_EVAL_DATASET: True }
+          STIR_CHALLENGE:    { VAL_FRACTION: 1.0, IS_EVAL_DATASET: True }
+          SURGICALMOTION:    { VAL_FRACTION: 1.0, IS_EVAL_DATASET: True }
+
+      # ----------------------------------------------------------------------------------------
+      # STAGE 1 — PHASE 2: surgical fine-tuning on CoTracker PSEUDO-labels (NO ground truth).
+      #           Inherits stage-0 weights automatically. Every knob below is a deliberate
+      #           difference from stage 0 (see header summary).
+      # ----------------------------------------------------------------------------------------
+      - NAME: surgical_finetune
+        BATCH_SIZE: 6
+        EPOCHS: 20                # <- fewer than 50: adaptation, not from-scratch learning
+        LR: 3.0e-5               # <- 10x lower: preserve the pretrained dynamics prior
+        WARMUP_EPOCHS: 1         # <- short warmup (weights are already good)
+        KL_WEIGHT_START: 0.05    # <- start at target (prior is trained; no need to re-anneal KL)
+        KL_ANNEAL_EPOCHS: 1
+        TEACHER_FORCING_EPOCHS: 1  # <- the model already tracks; minimal scheduled sampling
+        OBS_DROPOUT: 0.2         # <- keep some "coast without a frame" curriculum, but shorter
+        OBS_DROPOUT_EPOCHS: 2
+        LOSS:
+          POS_WEIGHT: 10.0       # KEEP dominant — teacher POSITIONS on visible points are the
+                                 # trustworthy pseudo-signal.
+          VIS_WEIGHT: 0.2        # DOWN 0.5->0.2 — teacher OCCLUSION labels are the least reliable
+                                 # pseudo-signal in surgery (tool passes, specular blowout, defocus).
+          KL_WEIGHT: 0.05
+          KL_FREE_BITS: 0.02
+          KL_BALANCE_ALPHA: 0.8
+          HUBER_DELTA: 0.2       # (optional robustness lever: raise ~0.3 for heavier tails =
+                                 # less sensitivity to pseudo-label position outliers.)
+          UNC_WEIGHT: 0.0        # OFF (as in Phase 1). Candidate to RE-ENABLE here: the aleatoric
+                                 # head could learn to down-weight ambiguous pseudo-labels — but it
+                                 # gamed the static solution on Kubric, so only with monitoring.
+          PRIOR_WEIGHT: 0.25     # DOWN 0.5->0.25 — prior-mean supervision now points at pseudo
+                                 # motion; halve our trust in it.
+          ROLLOUT_WEIGHT: 0.5    # DOWN 2.0->0.5 — the multi-step rollout is supervised against
+                                 # THROUGH-OCCLUSION pseudo-GT, which is a teacher guess exactly
+                                 # where it matters. Lean on the Kubric-pretrained prior instead.
+        DATASETS:
+          OVERRIDE_ALL_DATASETS:
+            SPLIT_SEED: 42
+            CLIP_LEN: 24
+            LOAD_FRAMES: true
+            LOAD_DEPTHS: false
+            FRAMES_AS_FLOAT: false
+            MARK_OFFSCREEN_INVISIBLE: true
+            POINT_SAMPLE_MODE: even
+            QUERY_FRAME: 0
+            CLIP_STRIDE: null
+            FRAME_STRIDE: 1
+            REQUIRE_VISIBLE_AT_QUERY: true
+            MIN_VISIBLE_FRAMES: 1
+          # TRAIN — surgical CoTracker pseudo-labels (no GT). 90% train / 10% pseudo-val.
+          # (EndoTAPP is deliberately NOT trained on: its GT split is an eval benchmark below,
+          #  so training on the same source videos would leak into the headline number.)
+          CHOLEC80:
+            VAL_FRACTION: 0.1
+          SURGT:
+            VAL_FRACTION: 0.1
+          # EVAL — REAL surgical ground truth (held out; the honest Phase-2 headline, reported
+          # against zero-shot CoTracker3 through this same evaluator).
+          ENDOTAPP_GT:       { VAL_FRACTION: 1.0, IS_EVAL_DATASET: True }
+          STIR_CHALLENGE:    { VAL_FRACTION: 1.0, IS_EVAL_DATASET: True }
+          SURGICALMOTION:    { VAL_FRACTION: 1.0, IS_EVAL_DATASET: True }
+          # Keep one source-domain TAP benchmark to catch catastrophic forgetting of general
+          # tracking while we specialize to surgery.
+          TAPVID_DAVIS:      { VAL_FRACTION: 1.0, IS_EVAL_DATASET: True }

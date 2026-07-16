@@ -62,6 +62,7 @@ except Exception:  # pragma: no cover - dotmap is a declared dep
 _SPLIT_KEYS = {
     "ROOT_DIR", "READER", "VAL_FRACTION", "SPLIT_SEED",
     "VAL_SEQUENCES", "TRAIN_SEQUENCES", "MAX_SEQUENCES",
+    "VAL_SUBSAMPLE",   # per-epoch val clip fraction; injected into the val reader only
 }
 
 
@@ -114,6 +115,73 @@ def _apply_dotted_override(config_dict: dict, dotted_key: str, value: str) -> No
     except Exception as e:  # noqa: BLE001
         logger.warning(f"could not coerce {dotted_key}={value!r}: {e}")
         node[leaf] = value
+
+
+def _apply_top_level_image_size(config_dict: dict) -> None:
+    """Propagate a single top-level ``IMAGE_SIZE`` to both the dataset loader and
+    the encoder, so frames are loaded at exactly the size the encoder consumes and
+    are never resampled inside the encoder.
+
+    When ``IMAGE_SIZE`` is present it sets:
+      * ``DATASETS.OVERRIDE_ALL_DATASETS.TARGET_SIZE -> [IMAGE_SIZE, IMAGE_SIZE]``
+        (the size every reader produces), and
+      * ``MODEL.RGB_ENCODER.IMAGE_SIZE -> IMAGE_SIZE`` (what the encoder expects).
+
+    Companion: top-level ``CROP`` (see :func:`_apply_top_level_crop`) selects a
+    native-pixel box applied *before* this resize. No-op if absent. Runs after the
+    dotted-key fold so a swept/CLI ``IMAGE_SIZE`` override is the value used."""
+    size = config_dict.get("IMAGE_SIZE")
+    if size is None:
+        return
+    try:
+        size = int(size)
+    except (TypeError, ValueError):
+        logger.warning(f"top-level IMAGE_SIZE={size!r} is not an int; ignoring")
+        return
+    if size % 16 != 0:
+        logger.warning(
+            f"IMAGE_SIZE={size} is not divisible by the DINOv3 patch size 16; "
+            "the encoder requires H,W % 16 == 0 and will assert at runtime")
+    datasets = config_dict.setdefault("DATASETS", {})
+    if isinstance(datasets, dict):
+        oad = datasets.setdefault(OVERRIDE_ALL_DATASETS_KEY, {})
+        if isinstance(oad, dict):
+            oad["TARGET_SIZE"] = [size, size]
+    model = config_dict.setdefault("MODEL", {})
+    if isinstance(model, dict):
+        enc = model.setdefault("RGB_ENCODER", {})
+        if isinstance(enc, dict):
+            enc["IMAGE_SIZE"] = size
+    logger.info(f"resolution: IMAGE_SIZE={size} -> TARGET_SIZE=[{size},{size}] + encoder IMAGE_SIZE")
+
+
+def _apply_top_level_crop(config_dict: dict) -> None:
+    """Propagate top-level ``CROP`` to ``DATASETS.OVERRIDE_ALL_DATASETS.CROP``.
+
+    ``CROP`` is ``[x0, y0, x1, y1]`` in native pixels, applied *before* the
+    resize-to-cover + center-crop to ``TARGET_SIZE`` (see ``dataset.base``). No-op
+    if absent. Runs after the dotted-key fold so a swept/CLI override wins."""
+    crop = config_dict.get("CROP")
+    if crop is None:
+        return
+    if not isinstance(crop, (list, tuple)) or len(crop) != 4:
+        logger.warning(f"top-level CROP={crop!r} must be [x0, y0, x1, y1]; ignoring")
+        return
+    try:
+        crop = tuple(int(v) for v in crop)
+    except (TypeError, ValueError):
+        logger.warning(f"top-level CROP={crop!r} must be four ints; ignoring")
+        return
+    x0, y0, x1, y1 = crop
+    if not (x1 > x0 and y1 > y0):
+        logger.warning(f"top-level CROP={list(crop)} invalid (need x1>x0, y1>y0); ignoring")
+        return
+    datasets = config_dict.setdefault("DATASETS", {})
+    if isinstance(datasets, dict):
+        oad = datasets.setdefault(OVERRIDE_ALL_DATASETS_KEY, {})
+        if isinstance(oad, dict):
+            oad["CROP"] = list(crop)
+    logger.info(f"geometry: CROP={list(crop)} (native px, applied before TARGET_SIZE resize)")
 
 
 def load_and_process_config(
@@ -184,6 +252,14 @@ def load_and_process_config(
     # params sweepable without flattening the whole config.
     for key in [k for k in config_dict if isinstance(k, str) and "." in k]:
         _apply_dotted_override(config_dict, key, str(config_dict.pop(key)))
+
+    # Single-knob resolution: a top-level ``IMAGE_SIZE`` drives both the loaded
+    # frame size (DATASETS TARGET_SIZE) and the encoder, so frames are read at the
+    # encoder's size and never resampled. ``CROP`` is the companion native-pixel box
+    # applied before that resize. Both run after the dotted-key fold so swept/CLI
+    # overrides are the values that propagate.
+    _apply_top_level_image_size(config_dict)
+    _apply_top_level_crop(config_dict)
 
     if boot_mode:
         config_dict["BATCH_SIZE"] = 1
@@ -282,6 +358,17 @@ def resolve_stage_config(config: "DotMap", stage_idx: int) -> "DotMap":
     merged[STAGE_INDEX_KEY] = stage_idx
     merged[STAGE_NAME_KEY] = stages[stage_idx].get("NAME", f"stage{stage_idx}")
     merged.setdefault("EXPERIMENT_NAME", config.get("EXPERIMENT_NAME"))
+    # Re-derive the resolution/crop injection on the merged stage config. A stage's
+    # own top-level ``DATASETS`` block REPLACES the base one, which would drop the
+    # ``OVERRIDE_ALL_DATASETS.TARGET_SIZE`` that ``_apply_top_level_image_size``
+    # injected into the base at load time — leaving that stage's readers at
+    # target_size=None (each dataset keeps its native H,W, so a mixed-resolution
+    # train batch fails to collate: "storage that is not resizable"). Re-running
+    # the derivation here re-injects TARGET_SIZE (and CROP) from the stage's own
+    # IMAGE_SIZE into the stage's own OVERRIDE_ALL_DATASETS. Idempotent for a stage
+    # that redefines neither.
+    _apply_top_level_image_size(merged)
+    _apply_top_level_crop(merged)
     return DotMap(merged)
 
 
@@ -348,6 +435,10 @@ def create_datasets_from_config(
         raise ValueError("no datasets listed under DATASETS")
 
     train_sets, val_sets = [], []
+    # Global per-epoch val clip fraction (0<f<1 keeps a representative slice; f<=0
+    # drops a dataset from per-epoch val; None/>=1 keeps all). A per-dataset
+    # VAL_SUBSAMPLE overrides this. Decoupled from VAL_FRACTION (the split ratio).
+    global_val_subsample = config.get("VAL_SUBSAMPLE", None)
     logger.info(f"building {len(names)} dataset(s): {names}")
 
     for name in names:
@@ -356,6 +447,14 @@ def create_datasets_from_config(
         merged.update(all_overrides)
         merged.update(_as_dict(datasets_cfg.get(name)))
         merged.update(forced_overrides)
+
+        # Hard disable: VAL_FRACTION < 0 removes the dataset entirely -- no clips
+        # go to train OR val. Combined with IS_EVAL_DATASET=False (the default for
+        # training datasets) the dataset is completely ignored. See
+        # select_eval_datasets, which drops it from benchmark eval too.
+        if float(merged.get("VAL_FRACTION", 0.1)) < 0:
+            logger.info(f"  {name}: VAL_FRACTION < 0 -- dataset disabled, skipping")
+            continue
 
         reader_cls = reader_class_for(name, merged)
         root = expand_path(merged.get("ROOT_DIR", f"$DATASET_DIR/{name}"))
@@ -389,12 +488,17 @@ def create_datasets_from_config(
             val_kw = dict(kw)
             if val_kw.get("point_sample_mode") == "random":
                 val_kw["point_sample_mode"] = "even"  # reproducible val metrics
+            vfrac = merged.get("VAL_SUBSAMPLE", global_val_subsample)  # per-dataset override < global
+            if vfrac is not None:
+                val_kw["subsample"] = float(vfrac)    # keep only a representative fraction in per-epoch val
             vl = reader_cls(root=root, include=val_seqs, **val_kw)
             vl.dataset_name = name                      # so the engine logs >=1 viz clip per dataset
-            val_sets.append(vl)
-            logger.info(
-                f"  ✓ {name} val:   {len(val_seqs)} seqs -> {len(val_sets[-1])} clips"
-            )
+            sfx = f"  (VAL_SUBSAMPLE={vfrac})" if vfrac is not None else ""
+            if len(vl) > 0:
+                val_sets.append(vl)
+                logger.info(f"  ✓ {name} val:   {len(val_seqs)} seqs -> {len(vl)} clips{sfx}")
+            else:
+                logger.info(f"  ✓ {name} val:   {len(val_seqs)} seqs -> 0 clips{sfx} -- excluded from per-epoch val")
 
     training = ConcatDataset(train_sets) if train_sets else None
     validation = ConcatDataset(val_sets) if val_sets else None
@@ -537,12 +641,16 @@ def create_model_from_config(config: "DotMap", device, verbose: bool = True):
         "patch_size": int(enc.get("PATCH_SIZE", 8)),          # used by cnn
         "freeze_backbone": bool(enc.get("FREEZE_BACKBONE", True)),
         "encoder_lr": encoder_lr,
+        # None = final hidden state (v1); int selects a mid-transformer layer as the
+        # dense feature map (precision lever; dino only).
+        "feature_layer": enc.get("FEATURE_LAYER", None),
     }
     encoder = models_module.FrozenFrameEncoder(encoder_cfg).to(device)
 
     obs = _as_dict(mc.get("OBSERVATION"))
     trans = _as_dict(mc.get("TRANSITION"))
     heads = _as_dict(mc.get("HEADS"))
+    ups = _as_dict(mc.get("FEATURE_UPSAMPLE"))   # learned finer feature grid (default OFF)
     model_class = getattr(models_module, mc.get("MODEL_CLASS", "TrackerWorldModel"))
     model = model_class(
         encoder=encoder,
@@ -552,12 +660,23 @@ def create_model_from_config(config: "DotMap", device, verbose: bool = True):
         obs_radius_px=float(obs.get("RADIUS_PX", 24.0)),
         obs_heads=int(obs.get("HEADS", 4)),
         obs_max_corr=float(obs.get("MAX_CORR", 0.0)),
+        # v2 flags (all default OFF = the v1 architecture, checkpoint-compatible):
+        # STATS feeds detached correlation statistics to the vis/gate/logvar heads,
+        # COARSE enables the global re-acquisition stage, VIS_INPUT gives the
+        # transition the point's visibility belief.
+        obs_stats=bool(obs.get("STATS", False)),
+        obs_coarse=bool(obs.get("COARSE", False)),
         trans_heads=int(trans.get("HEADS", 4)),
         trans_depth=int(trans.get("DEPTH", 2)),
         trans_max_step=float(trans.get("MAX_STEP", 0.12)),
+        trans_vis_input=bool(trans.get("VIS_INPUT", False)),
         uncertainty=bool(heads.get("UNCERTAINTY", True)),
         encode_chunk=int(mc.get("ENCODE_CHUNK", 32)),
         rollout_vel_decay=float(mc.get("ROLLOUT_VEL_DECAY", 1.0)),
+        # Learned finer feature grid (precision lever; default OFF = v1 architecture).
+        feat_upsample=bool(ups.get("ENABLED", False)),
+        feat_upsample_factor=int(ups.get("FACTOR", 2)),
+        feat_upsample_bottleneck=int(ups.get("BOTTLENECK", 256)),
         verbose=verbose,
     ).to(device)
 
@@ -587,5 +706,9 @@ def create_loss_from_config(config: "DotMap", device=None):
         unc_weight=float(lc.get("UNC_WEIGHT", 0.0)),
         prior_weight=float(lc.get("PRIOR_WEIGHT", 0.5)),
         rollout_weight=float(lc.get("ROLLOUT_WEIGHT", 0.0)),
+        ce_weight=float(lc.get("CE_WEIGHT", 0.0)),
+        global_ce_weight=(None if lc.get("GLOBAL_CE_WEIGHT") is None
+                          else float(lc.get("GLOBAL_CE_WEIGHT"))),
+        use_occluded_gt=bool(lc.get("USE_OCCLUDED_GT", True)),
     )
     return loss.to(device) if device is not None else loss

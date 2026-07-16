@@ -227,6 +227,14 @@ class FrozenFrameEncoder(nn.Module):
         freeze = bool(cfg.get("freeze_backbone", True)) or (encoder_lr in (0, 0.0, None))
         self.frozen = freeze
 
+        # Which transformer layer to read as the dense feature map. ``None`` = the
+        # final hidden state (v1, default). An int selects a mid-block hidden state
+        # (a precision lever: earlier DINOv3 layers can carry finer spatial detail
+        # than the semantics-tuned last block). Negative indexes from the end
+        # (-1 == last == None-equivalent, -4 == 4th-from-last). ``dino`` only.
+        fl = cfg.get("feature_layer", None)
+        self.feature_layer = None if fl in (None, "", "null") else int(fl)
+
         if self.variant == "cnn":
             self.backbone = _CNNBackbone(
                 feature_dim=int(cfg.get("feature_dim", 64)),
@@ -235,13 +243,22 @@ class FrozenFrameEncoder(nn.Module):
             self.feature_dim = self.backbone.feature_dim
             self.patch_size = self.backbone.patch_size
         elif self.variant in ("dino", "dinov3", "dinov2"):
-            self.backbone = DINOv3({
+            dino_cfg = {
                 "model_name": cfg.get("model_name", "facebook/dinov3-vitl16-pretrain-lvd1689m"),
                 "image_size": int(cfg.get("image_size", 256)),
                 "freeze_backbone": freeze,
-                "return_last_hidden_state": True,
                 "return_as_feature_maps": True,
-            })
+            }
+            if self.feature_layer is None:
+                dino_cfg["return_last_hidden_state"] = True
+            else:
+                # Return one mid-transformer hidden state as the feature map. NB:
+                # keep return_patch_tokens_only=False so the 5-token (CLS+4 reg)
+                # prefix is stripped exactly once — inside tokens_to_feature_maps.
+                dino_cfg["return_last_hidden_state"] = False
+                dino_cfg["return_selected_layers"] = [self.feature_layer]
+                dino_cfg["return_patch_tokens_only"] = False
+            self.backbone = DINOv3(dino_cfg)
             self.feature_dim = self.backbone.feature_dim
             self.patch_size = self.backbone.patch_size
         else:
@@ -252,6 +269,15 @@ class FrozenFrameEncoder(nn.Module):
                 p.requires_grad = False
             self.eval()
 
+        # ImageNet statistics as (non-persistent) buffers: the dino path
+        # preprocesses ON-DEVICE (resize when needed + normalize) instead of the
+        # HF processor's GPU->CPU->PIL->GPU round-trip, which throttled every
+        # training step and inflated the timed ms/frame at eval.
+        self.register_buffer("_img_mean", torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1),
+                             persistent=False)
+        self.register_buffer("_img_std", torch.tensor(IMAGENET_STD).view(1, 3, 1, 1),
+                             persistent=False)
+
     @staticmethod
     def _to_unit(frames: torch.Tensor) -> torch.Tensor:
         """uint8 or float frames -> float in ``[0, 1]``."""
@@ -260,6 +286,20 @@ class FrozenFrameEncoder(nn.Module):
         f = frames.float()
         return f / 255.0 if float(f.max()) > 1.5 else f
 
+    def _preprocess_dino(self, x: torch.Tensor) -> torch.Tensor:
+        """``(B,3,H,W)`` in ``[0,1]`` -> DINOv3 input, entirely on-device.
+
+        Matches the HF processor semantics (resize to the square ``image_size``
+        with bicubic + antialias, then ImageNet-normalize). With the standard
+        config the dataset already loads frames at ``IMAGE_SIZE`` (the top-level
+        knob sets both), so the resize is skipped and this is a pure normalize.
+        """
+        size = int(self.backbone.config["image_size"])
+        if x.shape[-2:] != (size, size):
+            x = F.interpolate(x, size=(size, size), mode="bicubic",
+                              align_corners=False, antialias=True).clamp(0, 1)
+        return (x - self._img_mean) / self._img_std
+
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
         """``frames (B,3,H,W)`` -> dense features ``(B, C, Hf, Wf)``."""
         ctx = torch.no_grad() if self.frozen else nullcontext()
@@ -267,5 +307,8 @@ class FrozenFrameEncoder(nn.Module):
             x = self._to_unit(frames)
             if self.variant == "cnn":
                 return self.backbone(x)
-            x = self.backbone.preprocess_image(x)          # resize + ImageNet normalize
-            return self.backbone(x)["last_hidden_state"]   # (B, C, Hf, Wf)
+            x = self._preprocess_dino(x)                   # on-device resize + normalize
+            out = self.backbone(x)
+            if self.feature_layer is None:
+                return out["last_hidden_state"]            # (B, C, Hf, Wf)
+            return out["selected_hidden_states"][0]        # (B, C, Hf, Wf)

@@ -4,23 +4,38 @@ State = explicit point coordinates ``s_t (B,N,2)``. Each step:
   1. **Transition** (dynamics prior, frame-free): predicts ``p(s_t|s_{t-1})`` from
      state alone — a per-point GRU coupled across points by self-attention
      (rigidity). Runnable without any frame → occlusion rollout / forecasting.
-  2. **Observation** (correction): a local cost-volume around the prior position
-     in the next frame's features yields ``q(s_t|s_{t-1},I_t)``.
+  2. **Observation** (correction): an optional **coarse re-acquisition** stage
+     (template vs the FULL feature grid; confidence-gated re-centering, so a
+     point whose prior drifted beyond the local window during occlusion can
+     still snap back) followed by a local cost-volume around the (re-centered)
+     position in the next frame's features.
+  3. **Fusion**: a per-point Kalman gate blends observation vs prior. Its input
+     includes detached correlation-surface statistics (peak / entropy / margin)
+     and the prior's own calibrated log-variance, so gain follows measurement
+     quality rather than being an unconstrained function of appearance.
 
-Both emit diagonal Gaussians over the (normalized) coordinates; the KL between
-them (in :mod:`models.losses`) is what forces a useful dynamics prior. The model
-works internally in normalized ``[-1,1]`` coordinates and returns tracks in
-pixels.
+Both transition and observation emit diagonal Gaussians over the (normalized)
+coordinates; their log-variances are trained by a decoupled NLL in
+:mod:`models.losses` and are load-bearing (gate features). The model works
+internally in normalized ``[-1,1]`` coords and returns pixels.
 
 Forward returns a dict (the loss/metrics/viz contract)::
 
-    coords        (B,T,N,2)  posterior mean = predicted tracks (pixels)
-    vis_logits    (B,T,N)     visibility logits (supervised by BCE only)
-    gate_logits   (B,T,N)     Kalman-gate logits (obs-trust blend; pos-loss only)
-    coord_logvar  (B,T,N,2)   posterior log-variance (normalized units)
-    prior_mean    (B,T,N,2)   dynamics-only prior mean (pixels)
-    prior_logvar  (B,T,N,2)   prior log-variance (normalized units)
-    frame_hw      (H,W)       frame size the coords live in
+    coords        (B,T,N,2)  fused prediction = tracks (pixels)
+    vis_logits    (B,T,N)    visibility logits (BCE on observed point-steps)
+    gate_logits   (B,T,N)    Kalman-gate logits (obs-trust blend; pos-loss only)
+    coord_logvar  (B,T,N,2)  posterior log-variance (normalized units)
+    prior_mean    (B,T,N,2)  dynamics-only prior mean (pixels)
+    prior_logvar  (B,T,N,2)  prior log-variance (normalized units)
+    observed      (B,T,N)    1 where the observation ran AND was applied
+    corr_valid    (B,T,N)    1 where the local cost-volume was computed
+    corr_logits   (B,T,N,k*k)  local cost-volume logits (CE supervision)
+    win_center    (B,T,N,2)  window center the cost-volume was sampled at (px)
+    corr_grid     (k, radius_px)
+    gcorr_logits  (B,T,N,Hf*Wf)  global map logits (coarse stage; train only)
+    feat_hw       (Hf, Wf)       (coarse stage; train only)
+    coarse_gate   (B,T,N)        coarse re-centering gate (coarse stage only)
+    frame_hw      (H,W)      frame size the coords live in
 """
 
 from __future__ import annotations
@@ -42,6 +57,35 @@ from models.encoder import (
 LOGVAR_MIN, LOGVAR_MAX = -10.0, 2.0
 
 
+class FeatureUpsampler(nn.Module):
+    """Learned upsampler for the frozen encoder's dense feature map.
+
+    DINOv3 patch-16 yields a coarse ``Hf x Wf`` grid (32x32 @512) — the suspected
+    ceiling on sub-2px localization (bilinear feature sampling cannot resolve detail
+    the grid never carried). This trainable head lifts ``(B,C,Hf,Wf)`` to
+    ``(B,C,factor*Hf,factor*Wf)`` while **preserving the channel dim** ``C``, so every
+    downstream consumer (template sampling, local cost-volume, global match) sees a
+    finer grid with no other change — sampling is coordinate-based (normalized by the
+    pixel frame size, not the grid), so a denser grid is transparent. A channel
+    ``bottleneck`` keeps it cheap; the body is bilinear-upsample + a learned refine.
+    Never built when disabled (features pass through untouched = byte-identical v1).
+    """
+
+    def __init__(self, c: int, factor: int = 2, bottleneck: int = 256) -> None:
+        super().__init__()
+        self.factor = int(factor)
+        self.proj_in = nn.Conv2d(c, bottleneck, kernel_size=1)
+        self.refine = nn.Conv2d(bottleneck, bottleneck, kernel_size=3, padding=1)
+        self.proj_out = nn.Conv2d(bottleneck, c, kernel_size=1)
+        self.act = nn.GELU()
+
+    def forward(self, feats: torch.Tensor) -> torch.Tensor:  # (B,C,Hf,Wf)->(B,C,f*Hf,f*Wf)
+        y = self.act(self.proj_in(feats))
+        y = F.interpolate(y, scale_factor=self.factor, mode="bilinear", align_corners=False)
+        y = self.act(self.refine(y))
+        return self.proj_out(y)
+
+
 class ParticleState(TypedDict):
     pos: torch.Tensor        # (B, N, 2) pixel coordinates (x, y)
     vel: torch.Tensor        # (B, N, 2) last realized velocity (normalized units / frame)
@@ -61,8 +105,10 @@ VEL_CLAMP = 0.2
 class TransitionModel(nn.Module):
     """Predict the next position distribution from state alone.
 
-    Builds a particle token from ``[appearance, hidden, pos, velocity]``, couples
-    tokens across the N points with ``depth`` self-attention blocks (the
+    Builds a particle token from ``[appearance, hidden, pos, velocity]`` (plus,
+    with ``vis_input``, the point's current visibility belief — so the dynamics
+    can condition on "am I currently blind" and lean on neighbours accordingly),
+    couples tokens across the N points with ``depth`` self-attention blocks (the
     inter-point rigidity prior that carries occluded points on their neighbours'
     motion), advances a per-point GRU, and reads out a normalized displacement
     mean + log-variance.
@@ -76,10 +122,12 @@ class TransitionModel(nn.Module):
     """
 
     def __init__(self, c_dim: int, ds: int, dh: int, n_heads: int = 4, depth: int = 2,
-                 max_step: float = 0.12) -> None:
+                 max_step: float = 0.12, vis_input: bool = False) -> None:
         super().__init__()
         self.max_step = max_step          # max learned residual displacement (normalized units)
-        self.to_token = nn.Linear(c_dim + dh + 4, ds)   # +2 pos, +2 velocity
+        self.vis_input = bool(vis_input)
+        in_dim = c_dim + dh + 4 + (1 if self.vis_input else 0)  # +2 pos, +2 velocity, +1 vis belief
+        self.to_token = nn.Linear(in_dim, ds)
         self.blocks = nn.ModuleList()
         for _ in range(max(depth, 1)):
             self.blocks.append(nn.ModuleDict({
@@ -100,7 +148,10 @@ class TransitionModel(nn.Module):
         b, n, _ = state["pos"].shape
         pos_n = normalize_coords(state["pos"], hw)                      # (B,N,2) in [-1,1]
         vel = state["vel"]                                             # (B,N,2) normalized / frame
-        tok = self.to_token(torch.cat([state["feat"], state["hidden"], pos_n, vel], dim=-1))  # (B,N,Ds)
+        parts = [state["feat"], state["hidden"], pos_n, vel]
+        if self.vis_input:
+            parts.append(torch.sigmoid(state["vis_logit"]))            # (B,N,1) visibility belief
+        tok = self.to_token(torch.cat(parts, dim=-1))                  # (B,N,Ds)
         kpm = (~point_mask) if point_mask is not None else None         # True == ignore
         for blk in self.blocks:
             x = blk["norm1"](tok)
@@ -116,34 +167,53 @@ class TransitionModel(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-# Observation model (correction from the next frame — local cost-volume)
+# Observation model (correction from the next frame — coarse-to-fine cost volume)
 # --------------------------------------------------------------------------- #
 class ObservationModel(nn.Module):
     """Localize each point in the next frame by matching its (frozen, query-frame)
-    appearance template against a local window of the next frame's features.
+    appearance template against the frame's features.
 
-    **Cost-volume soft-argmax (the position correction).** The previous version
-    regressed the correction with a free ``max_corr * tanh(linear)`` head off a
-    pooled cross-attention vector — nothing tied the emitted offset to *where* the
-    template actually matched, so training sculpted it into a saturated near-constant
-    that merely cancelled the (also-degenerate) prior, freezing the output at the
-    query. We replace it with an explicit correlation soft-argmax: a learnable
-    matching projection (init identity) maps template + window features into a
-    matching space, cosine similarity gives a per-position score, and the
-    correction is the score-softmax-weighted **average window offset**. This is
-    *structurally bounded to the search window* — a constant offset is no longer
-    expressible unless the correlation surface is genuinely flat. A small,
-    zero-init learned residual (``max_corr``, default 0) can refine sub-cell.
+    **Cost-volume soft-argmax (the position correction).** A learnable matching
+    projection (init identity) maps template + window features into a matching
+    space, cosine similarity gives a per-position score, and the correction is
+    the score-softmax-weighted **average window offset** — structurally bounded
+    to the search window. A small, zero-init learned residual (``max_corr``,
+    default 0) can refine sub-cell. The raw logits are exported
+    (``corr_logits``) so the loss can supervise the map directly with a
+    cross-entropy — a matcher gradient that does NOT pass through (and so is
+    never attenuated by) the Kalman gate.
 
-    The cross-attention trunk is kept only to read the window for the visibility /
+    **Coarse re-acquisition stage (``coarse=True``).** The fine window is
+    ±``radius_px`` around the prior — if the prior drifted further than that
+    during an occlusion, re-acquisition used to be structurally impossible. The
+    coarse stage correlates the template against the FULL feature grid, takes a
+    global soft-argmax, and re-centers the fine window toward it by a
+    confidence gate (zero-init, bias -2 → starts nearly closed, i.e. the old
+    prior-centered behaviour; it must *earn* the right to move the window).
+    Global map logits are exported for CE supervision.
+
+    **Head statistics (``stats=True``).** The visibility / gate / uncertainty
+    heads additionally read detached correlation-surface statistics (peak,
+    normalized entropy, top-1/2 margin, the prior's log-scale, and the coarse
+    stats when enabled) — the measurement-quality signals a Kalman gain should
+    be a function of, delivered explicitly instead of hoping the cross-attention
+    trunk learns to compute them.
+
+    The cross-attention trunk is kept to read the window for the visibility /
     Kalman-gate / uncertainty heads (those still want a learned summary)."""
 
+    #: number of detached scalar stats appended per point when ``stats`` is on
+    N_STATS_LOCAL = 4   # local peak, local entropy, local margin, prior log-scale
+    N_STATS_COARSE = 3  # global peak, global entropy, prior->coarse distance
+
     def __init__(self, c_dim: int, ds: int, n_heads: int = 4, k: int = 7, radius_px: float = 24.0,
-                 max_corr: float = 0.0) -> None:
+                 max_corr: float = 0.0, stats: bool = False, coarse: bool = False) -> None:
         super().__init__()
         self.k = k
         self.radius_px = radius_px
         self.max_corr = max_corr          # bound on the OPTIONAL learned residual (normalized); 0 disables
+        self.stats = bool(stats)
+        self.coarse = bool(coarse)
         # learnable matching metric on top of the frozen features (identity init =
         # raw cosine correspondence, a sane starting point for DINOv3 features).
         self.match_proj = nn.Linear(c_dim, c_dim, bias=False)
@@ -153,21 +223,29 @@ class ObservationModel(nn.Module):
         self.pos_enc = nn.Sequential(nn.Linear(2, c_dim), nn.GELU(), nn.Linear(c_dim, c_dim))
         self.cross = nn.MultiheadAttention(c_dim, n_heads, batch_first=True)
         self.norm = nn.LayerNorm(c_dim)
+        if self.coarse:
+            # its own (sharper) temperature: the global map must peak hard for the
+            # soft-argmax over the whole frame to mean anything.
+            self.coarse_logit_scale = nn.Parameter(torch.tensor(3.0))   # exp() ~= 20
+            # re-centering gate off detached coarse stats; zero-init weight + bias -2
+            # -> sigmoid ~0.12: starts (almost) prior-centered, opens with evidence.
+            self.coarse_gate_head = nn.Linear(self.N_STATS_COARSE + 1, 1)
+            nn.init.zeros_(self.coarse_gate_head.weight)
+            nn.init.constant_(self.coarse_gate_head.bias, -2.0)
         # Separate heads off a shared trunk so the visibility gradient doesn't
         # corrupt the position features; the uncertainty head reads a DETACHED
         # trunk (calibration only -- it must not perturb the matching features).
-        self.trunk = nn.Sequential(nn.Linear(c_dim, c_dim), nn.GELU())
+        n_stats = (self.N_STATS_LOCAL + (self.N_STATS_COARSE if self.coarse else 0)) if self.stats else 0
+        self.trunk = nn.Sequential(nn.Linear(c_dim + n_stats, c_dim), nn.GELU())
         self.corr_head = nn.Linear(c_dim, 2)
         self.vis_head = nn.Linear(c_dim, 1)
         # The Kalman gate (how much to trust the observation) is a SEPARATE head
-        # from the visibility logit. Tying them — as an earlier version did, using
-        # sigmoid(vis_logit) as the blend weight — let the visibility BCE (many
-        # points are genuinely occluded) drag the gate toward 0. It is now
-        # initialised NEUTRAL (bias 0 -> sigmoid 0.5): the prior is a competent
-        # constant-velocity smoother and the observation is a bounded localizer, so
-        # the gate must be free to learn a LOW gain where the frozen-feature match
-        # is noisier than the per-frame motion (slow scenes) and a high gain where
-        # it is informative (fast motion) — the previous bias 2.0 pinned it open.
+        # from the visibility logit (tying them let the visibility BCE drag the
+        # gate toward 0). Initialised NEUTRAL (bias 0 -> sigmoid 0.5): the prior is
+        # a competent constant-velocity smoother and the observation is a bounded
+        # localizer, so the gate must be free to learn a LOW gain where the match
+        # is noisier than the per-frame motion and a high gain where it is
+        # informative. With ``stats`` it sees the correlation quality directly.
         self.gate_head = nn.Linear(c_dim, 1)
         self.logvar_head = nn.Linear(c_dim, 2)
         nn.init.zeros_(self.corr_head.weight); nn.init.zeros_(self.corr_head.bias)
@@ -187,33 +265,95 @@ class ObservationModel(nn.Module):
         scale = off_px.new_tensor([2.0 / max(w - 1, 1), 2.0 / max(h - 1, 1)])
         return off_px * scale                                              # (k*k,2) normalized
 
-    def forward(self, prior_mean, tokens, feat_template, feats_next, hw):
+    @staticmethod
+    def _grid_centers_px(hf: int, wf: int, hw, device, dtype) -> torch.Tensor:
+        """Feature-cell centers in pixel coords, matching the align_corners=True
+        convention of :func:`normalize_coords` (cell (0,0) -> pixel (0,0), cell
+        (hf-1,wf-1) -> pixel (h-1,w-1))."""
+        h, w = hw
+        xs = torch.linspace(0, w - 1, wf, device=device, dtype=dtype)
+        ys = torch.linspace(0, h - 1, hf, device=device, dtype=dtype)
+        gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+        return torch.stack([gx, gy], dim=-1).reshape(hf * wf, 2)          # (Hf*Wf, 2) px
+
+    @staticmethod
+    def _softmax_stats(p: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(peak, normalized entropy, top1-top2 margin) of a prob map ``p (...,M)``,
+        each ``(...,1)`` and DETACHED (head inputs must not shape the matcher)."""
+        m = p.shape[-1]
+        peak = p.max(dim=-1, keepdim=True).values
+        ent = -(p * (p + 1e-9).log()).sum(-1, keepdim=True) / torch.log(
+            torch.tensor(float(m), device=p.device, dtype=p.dtype))
+        top2 = p.topk(2, dim=-1).values
+        margin = top2[..., :1] - top2[..., 1:2]
+        return peak.detach(), ent.detach(), margin.detach()
+
+    def forward(self, prior_mean, tokens, feat_template, feats_next, hw,
+                prior_logvar: Optional[torch.Tensor] = None):
         b, n, _ = prior_mean.shape
         c = feat_template.shape[-1]
         kk = self.k * self.k
-        win = sample_window(feats_next, prior_mean, hw, self.k, self.radius_px)  # (B,N,k*k,C)
-        off_n = self._offsets_normalized(hw, prior_mean.device, prior_mean.dtype)  # (k*k,2) normalized
-
-        # --- cost-volume soft-argmax localization (bounded to the window) ---
         tpl = F.normalize(self.match_proj(feat_template), dim=-1)                # (B,N,C)
+        # prior log-scale: the calibrated "how lost am I" signal (grows over a
+        # coasted occlusion) — detached: heads read it, they don't train it.
+        if prior_logvar is not None:
+            pls = 0.5 * prior_logvar.mean(-1, keepdim=True).detach()             # (B,N,1)
+        else:
+            pls = prior_mean.new_zeros(b, n, 1)
+        extras: Dict[str, torch.Tensor] = {}
+
+        # --- coarse re-acquisition: template vs the FULL grid, gated re-centering ---
+        center = prior_mean
+        coarse_stats = None
+        if self.coarse:
+            hf, wf = int(feats_next.shape[-2]), int(feats_next.shape[-1])
+            featm = self.match_proj(feats_next.permute(0, 2, 3, 1).reshape(b, hf * wf, c))
+            featm = F.normalize(featm, dim=-1)                                   # (B,Hf*Wf,C)
+            glog = torch.bmm(tpl, featm.transpose(1, 2)) * self.coarse_logit_scale.exp()  # (B,N,Hf*Wf)
+            gp = glog.softmax(dim=-1)
+            centers_px = self._grid_centers_px(hf, wf, hw, glog.device, glog.dtype)
+            coarse_xy = gp @ centers_px                                          # (B,N,2) px
+            gpeak, gent, _ = self._softmax_stats(gp)
+            dist = (normalize_coords(coarse_xy, hw)
+                    - normalize_coords(prior_mean, hw)).norm(dim=-1, keepdim=True).detach()
+            cg = torch.sigmoid(self.coarse_gate_head(
+                torch.cat([gpeak, gent, dist, pls], dim=-1)))                     # (B,N,1)
+            center = prior_mean + cg * (coarse_xy - prior_mean)
+            coarse_stats = [gpeak, gent, dist]
+            extras["gcorr_logits"] = glog
+            extras["feat_hw"] = (hf, wf)
+            extras["coarse_gate"] = cg
+
+        # --- local cost-volume soft-argmax localization (bounded to the window) ---
+        win = sample_window(feats_next, center, hw, self.k, self.radius_px)      # (B,N,k*k,C)
+        off_n = self._offsets_normalized(hw, prior_mean.device, prior_mean.dtype)  # (k*k,2) normalized
         winm = F.normalize(self.match_proj(win), dim=-1)                         # (B,N,k*k,C)
         corr_vol = (winm * tpl.unsqueeze(2)).sum(-1) * self.logit_scale.exp()    # (B,N,k*k)
         wsm = corr_vol.softmax(dim=-1)                                           # (B,N,k*k)
         corr = (wsm.unsqueeze(-1) * off_n.view(1, 1, kk, 2)).sum(2)              # (B,N,2) normalized
+        extras["corr_logits"] = corr_vol
+        extras["win_center"] = center
 
         # --- learned read of the window for the vis / gate / uncertainty heads ---
         kv = win + self.pos_enc(off_n).reshape(1, 1, kk, c)                      # inject offset (normalized units)
         q = self.q_proj(torch.cat([tokens, feat_template], dim=-1)).reshape(b * n, 1, c)
         ev, _ = self.cross(q, kv.reshape(b * n, kk, c), kv.reshape(b * n, kk, c), need_weights=False)
         ev = self.norm(ev.reshape(b, n, c))
-        h = self.trunk(ev)
+        if self.stats:
+            lpeak, lent, lmarg = self._softmax_stats(wsm)
+            feats_in = [ev, lpeak, lent, lmarg, pls]
+            if coarse_stats is not None:
+                feats_in += coarse_stats
+            h = self.trunk(torch.cat(feats_in, dim=-1))
+        else:
+            h = self.trunk(ev)
         if self.max_corr > 0:                                                    # optional zero-init sub-cell refine
             corr = corr + self.max_corr * torch.tanh(self.corr_head(h))
-        post_mean = denormalize_coords(normalize_coords(prior_mean, hw) + corr, hw)
+        post_mean = denormalize_coords(normalize_coords(center, hw) + corr, hw)
         vis_logit = self.vis_head(h)
         gate_logit = self.gate_head(h)                                           # Kalman gate (decoupled from vis)
         post_logvar = self.logvar_head(h.detach()).clamp(LOGVAR_MIN, LOGVAR_MAX)  # calibration only
-        return post_mean, post_logvar, vis_logit, gate_logit
+        return post_mean, post_logvar, vis_logit, gate_logit, extras
 
 
 # --------------------------------------------------------------------------- #
@@ -229,22 +369,36 @@ class TrackerWorldModel(nn.Module):
         obs_radius_px: float = 24.0,
         obs_heads: int = 4,
         obs_max_corr: float = 0.0,
+        obs_stats: bool = False,
+        obs_coarse: bool = False,
         trans_heads: int = 4,
         trans_depth: int = 2,
         trans_max_step: float = 0.12,
+        trans_vis_input: bool = False,
         uncertainty: bool = True,
         encode_chunk: int = 32,
         rollout_vel_decay: float = 1.0,
+        feat_upsample: bool = False,
+        feat_upsample_factor: int = 2,
+        feat_upsample_bottleneck: int = 256,
         verbose: bool = True,
         **kwargs,
     ) -> None:
         super().__init__()
         self.encoder = encoder
         c = encoder.feature_dim
+        # Optional learned finer feature grid (precision lever; None = v1 behaviour).
+        # Lives here (not on the frozen encoder) so its params land in the trainable
+        # LR group, not the encoder group.
+        self.feat_upsampler = (
+            FeatureUpsampler(c, feat_upsample_factor, feat_upsample_bottleneck)
+            if feat_upsample else None
+        )
         self.transition = TransitionModel(c, token_dim, hidden_dim, trans_heads, trans_depth,
-                                          max_step=trans_max_step)
+                                          max_step=trans_max_step, vis_input=trans_vis_input)
         self.observation = ObservationModel(c, token_dim, obs_heads, obs_k, obs_radius_px,
-                                            max_corr=obs_max_corr)
+                                            max_corr=obs_max_corr, stats=obs_stats,
+                                            coarse=obs_coarse)
         self.dh = hidden_dim
         self.uncertainty = uncertainty
         self.encode_chunk = encode_chunk
@@ -278,17 +432,44 @@ class TrackerWorldModel(nn.Module):
         vel = normalize_coords(new_pos, hw) - normalize_coords(prev_pos, hw)
         return vel.clamp(-VEL_CLAMP, VEL_CLAMP).detach()
 
-    def step(self, state, feats_next, hw, point_mask=None, use_observation=True):
+    def step(self, state, feats_next, hw, point_mask=None, use_observation=True,
+             obs_point_mask: Optional[torch.Tensor] = None):
+        """One filter step.
+
+        ``use_observation=False`` -> pure frame-free rollout for every point.
+        ``obs_point_mask`` (B or 1, N, 1) float in {0,1}: PER-POINT observation
+        gating — the training-time simulation of real occlusion (some points
+        blinded while their neighbours keep observing and, through the
+        transition's self-attention, carry them). Masked points take the prior
+        and keep their previous visibility belief; the observation branch is
+        computed for all points (it must be — neighbours need the frame) but is
+        *applied* only where the mask is 1.
+        """
         prior_mean, prior_logvar, new_hidden, tokens = self.transition(state, hw, point_mask)
+        extras: Dict[str, torch.Tensor] = {}
         if use_observation:
-            post_mean, post_logvar, vis_logit, gate_logit = self.observation(
-                prior_mean, tokens, state["feat"], feats_next, hw)
-            g = torch.sigmoid(gate_logit)                      # Kalman gain (trained by position loss)
-            pos = g * post_mean + (1.0 - g) * prior_mean
+            post_mean, post_logvar, vis_logit_o, gate_logit_o, extras = self.observation(
+                prior_mean, tokens, state["feat"], feats_next, hw, prior_logvar)
+            g = torch.sigmoid(gate_logit_o)                    # Kalman gain (trained by position loss)
+            pos_obs = g * post_mean + (1.0 - g) * prior_mean
+            if obs_point_mask is None:
+                pos = pos_obs
+                vis_logit, gate_logit = vis_logit_o, gate_logit_o
+                obs_applied = prior_mean.new_ones(prior_mean.shape[:-1] + (1,))
+            else:                                              # per-point simulated occlusion
+                m = obs_point_mask.to(pos_obs.dtype)
+                pos = m * pos_obs + (1.0 - m) * prior_mean
+                vis_logit = m * vis_logit_o + (1.0 - m) * state["vis_logit"]
+                gate_logit = m * gate_logit_o + (1.0 - m) * gate_logit_o.new_full(
+                    gate_logit_o.shape, -10.0)
+                post_logvar = m * post_logvar + (1.0 - m) * prior_logvar
+                obs_applied = m.expand(prior_mean.shape[:-1] + (1,)).to(prior_mean.dtype)
         else:  # frame-free rollout: no observation -> trust the prior (gate closed)
             post_mean, post_logvar = prior_mean, prior_logvar
-            vis_logit, gate_logit = state["vis_logit"], prior_mean.new_zeros(prior_mean.shape[:-1] + (1,)) - 10.0
             pos = prior_mean
+            vis_logit = state["vis_logit"]
+            gate_logit = prior_mean.new_zeros(prior_mean.shape[:-1] + (1,)) - 10.0
+            obs_applied = prior_mean.new_zeros(prior_mean.shape[:-1] + (1,))
         new_vel = self._advance(state["pos"], pos, hw)
         if not use_observation and self.rollout_vel_decay != 1.0:
             new_vel = new_vel * self.rollout_vel_decay          # friction: damp the frame-free runaway
@@ -296,17 +477,26 @@ class TrackerWorldModel(nn.Module):
                                   feat=state["feat"], hidden=new_hidden, vis_logit=vis_logit)
         out = dict(prior_mean=prior_mean, prior_logvar=prior_logvar,
                    post_mean=post_mean, post_logvar=post_logvar,
-                   vis_logit=vis_logit, gate_logit=gate_logit)
+                   vis_logit=vis_logit, gate_logit=gate_logit,
+                   obs_applied=obs_applied, extras=extras)
         return new_state, out
 
     # -- encoding ------------------------------------------------------------- #
     def _encode(self, frames: torch.Tensor) -> torch.Tensor:
-        """``frames (B,T,3,H,W)`` -> ``feats (B,T,C,Hf,Wf)`` (chunked)."""
+        """``frames (B,T,3,H,W)`` -> ``feats (B,T,C,Hf,Wf)`` (chunked).
+
+        With ``feat_upsampler`` enabled the frozen features are lifted to a finer
+        grid (larger Hf,Wf, same C) per chunk before returning; grads flow to the
+        upsampler even though the encoder output is detached (frozen).
+        """
         b, t = frames.shape[:2]
         flat = frames.reshape(b * t, *frames.shape[2:])
         outs: List[torch.Tensor] = []
         for i in range(0, flat.shape[0], self.encode_chunk):
-            outs.append(self.encoder(flat[i:i + self.encode_chunk]))
+            f = self.encoder(flat[i:i + self.encode_chunk])
+            if self.feat_upsampler is not None:
+                f = self.feat_upsampler(f)
+            outs.append(f)
         feats = torch.cat(outs, dim=0)
         return feats.reshape(b, t, *feats.shape[1:])
 
@@ -326,42 +516,87 @@ class TrackerWorldModel(nn.Module):
         b, t = frames.shape[:2]
         h, w = int(frames.shape[-2]), int(frames.shape[-1])
         hw = (h, w)
+        n = queries.shape[1]
         feats = self._encode(frames)                              # (B,T,C,Hf,Wf)
 
         qf = int(queries[0, 0, 0].item())                         # query frame (constant per clip)
+        # Every real query in the batch must share that frame — the recurrence
+        # starts once per forward. Padded query rows are all-zero and pass the
+        # check (qf==0 batches trivially satisfy it).
+        qtimes = queries[..., 0]
+        if not bool(((qtimes == qf) | (qtimes == 0)).all()):
+            raise ValueError("all queries in a batch must share one query frame "
+                             f"(got frames {torch.unique(qtimes).tolist()})")
         qf = max(0, min(qf, t - 1))
         query_xy = queries[..., 1:]                               # (B,N,2)
         state = self.init_state(query_xy, feats[:, qf], hw)
 
-        zlv = query_xy.new_full((b, query_xy.shape[1], 2), LOGVAR_MIN)
-        vis_obs = query_xy.new_full((b, query_xy.shape[1], 1), 4.0)   # query frame is observed
-        gate_obs = query_xy.new_full((b, query_xy.shape[1], 1), 4.0)  # query frame fully observed
-        rec = {k: [None] * t for k in
-               ("coords", "prior_mean", "prior_logvar", "post_logvar", "vis_logits", "gate_logits")}
+        kk = self.observation.k ** 2
+        coarse = self.observation.coarse
+        record_gcorr = coarse and self.training                   # big map: train-time only
+        hf, wf = int(feats.shape[-2]), int(feats.shape[-1])
 
-        def put(ti, coords, pm, plv, polv, vl, gl):
+        zlv = query_xy.new_full((b, n, 2), LOGVAR_MIN)
+        vis_obs = query_xy.new_full((b, n, 1), 4.0)   # query frame is observed
+        gate_obs = query_xy.new_full((b, n, 1), 4.0)  # query frame fully observed
+        keys = ["coords", "prior_mean", "prior_logvar", "post_logvar", "vis_logits",
+                "gate_logits", "observed", "corr_valid", "corr_logits", "win_center"]
+        if record_gcorr:
+            keys.append("gcorr_logits")
+        if coarse:
+            keys.append("coarse_gate")
+        rec: Dict[str, list] = {k: [None] * t for k in keys}
+
+        def zeros_for(key):
+            if key == "corr_logits":
+                return query_xy.new_zeros(b, n, kk)
+            if key == "gcorr_logits":
+                return query_xy.new_zeros(b, n, hf * wf)
+            return query_xy.new_zeros(b, n, 1)        # observed / corr_valid / coarse_gate
+
+        def put(ti, *, coords, pm, plv, polv, vl, gl, obs_applied=None, corr_valid=0.0,
+                extras=None):
             rec["coords"][ti] = coords; rec["prior_mean"][ti] = pm
             rec["prior_logvar"][ti] = plv; rec["post_logvar"][ti] = polv
             rec["vis_logits"][ti] = vl; rec["gate_logits"][ti] = gl
+            rec["observed"][ti] = (obs_applied if obs_applied is not None
+                                   else query_xy.new_ones(b, n, 1))
+            rec["corr_valid"][ti] = query_xy.new_full((b, n, 1), float(corr_valid))
+            ex = extras or {}
+            rec["corr_logits"][ti] = ex.get("corr_logits", zeros_for("corr_logits"))
+            rec["win_center"][ti] = ex.get("win_center", coords)
+            if record_gcorr:
+                rec["gcorr_logits"][ti] = ex.get("gcorr_logits", zeros_for("gcorr_logits"))
+            if coarse:
+                rec["coarse_gate"][ti] = ex.get("coarse_gate", zeros_for("coarse_gate"))
 
-        # frames before the query frame: emit the (frozen) query as a placeholder
-        for ti in range(qf):
-            put(ti, query_xy, query_xy, zlv, zlv, vis_obs, gate_obs)
-        put(qf, query_xy, query_xy, zlv, zlv, vis_obs, gate_obs)  # query frame itself
+        # frames up to and including the query frame: emit the (frozen) query
+        for ti in range(qf + 1):
+            put(ti, coords=query_xy, pm=query_xy, plv=zlv, polv=zlv, vl=vis_obs, gl=gate_obs)
 
         for ti in range(qf + 1, t):
-            # ``observe_mask`` (B,) or (T,) takes precedence: training-time observation
-            # dropout drops the frame correction at masked steps so the loss there
-            # trains the prior directly (the occlusion curriculum). Falls back to the
-            # contiguous ``observe_steps`` forecast horizon used by rollout eval.
+            # ``observe_mask`` takes precedence: training-time observation dropout.
+            #   (T,) bool  -> whole-frame drop (all points coast together);
+            #   (T,N) bool -> PER-POINT drop (simulated occlusion: masked points coast
+            #                 on the transition + neighbours while the rest observe).
+            # Falls back to the contiguous ``observe_steps`` horizon of rollout eval.
+            opm = None
             if observe_mask is not None:
-                observe = bool(observe_mask[ti])
+                om = observe_mask[ti]
+                if om.dim() == 0:
+                    observe = bool(om)
+                else:                                          # (N,) per-point row
+                    observe = bool(om.any())
+                    opm = None if bool(om.all()) else om.reshape(1, n, 1)
             else:
                 observe = observe_steps is None or (ti - qf) <= observe_steps
             prev_pos = state["pos"]
-            state, o = self.step(state, feats[:, ti], hw, point_mask, use_observation=observe)
-            put(ti, state["pos"], o["prior_mean"], o["prior_logvar"],
-                o["post_logvar"], o["vis_logit"], o["gate_logit"])
+            state, o = self.step(state, feats[:, ti] if observe else None, hw, point_mask,
+                                 use_observation=observe, obs_point_mask=opm)
+            put(ti, coords=state["pos"], pm=o["prior_mean"], plv=o["prior_logvar"],
+                polv=o["post_logvar"], vl=o["vis_logit"], gl=o["gate_logit"],
+                obs_applied=o["obs_applied"], corr_valid=1.0 if observe else 0.0,
+                extras=o["extras"])
             # Scheduled sampling: with per-point probability ``tf_prob`` feed the GT
             # position into the NEXT step (the recorded ``coords`` above is always the
             # model's own prediction, so the loss still penalises it). Annealing
@@ -383,8 +618,18 @@ class TrackerWorldModel(nn.Module):
             "coord_logvar": torch.stack(rec["post_logvar"], dim=1),   # (B,T,N,2)
             "vis_logits": torch.stack(rec["vis_logits"], dim=1).squeeze(-1),    # (B,T,N)
             "gate_logits": torch.stack(rec["gate_logits"], dim=1).squeeze(-1),  # (B,T,N)
+            "observed": torch.stack(rec["observed"], dim=1).squeeze(-1),        # (B,T,N)
+            "corr_valid": torch.stack(rec["corr_valid"], dim=1).squeeze(-1),    # (B,T,N)
+            "corr_logits": torch.stack(rec["corr_logits"], dim=1),    # (B,T,N,k*k)
+            "win_center": torch.stack(rec["win_center"], dim=1),      # (B,T,N,2)
+            "corr_grid": (self.observation.k, self.observation.radius_px),
             "frame_hw": hw,
         }
+        if record_gcorr:
+            out["gcorr_logits"] = torch.stack(rec["gcorr_logits"], dim=1)  # (B,T,N,Hf*Wf)
+            out["feat_hw"] = (hf, wf)
+        if coarse:
+            out["coarse_gate"] = torch.stack(rec["coarse_gate"], dim=1).squeeze(-1)  # (B,T,N)
 
         # --- optional differentiable multi-step rollout supervision -------------
         # Mirrors the rollout-eval protocol (observe ``rollout_observe`` real frames

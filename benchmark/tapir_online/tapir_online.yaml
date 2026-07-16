@@ -1,0 +1,69 @@
+# Benchmark config: Online / causal TAPIR (Online BootsTAPIR, PyTorch) on the
+# TWIST eval datasets.
+#
+# W&B-sweep format like every config in the repo. Runs TAPIR through the *same*
+# evaluator the TWIST model uses, so metrics are directly comparable to the
+# offline `bootstapir` baseline in benchmark/tapir/.
+#
+#   python benchmark/tapir_online/tapir_online.py                     # uses this file
+#   python benchmark/tapir_online/tapir_online.py --datasets TAPVID_DAVIS --max-clips 5   # smoke
+parameters:
+
+  ###===========================================================================
+  ### RUN / W&B
+  ###===========================================================================
+  EXPERIMENT_NAME:
+    value: tapir_online
+  WANDB_PROJECT:
+    value: twist
+  WANDB_ENTITY:
+    value: twisteam
+  WANDB_TAGS:
+    value: [benchmark]
+
+  ###===========================================================================
+  ### GEOMETRY
+  ### Online BootsTAPIR is trained at 256²(+512²). Online tracking builds a
+  ### per-frame cost volume each step, so 256 is the safe default; 512 works but
+  ### is markedly heavier. Match whatever geometry you compare against.
+  ###===========================================================================
+  CROP:
+    value: null
+  IMAGE_SIZE:
+    value: 256
+
+  ###===========================================================================
+  ### ONLINE TAPIR MODEL (causal). VARIANT selects the weights filename under
+  ### weights/tapir/. The checkpoint MUST be the *causal* one — the offline
+  ### bootstapir_checkpoint_v2.pt will load with mismatched keys and mistrack.
+  ###===========================================================================
+  TAPIR_ONLINE:
+    value:
+      VARIANT: causal_bootstapir
+      CHECKPOINT: weights/tapir/causal_bootstapir.pt
+      # PyTorch Online BootsTAPIR checkpoint (download manually first, see SETUP_TRACKERS.md):
+      CHECKPOINT_URL: https://storage.googleapis.com/dm-tapnet/bootstap/causal_bootstapir_checkpoint.pt
+      MODEL_KWARGS:
+        pyramid_level: 1
+        extra_convs: true
+        softmax_temperature: 10.0
+        bilinear_interp_with_depthwise_conv: false
+        use_casual_conv: true            # sic: upstream field name; enables the causal temporal conv
+
+  ###===========================================================================
+  ### EVAL PROTOCOL
+  ###===========================================================================
+  EVAL_QUERY_MODE:
+    value: first
+  EVAL_TIMING_BATCHES:
+    value: 0                # skip extra timing forward (online TAPIR is already heavy)
+  EVAL_RECOVERY:
+    value: true
+  EVAL_RECOVERY_WINDOW:
+    value: 8
+  EVAL_AMP:
+    value: false
+  EVAL_BATCH_SIZE:
+    value: 1
+  EVAL_WORKERS:
+    value: 4

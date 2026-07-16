@@ -1,0 +1,60 @@
+# Benchmark config: MFTIQ (Multi-Flow Tracker w/ Independent Matching Quality,
+# WACV 2025) on the TWIST eval datasets.
+#
+# W&B-sweep format like every config in the repo. The benchmark script runs MFTIQ
+# through the *same* evaluator the TWIST model uses, so the metrics are directly
+# comparable (and comparable to the 'mft' baseline: same dense forward
+# flow-chaining, but a decoupled learned occlusion/uncertainty module). Dense,
+# online/causal; works at the fed resolution, so predictions line up with GT at
+# TARGET_SIZE with no rescale (see benchmark/mftiq/mftiq.py).
+#
+#   python benchmark/mftiq/mftiq.py --datasets TAPVID_DAVIS --max-clips 3 --no-wandb   # smoke
+parameters:
+
+  ###===========================================================================
+  ### RUN / W&B
+  ###===========================================================================
+  EXPERIMENT_NAME:
+    value: mftiq
+  WANDB_PROJECT:
+    value: twist
+  WANDB_ENTITY:
+    value: twisteam
+  WANDB_TAGS:
+    value: [benchmark]
+
+  ###===========================================================================
+  ### GEOMETRY  (MFTIQ tracks at the fed resolution; no internal resize.)
+  ###===========================================================================
+  CROP:
+    value: null
+  IMAGE_SIZE:
+    value: 512
+
+  ###===========================================================================
+  ### MFTIQ MODEL. CONFIG is resolved relative to the clone root
+  ### (benchmark/methods/MFTIQ); the UOM + flow checkpoints it names must have
+  ### been fetched into that clone's checkpoints/ via download_model.sh (see
+  ### benchmark/README.md). Default = the RAFT-flow variant (closest to 'mft').
+  ### OCCLUSION_THRESHOLD: visible when the occlusion score (0..1) is <= this.
+  ###===========================================================================
+  MFTIQ:
+    value:
+      CONFIG: configs/MFTIQ4_RAFT_200k_cfg.py
+      OCCLUSION_THRESHOLD: 0.5
+
+  ###===========================================================================
+  ### EVAL PROTOCOL
+  ###===========================================================================
+  EVAL_QUERY_MODE:
+    value: first
+  EVAL_RECOVERY:
+    value: true
+  EVAL_RECOVERY_WINDOW:
+    value: 8
+  EVAL_AMP:
+    value: false
+  EVAL_BATCH_SIZE:
+    value: 1
+  EVAL_WORKERS:
+    value: 6

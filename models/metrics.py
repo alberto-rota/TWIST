@@ -49,17 +49,30 @@ def tracking_metrics(
     thresholds=TAP_THRESHOLDS,
     query_frame: int = 0,
     eval_mask: Optional[torch.Tensor] = None,
+    visible_only: bool = False,
 ) -> Dict[str, float]:
     """``eval_mask`` (B,T,N) bool, when given, is the set of **evaluation points**
     (the TAP-Vid ``evaluation_points``) and *replaces* the ``time_mask``⊗``point_mask``
     outer product. Use it to express per-point eval regions the outer product can't —
     e.g. TAP-Vid "queried first" scores only frames *after* each point's own query
     frame (see :mod:`utilities.evaluation`). Visibility is still applied on top, so
-    occluded GT frames inside the region count only toward OA / Jaccard-FP, never EPE."""
+    occluded GT frames inside the region count only toward OA / Jaccard-FP, never EPE.
+
+    ``visible_only`` restricts the evaluation region to frames where GT is **visible**
+    (``exist &= gt_vis``). Set it for datasets whose visibility GT is *sparse* — present
+    only on annotated frames, with every other frame marked occluded merely because it
+    is *unlabelled*, not genuinely hidden (STIR: GT only at the first/last frame). Left
+    off (the default, for TAP-Vid / Kubric where "occluded" is a real label) an occluded
+    evaluated frame the model predicts visible is a Jaccard false-positive and an OA
+    miss — correct there, but for STIR it turns every unlabelled interior frame into a
+    spurious FP/miss and collapses AJ/OA to ~0. It does **not** change EPE or δ (both
+    already sum over ``gt_vis & exist`` only)."""
     coords = coords.float(); gt_tracks = gt_tracks.float()
     gt_vis_b = gt_vis.bool()
     exist = (eval_mask.bool() if eval_mask is not None
              else _exist_mask(gt_vis, time_mask, point_mask).bool())
+    if visible_only:
+        exist = exist & gt_vis_b               # sparse-GT datasets: score only annotated (visible) frames
     pred_vis = (torch.sigmoid(vis_logits) > 0.5)
 
     dist = torch.linalg.norm(coords - gt_tracks, dim=-1)       # (B,T,N) px
@@ -82,6 +95,7 @@ def tracking_metrics(
         stuck_frac = ((pred_disp < 2.0) & moving).float().sum().item() / moving.float().sum().clamp_min(1).item()
     else:
         motion_ratio = float("nan"); stuck_frac = float("nan")
+        pred_travel = float("nan"); gt_travel = float("nan")
 
     deltas, jaccards = [], []
     per_threshold: Dict[str, float] = {}
@@ -110,7 +124,13 @@ def tracking_metrics(
         "delta_avg": _nanmean(deltas),
         "occlusion_accuracy": occ_acc,
         "average_jaccard": _nanmean(jaccards),
-        "motion_ratio": motion_ratio,
+        "motion_ratio": motion_ratio,          # per-batch ratio-of-means (unstable; see below)
+        # pred/GT travel are returned separately so callers can POOL across batches
+        # (Σpred/Σgt) instead of averaging the per-batch ratio — a single near-static
+        # clip drives gt_travel→0 and blows the per-batch ratio into the hundreds,
+        # which the arithmetic mean-of-ratios then inflates (the ~40 artifact).
+        "pred_travel": pred_travel,
+        "gt_travel": gt_travel,
         "stuck_frac": stuck_frac,
         **per_threshold,
     }

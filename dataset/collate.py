@@ -75,6 +75,8 @@ def pad_collate(batch: List[Dict]) -> Dict:
 
     out["tracks"] = torch.stack([_pad_tn(b["tracks"]) for b in batch])
     out["visibility"] = torch.stack([_pad_tn(b["visibility"], fill=False) for b in batch])
+    if "pos_valid" in batch[0]:
+        out["pos_valid"] = torch.stack([_pad_tn(b["pos_valid"], fill=False) for b in batch])
 
     Nq = N
     queries = []

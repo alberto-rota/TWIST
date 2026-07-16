@@ -1,0 +1,57 @@
+# Benchmark config: Track-On (online / causal) on the TWIST eval datasets.
+#
+# W&B-sweep format like every config in the repo. The benchmark script runs
+# Track-On through the *same* evaluator the TWIST model uses, so the metrics are
+# directly comparable.
+#
+#   python benchmark/trackon/trackon.py                       # uses this file
+#   python benchmark/trackon/trackon.py --datasets TAPVID_DAVIS --max-clips 5   # smoke
+parameters:
+
+  ###===========================================================================
+  ### RUN / W&B
+  ###===========================================================================
+  EXPERIMENT_NAME:
+    value: track_on
+  WANDB_PROJECT:
+    value: twist
+  WANDB_ENTITY:
+    value: twisteam
+  WANDB_TAGS:
+    value: [benchmark]
+
+  ###===========================================================================
+  ### GEOMETRY
+  ###===========================================================================
+  CROP:
+    value: null
+  IMAGE_SIZE:
+    value: 512
+
+  ###===========================================================================
+  ### TRACK-ON MODEL
+  ###===========================================================================
+  TRACKON:
+    value:
+      CHECKPOINT: weights/trackon/track_on_r.pt
+      # CONFIG: optional path to a model-args YAML (Track-On's config/test.yaml
+      # style). Leave unset to use the Predictor's built-in defaults (DINOv3-s+),
+      # which match the released track_on_r / track_on2 architecture.
+      CONFIG: null
+      SUPPORT_GRID_SIZE: 20     # uniform grid of support points at frame 0 (stability)
+
+  ###===========================================================================
+  ### EVAL PROTOCOL
+  ###===========================================================================
+  EVAL_QUERY_MODE:
+    value: first
+  EVAL_RECOVERY:
+    value: true
+  EVAL_RECOVERY_WINDOW:
+    value: 8
+  EVAL_AMP:
+    value: false
+  EVAL_BATCH_SIZE:
+    value: 1          # Track-On is batch-1 internally; this just sizes the loader
+  EVAL_WORKERS:
+    value: 8

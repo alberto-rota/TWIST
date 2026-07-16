@@ -1,0 +1,59 @@
+# Benchmark config: TAPTRv3 on the TWIST eval datasets.
+#
+# W&B-sweep format like every config in the repo. The benchmark script runs
+# TAPTRv3 through the *same* evaluator the TWIST model uses, so the metrics are
+# directly comparable.
+#
+#   python benchmark/taptr/taptr.py                       # uses this file
+#   python benchmark/taptr/taptr.py --datasets TAPVID_DAVIS --max-clips 5   # smoke
+parameters:
+
+  ###===========================================================================
+  ### RUN / W&B
+  ###===========================================================================
+  EXPERIMENT_NAME:
+    value: taptr
+  WANDB_PROJECT:
+    value: twist
+  WANDB_ENTITY:
+    value: twisteam
+  WANDB_TAGS:
+    value: [benchmark]
+
+  ###===========================================================================
+  ### GEOMETRY  (resnet50 variant is trained at 512x512 -> keep IMAGE_SIZE 512)
+  ###===========================================================================
+  CROP:
+    value: null
+  IMAGE_SIZE:
+    value: 512
+
+  ###===========================================================================
+  ### TAPTR MODEL.  Requires the v3 branch checked out at benchmark/methods/TAPTR
+  ### and the custom CUDA ops compiled (see the sbatch note). CHECKPOINT is a
+  ### Google-Drive .pth (download manually). CONFIG points at the matching
+  ### TAPTRv3 config .py inside the source tree.
+  ###===========================================================================
+  TAPTR:
+    value:
+      CONFIG: benchmark/methods/TAPTR/config/TAPTRv3_resnet50_512x512.py
+      CHECKPOINT: weights/taptr/TAPTRv3_resnet50_512x512.pth
+      STREAMING: true          # causal sliding-window eval (TAPTR's default); false = offline forward
+      MINI_BOX_SIZE: 5.0       # query point -> mini-box side (px) seeding, matches TAPTR data pipeline
+      OCC_THRESHOLD: 0.45      # sigmoid(occlusion logit) > thr -> occluded (TAPTR eval default)
+
+  ###===========================================================================
+  ### EVAL PROTOCOL
+  ###===========================================================================
+  EVAL_QUERY_MODE:
+    value: first
+  EVAL_RECOVERY:
+    value: true
+  EVAL_RECOVERY_WINDOW:
+    value: 8
+  EVAL_AMP:
+    value: false
+  EVAL_BATCH_SIZE:
+    value: 1          # TAPTR is batch-1 internally
+  EVAL_WORKERS:
+    value: 8

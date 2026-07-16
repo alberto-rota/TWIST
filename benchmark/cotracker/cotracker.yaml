@@ -1,0 +1,65 @@
+# Benchmark config: CoTracker3 (offline, scaled) on the TWIST eval datasets.
+#
+# W&B-sweep format (parameters: {KEY: {value: ...}}) like every other config in
+# the repo, so it loads through utilities.config.load_and_process_config. The
+# benchmark script runs CoTracker through the *same* evaluator the TWIST model
+# uses (utilities.evaluation), so the logged metrics are directly comparable to
+# the TWIST runs' eval/* metrics.
+#
+#   python benchmark/cotracker.py                       # uses this file
+#   python benchmark/cotracker.py --image-size 256      # override IMAGE_SIZE
+#   python benchmark/cotracker.py --crop 0,0,854,480    # override native-pixel CROP
+#   python benchmark/cotracker.py --datasets TAPVID_DAVIS --max-clips 5   # smoke
+parameters:
+
+  ###===========================================================================
+  ### RUN / W&B  (lands in the same project/entity as the TWIST runs)
+  ###===========================================================================
+  EXPERIMENT_NAME:
+    value: cotracker3        # W&B run name + results/<name>/ dir for the CSVs
+  WANDB_PROJECT:
+    value: twist
+  WANDB_ENTITY:
+    value: twisteam
+  WANDB_TAGS:
+    value: [benchmark]       # the run is tagged so the baselines group together
+
+  ###===========================================================================
+  ### GEOMETRY  (same crop-then-resize knobs as the TWIST train/eval pipeline)
+  ###===========================================================================
+  # Pipeline: optional native-pixel CROP (x0,y0,x1,y1) -> resize-to-cover +
+  # center-crop to TARGET_SIZE (square side = IMAGE_SIZE). Omit either knob to
+  # skip that step (native clip resolution when both are unset).
+  CROP:
+    value: null              # e.g. [0, 0, 854, 480] — endoscope letterbox trim, etc.
+  IMAGE_SIZE:
+    value: 512               # -> DATASETS.OVERRIDE_ALL_DATASETS.TARGET_SIZE [512, 512]
+
+  ###===========================================================================
+  ### COTRACKER MODEL  (online / streaming variant — the one we benchmark against)
+  ###===========================================================================
+  COTRACKER:
+    value:
+      VARIANT: scaled_online    # CoTracker3 ONLINE (causal, real-time); "online" in the name picks the streaming predictor
+      # Local checkpoint cache; downloaded from CHECKPOINT_URL on first run if absent.
+      CHECKPOINT: weights/cotracker/scaled_online.pth
+      CHECKPOINT_URL: https://huggingface.co/facebook/cotracker3/resolve/main/scaled_online.pth
+      WINDOW_LEN: 16            # CoTracker3 online window (hubconf default) -> sliding step = 8
+      BACKWARD_TRACKING: false  # online is causal (no backward pass); "queried first" scores only frames after the query
+
+
+  ###===========================================================================
+  ### EVAL PROTOCOL  (must match the TWIST evaluator to stay comparable)
+  ###===========================================================================
+  EVAL_QUERY_MODE:
+    value: first             # TAP-Vid "queried first" (CoTracker-comparable)
+  EVAL_RECOVERY:
+    value: true              # also log the Post-Occlusion-Recovery table
+  EVAL_RECOVERY_WINDOW:
+    value: 8
+  EVAL_AMP:
+    value: false             # CoTracker is benchmarked in fp32
+  EVAL_BATCH_SIZE:
+    value: 1
+  EVAL_WORKERS:
+    value: 6

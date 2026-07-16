@@ -1,0 +1,67 @@
+# Benchmark config: TAPIR / BootsTAPIR (PyTorch, offline) on the TWIST eval datasets.
+#
+# W&B-sweep format like every config in the repo. The benchmark script runs TAPIR
+# through the *same* evaluator the TWIST model uses, so the metrics are directly
+# comparable. MODEL_KWARGS below match BootsTAPIR (the strong baseline).
+#
+#   python benchmark/tapir/tapir.py                       # uses this file
+#   python benchmark/tapir/tapir.py --datasets TAPVID_DAVIS --max-clips 5   # smoke
+parameters:
+
+  ###===========================================================================
+  ### RUN / W&B
+  ###===========================================================================
+  EXPERIMENT_NAME:
+    value: bootstapir
+  WANDB_PROJECT:
+    value: twist
+  WANDB_ENTITY:
+    value: twisteam
+  WANDB_TAGS:
+    value: [benchmark]
+
+  ###===========================================================================
+  ### GEOMETRY
+  ###===========================================================================
+  CROP:
+    value: null
+  IMAGE_SIZE:
+    value: 512
+
+  ###===========================================================================
+  ### TAPIR MODEL  (offline). MODEL_KWARGS default = BootsTAPIR; for vanilla TAPIR
+  ### use {pyramid_level: 1} and the tapir_checkpoint_panning.pt checkpoint.
+  ###===========================================================================
+  TAPIR:
+    value:
+      VARIANT: bootstapir
+      CHECKPOINT: weights/tapir/bootstapir.pt
+      # PyTorch checkpoint (must be downloaded manually first, see the sbatch note):
+      CHECKPOINT_URL: https://storage.googleapis.com/dm-tapnet/bootstap/bootstapir_checkpoint_v2.pt
+      QUERY_CHUNK_SIZE: 32
+      FEATURE_EXTRACTOR_CHUNK_SIZE: 8   # ResNet frames per pass (default 10 OOMs @ 512²)
+      MAX_TEMPORAL_FRAMES: 128          # tile longer clips (RoboTAP ~1.2k frames)
+      # REFINEMENT_RESOLUTIONS: null     # default: [(256,256)] when IMAGE_SIZE>256
+      MODEL_KWARGS:
+        pyramid_level: 1
+        extra_convs: true
+        softmax_temperature: 10.0
+        bilinear_interp_with_depthwise_conv: false
+
+  ###===========================================================================
+  ### EVAL PROTOCOL
+  ###===========================================================================
+  EVAL_QUERY_MODE:
+    value: first
+  EVAL_TIMING_BATCHES:
+    value: 0                # skip extra timing forward (TAPIR is already heavy)
+  EVAL_RECOVERY:
+    value: true
+  EVAL_RECOVERY_WINDOW:
+    value: 8
+  EVAL_AMP:
+    value: false
+  EVAL_BATCH_SIZE:
+    value: 1
+  EVAL_WORKERS:
+    value: 4

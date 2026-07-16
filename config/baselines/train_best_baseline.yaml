@@ -1,0 +1,232 @@
+###===============================================================================================================================
+### train_red_repro.yaml  —  FAITHFUL reproduction of the "red" baseline t7imej6u (eternal-sweep-2)
+###===============================================================================================================================
+### Provenance: every value below is the EXACT resolved config of W&B run twisteam/twist/t7imej6u
+### (fetched 2026-07-14), which reached val/epe 10.11 @ep14 (still falling) before it crashed.
+###
+### This differs from the drifted config/train_red.yaml, which had silently diverged from the baseline
+### (LR 1e-4 vs 3e-4, EPOCHS 50 vs 25, RADIUS_PX 24 vs 16, BATCH 4 vs 8, and 13 datasets vs 6). Those
+### drifts are why the earlier train_red runs did not reproduce t7imej6u's val metrics.
+###
+### THE ONLY additions vs t7imej6u's config:
+###   * LR_SCALING: none   (new knob; no-op unless world_size>1 — see below)
+### Everything else is byte-for-byte the baseline.
+###
+### Intended use — the DDP-equivalence A/B (Regime A: split the global batch, do NOT scale LR):
+###   ARM 1 (control, 1 GPU):  sbatch .sbatch_scripts/train_A100_80_single.sbatch config/train_red_repro.yaml \
+###                                --BATCH_SIZE=6 --EXPERIMENT_NAME=red_repro_1gpu
+###   ARM 2 (Regime A, 2 GPU): sbatch .sbatch_scripts/train_A100_80_DDP.sbatch config/train_red_repro.yaml \
+###                                --BATCH_SIZE=3 --EXPERIMENT_NAME=red_repro_2gpu
+###   Both arms => effective batch 6, LR 3e-4, identical everything else. Curves must overlie within noise.
+###   Then the actual t7imej6u batch (effective 8, which does NOT fit on one 80GB card) via DDP:
+###     sbatch .sbatch_scripts/train_A100_80_DDP.sbatch config/train_red_repro.yaml \
+###         --BATCH_SIZE=4 --EXPERIMENT_NAME=red_repro_2gpu_bs8   # 2x4 = 8 = t7imej6u; compare to archived t7imej6u curve
+###===============================================================================================================================
+
+parameters:
+
+  ###===========================================================================================================================
+  ### RUN / GENERAL
+  ###===========================================================================================================================
+  EXPERIMENT_NAME:
+    value: null            # set per-launch via --EXPERIMENT_NAME (Law 5: run identity == EXPERIMENT_NAME)
+  RESUME:
+    value: scratch
+  WORKERS:
+    value: 8
+  PIN_MEMORY:
+    value: true
+  NO_WANDB:
+    value: false
+  WANDB_PROJECT:
+    value: twist
+  SEED:
+    value: 42
+
+  ###===========================================================================================================================
+  ### DDP LR SCALING  (the lever this file exists to exercise)
+  ###===========================================================================================================================
+  # none   -> LR invariant to GPU count. Pair with per-GPU BATCH_SIZE = global/N to hold the effective batch
+  #           fixed; DDP averages gradients + this model has no BatchNorm (LayerNorm only), so the per-step
+  #           update is mathematically identical to the single-GPU run. Free ~Nx wall-clock, zero quality loss.
+  # sqrt   -> LR *= sqrt(N). Use when GROWING the effective batch (per-GPU batch fixed); correct rule for AdamW.
+  # linear -> LR *= N (Goyal SGD rule). Overshoots here (2-GPU 6e-4 hurt, 4-GPU 4e-3 diverged). Not recommended.
+  LR_SCALING:
+    value: none
+
+  ###===========================================================================================================================
+  ### MODEL — exact resolved architecture from t7imej6u (RADIUS_PX=16 EFFECTIVE: the sweep's dotted override
+  ###          won over the nested default of 24; the skill records t7imej6u as a RAD=16 run)
+  ###===========================================================================================================================
+  MODEL:
+    value:
+      MODEL_CLASS: TrackerWorldModel
+      MODEL_MODULE: models
+      HIDDEN_DIM: 256
+      TOKEN_DIM: 256
+      RGB_ENCODER:
+        ENCODER: facebook/dinov3-vitl16-pretrain-lvd1689m
+        IMAGE_SIZE: 512
+        FREEZE_BACKBONE: true
+        RGB_ENCODER_LR: 0.0
+        # PRECISION LEVER (OFF, no-op = preserves the t7imej6u reproduction): null =
+        # final DINOv3 hidden state (v1). An int (e.g. -4) reads a mid-transformer layer
+        # as the dense feature map — finer spatial detail, a candidate for the
+        # delta_1px/2px wall. dino only. MUST stay null for the faithful repro.
+        FEATURE_LAYER: null
+      OBSERVATION:
+        K: 9
+        RADIUS_PX: 16       # t7imej6u effective value (NOT 24)
+        HEADS: 4
+        MAX_CORR: 0.0
+      TRANSITION:
+        DEPTH: 2
+        HEADS: 4
+        MAX_STEP: 0.12
+      ROLLOUT_VEL_DECAY: 1.0
+      HEADS:
+        UNCERTAINTY: true
+      # PRECISION LEVER (OFF, no-op = preserves the t7imej6u reproduction): learned
+      # upsampler on the frozen encoder feature map. DINOv3 patch-16 gives a 32x32 grid
+      # @512. ENABLED true lifts it to FACTOR x (same channel dim), transparent to every
+      # consumer; adds a small trainable head in the LR group (~4x feat-map VRAM at
+      # FACTOR 2). MUST stay ENABLED false for the faithful repro.
+      FEATURE_UPSAMPLE:
+        ENABLED: false
+        FACTOR: 2
+        BOTTLENECK: 256
+
+  ###===========================================================================================================================
+  ### DATA — EXACT DATASETS block from t7imej6u (6 datasets; NOT the 13-set train_red list)
+  ###        NB: this reproduces t7imej6u's val set verbatim, INCLUDING TAPVID_DAVIS/SURGICALMOTION as
+  ###            IS_EVAL_DATASET @ VAL_FRACTION 1 (they sit in per-epoch val) — required for an EXACT
+  ###            val-metric match, even though it is the val-pollution pattern flagged in the audit memory.
+  ###===========================================================================================================================
+  DATASETS:
+    value:
+      OVERRIDE_ALL_DATASETS:
+        SPLIT_SEED: 42
+        TARGET_SIZE: [512, 512]
+        CLIP_LEN: 24
+        LOAD_FRAMES: true
+        LOAD_DEPTHS: false
+        FRAMES_AS_FLOAT: false
+        MARK_OFFSCREEN_INVISIBLE: true
+        POINT_SAMPLE_MODE: even
+        QUERY_FRAME: 0
+        CLIP_STRIDE: null
+        FRAME_STRIDE: 1
+        REQUIRE_VISIBLE_AT_QUERY: true
+        MIN_VISIBLE_FRAMES: 1
+        # GEOMETRY LEVER (OFF, no-op = preserves the t7imej6u reproduction): cover =
+        # aspect-preserving resize + center-crop (v1 harness). stretch = anisotropic
+        # squash, NO crop = canonical TAP-Vid protocol; use with TARGET_SIZE [256,256]
+        # for published-table-comparable numbers. MUST stay cover for the faithful repro.
+        RESIZE_MODE: cover
+
+      KUBRIC:
+        MAX_CLIPS: 4000
+        VAL_FRACTION: 0.1
+
+      CHOLEC80:
+        MAX_CLIPS: 25
+        VAL_FRACTION: 1
+
+      POINTODYSSEY:
+        VAL_FRACTION: 0.1
+
+      TAPVID_DAVIS:
+        VAL_FRACTION: 1
+        IS_EVAL_DATASET: true
+
+      DYNAMICREPLICA:
+        VAL_FRACTION: 0.1
+
+      SURGICALMOTION:
+        VAL_FRACTION: 1
+        IS_EVAL_DATASET: true
+
+  ###===========================================================================================================================
+  ### TRAINING (ENGINE) — exact schedule from t7imej6u
+  ###===========================================================================================================================
+  BATCH_SIZE:
+    value: 4               # t7imej6u's per-GPU value. NB: bs8 @512 (~100 GB) does NOT fit on one 80GB card;
+                           # override per-aunch (single-GPU: --BATCH_SIZE=6; DDP 2x4 reaches effective 8).
+  EPOCHS:
+    value: 100
+  LR:
+    value: 3.0e-4          # single-GPU value; LR_SCALING (above) decides what happens under DDP
+  WEIGHT_DECAY:
+    value: 1.0e-4
+  OPTIMIZER:
+    value: adamw
+  GRAD_CLIP:
+    value: 1.0
+  AMP:
+    value: true
+  LR_SCHEDULER:
+    value: cosine
+  WARMUP_EPOCHS:
+    value: 3
+  MIN_LR_RATIO:
+    value: 0.05
+  KL_WEIGHT_START:
+    value: 0.0
+  KL_ANNEAL_EPOCHS:
+    value: 5
+  TEACHER_FORCING_EPOCHS:
+    value: 3
+  OBS_DROPOUT:
+    value: 0.3
+  OBS_DROPOUT_EPOCHS:
+    value: 5
+  LOSS:
+    value:
+      POS_WEIGHT: 10.0
+      VIS_WEIGHT: 0.5
+      KL_WEIGHT: 0.05
+      KL_FREE_BITS: 0.02
+      KL_BALANCE_ALPHA: 0.8
+      HUBER_DELTA: 0.2
+      UNC_WEIGHT: 0.0
+      PRIOR_WEIGHT: 0.5
+      ROLLOUT_WEIGHT: 2.0
+
+  ###===========================================================================================================================
+  ### VALIDATION  —  VAL_SUBSAMPLE null to match t7imej6u (which predates the knob; it validated on the full
+  ###                val set). Required for an EXACT val-metric match. (Safe here: no SURGT, so no 7k-clip blowup.)
+  ###===========================================================================================================================
+  VAL_EVERY:
+    value: 1
+  VAL_SUBSAMPLE:
+    value: null
+  EARLY_STOP_PATIENCE:
+    value: 12
+  ROLLOUT_EVAL:
+    value: true
+  ROLLOUT_OBSERVE_STEPS:
+    value: 4
+
+  ###===========================================================================================================================
+  ### BENCHMARK EVALUATION
+  ###===========================================================================================================================
+  EVAL_QUERY_MODE:
+    value: first
+  EVAL_AT_END:
+    value: true
+  EVAL_EVERY:
+    value: 0
+  EVAL_MAX_CLIPS:
+    value: 30
+  EVAL_BATCH_SIZE:
+    value: 1
+  EVAL_WORKERS:
+    value: 4
+
+  ###===========================================================================================================================
+  ### LOGGING & VISUALIZATION
+  ###===========================================================================================================================
+  LOG_EVERY:
+    value: 25
+  VIZ_EVERY:
+    value: 5

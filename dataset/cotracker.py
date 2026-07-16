@@ -86,12 +86,15 @@ class CoTrackerTracksDataset(BaseTracksDataset):
         require_visible_at_query: bool = True,
         min_visible_frames: int = 1,
         target_size: Optional[Tuple[int, int]] = None,
+        resize_mode: str = "cover",
         crop: Optional[Tuple[int, int, int, int]] = None,
         mark_offscreen_invisible: bool = True,
+        has_occluded_gt: bool = False,
         load_frames: bool = True,
         load_depths: bool = False,
         frames_as_float: bool = False,
         seed: int = 0,
+        subsample: Optional[float] = None,
     ):
         super().__init__(
             include=include,
@@ -108,12 +111,15 @@ class CoTrackerTracksDataset(BaseTracksDataset):
             require_visible_at_query=require_visible_at_query,
             min_visible_frames=min_visible_frames,
             target_size=target_size,
+            resize_mode=resize_mode,
             crop=crop,
             mark_offscreen_invisible=mark_offscreen_invisible,
+            has_occluded_gt=has_occluded_gt,
             load_frames=load_frames,
             load_depths=load_depths,
             frames_as_float=frames_as_float,
             seed=seed,
+            subsample=subsample,
         )
         self.root = Path(root)
         self._raw_index = _read_index(self.root)
@@ -188,6 +194,20 @@ class CoTrackerTracksDataset(BaseTracksDataset):
             entries = [en for en in entries if en["video"] in keepset]
         if self.max_clips is not None:
             entries = entries[: int(self.max_clips)]  # total-clip cap (first videos, in order)
+        # Deterministic subsampling to a fraction of the clips, evenly spread over
+        # the whole index (so it stays representative across videos -- unlike
+        # max_clips, which takes the first videos). Used for a small per-epoch val
+        # set via VAL_SUBSAMPLE; f<=0 empties it, f>=1 (or None) keeps everything.
+        if self.subsample is not None:
+            f = float(self.subsample)
+            if f <= 0:
+                entries = []
+            elif f < 1.0 and len(entries) > 1:
+                k = max(1, int(round(len(entries) * f)))
+                if k < len(entries):
+                    sel = np.linspace(0, len(entries) - 1, num=k).round().astype(int)
+                    sel = sorted({int(x) for x in sel.tolist()})
+                    entries = [entries[x] for x in sel]
         return entries
 
     # ------------------------------------------------------------------ #
@@ -198,13 +218,37 @@ class CoTrackerTracksDataset(BaseTracksDataset):
         clip_t, start = entry["clip_len"], entry["start"]
         frame_ids = start + np.arange(clip_t) * self.frame_stride          # (T,)
 
-        with np.load(self.root / entry["path"]) as d:
-            tracks = np.asarray(d["tracks"])[frame_ids]                    # (T, N, 2)
-            visibility = np.asarray(d["visibility"])[frame_ids]            # (T, N)
+        # Two on-disk variants of the same clip, chosen per read:
+        #   * mmap  — a sibling ``<clip>/`` dir of UNCOMPRESSED per-array ``.npy``
+        #     (frames/tracks/visibility). ``np.load(mmap_mode='r')[frame_ids]``
+        #     touches only the pages for the requested frames, so a 24-frame window
+        #     of a 120-frame stored clip reads ~24/120 of the bytes with NO DEFLATE
+        #     decompression — ~80x faster per item than the compressed path, which
+        #     is what let dataloading keep the GPU fed (see assets/dataprep/
+        #     transcode_to_mmap.py, which produces this layout from the .npz files).
+        #   * npz   — the legacy compressed ``.npz`` (whole arrays decompressed).
+        # The mmap dir is preferred when present; otherwise we fall back to the
+        # ``.npz`` so un-transcoded datasets keep working unchanged.
+        npz_path = self.root / entry["path"]
+        mmap_dir = npz_path.with_suffix("")                                # 0000/clip_00000/
+        if (mmap_dir / "tracks.npy").exists():
+            tracks = np.ascontiguousarray(
+                np.load(mmap_dir / "tracks.npy", mmap_mode="r")[frame_ids])       # (T, N, 2)
+            visibility = np.ascontiguousarray(
+                np.load(mmap_dir / "visibility.npy", mmap_mode="r")[frame_ids])   # (T, N)
+            fpath = mmap_dir / "frames.npy"
             frames = (
-                np.asarray(d["frames"])[frame_ids]                         # (T, H, W, 3)
-                if (self.load_frames and "frames" in d.files) else None
+                np.ascontiguousarray(np.load(fpath, mmap_mode="r")[frame_ids])    # (T, H, W, 3)
+                if (self.load_frames and fpath.exists()) else None
             )
+        else:
+            with np.load(npz_path) as d:
+                tracks = np.asarray(d["tracks"])[frame_ids]                # (T, N, 2)
+                visibility = np.asarray(d["visibility"])[frame_ids]        # (T, N)
+                frames = (
+                    np.asarray(d["frames"])[frame_ids]                     # (T, H, W, 3)
+                    if (self.load_frames and "frames" in d.files) else None
+                )
 
         tracks_nt = np.ascontiguousarray(tracks.transpose(1, 0, 2))        # (N, T, 2)
         vis_nt = np.ascontiguousarray(visibility.transpose(1, 0))          # (N, T)

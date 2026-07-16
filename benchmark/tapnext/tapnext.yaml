@@ -1,0 +1,63 @@
+# Benchmark config: TAPNext / BootsTAPNext (PyTorch, online/causal) on the
+# TWIST eval datasets.
+#
+# W&B-sweep format like every config in the repo. The benchmark script runs
+# TAPNext through the *same* evaluator the TWIST model uses, so the metrics
+# are directly comparable. TAPNext is online-only (no offline variant exists)
+# and needs a GPU even to construct the model (see benchmark/tapnext/tapnext.py).
+#
+#   python benchmark/tapnext/tapnext.py                       # uses this file
+#   python benchmark/tapnext/tapnext.py --datasets TAPVID_DAVIS --max-clips 5   # smoke
+parameters:
+
+  ###===========================================================================
+  ### RUN / W&B
+  ###===========================================================================
+  EXPERIMENT_NAME:
+    value: tapnext
+  WANDB_PROJECT:
+    value: twist
+  WANDB_ENTITY:
+    value: twisteam
+  WANDB_TAGS:
+    value: [benchmark]
+
+  ###===========================================================================
+  ### GEOMETRY  (feeds the dataset at this resolution; TAPNext internally
+  ### downsamples each frame to TAPNEXT.MODEL_IMAGE_SIZE before its forward and
+  ### rescales predicted coords back up, so this can differ from 256x256).
+  ###===========================================================================
+  CROP:
+    value: null
+  IMAGE_SIZE:
+    value: 512
+
+  ###===========================================================================
+  ### TAPNEXT MODEL  (online/causal only). MODEL_IMAGE_SIZE must match the
+  ### checkpoint's baked-in positional embeddings -- 256x256 for BootsTAPNext.
+  ###===========================================================================
+  TAPNEXT:
+    value:
+      VARIANT: bootstapnext
+      # Local checkpoint cache; downloaded from CHECKPOINT_URL on first run if absent.
+      # Raw JAX .npz (not a torch state_dict) -- restored via
+      # tapnet.tapnext.tapnext_torch_utils.restore_model_from_jax_checkpoint.
+      CHECKPOINT: weights/tapnext/bootstapnext_ckpt.npz
+      CHECKPOINT_URL: https://storage.googleapis.com/dm-tapnet/tapnext/bootstapnext_ckpt.npz
+      MODEL_IMAGE_SIZE: [256, 256]
+
+  ###===========================================================================
+  ### EVAL PROTOCOL
+  ###===========================================================================
+  EVAL_QUERY_MODE:
+    value: first
+  EVAL_RECOVERY:
+    value: true
+  EVAL_RECOVERY_WINDOW:
+    value: 8
+  EVAL_AMP:
+    value: false
+  EVAL_BATCH_SIZE:
+    value: 1
+  EVAL_WORKERS:
+    value: 6
