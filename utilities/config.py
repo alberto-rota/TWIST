@@ -62,6 +62,7 @@ except Exception:  # pragma: no cover - dotmap is a declared dep
 _SPLIT_KEYS = {
     "ROOT_DIR", "READER", "VAL_FRACTION", "SPLIT_SEED",
     "VAL_SEQUENCES", "TRAIN_SEQUENCES", "MAX_SEQUENCES",
+    "VAL_SUBSAMPLE",   # per-epoch val clip fraction; injected into the val reader only
 }
 
 
@@ -357,6 +358,17 @@ def resolve_stage_config(config: "DotMap", stage_idx: int) -> "DotMap":
     merged[STAGE_INDEX_KEY] = stage_idx
     merged[STAGE_NAME_KEY] = stages[stage_idx].get("NAME", f"stage{stage_idx}")
     merged.setdefault("EXPERIMENT_NAME", config.get("EXPERIMENT_NAME"))
+    # Re-derive the resolution/crop injection on the merged stage config. A stage's
+    # own top-level ``DATASETS`` block REPLACES the base one, which would drop the
+    # ``OVERRIDE_ALL_DATASETS.TARGET_SIZE`` that ``_apply_top_level_image_size``
+    # injected into the base at load time — leaving that stage's readers at
+    # target_size=None (each dataset keeps its native H,W, so a mixed-resolution
+    # train batch fails to collate: "storage that is not resizable"). Re-running
+    # the derivation here re-injects TARGET_SIZE (and CROP) from the stage's own
+    # IMAGE_SIZE into the stage's own OVERRIDE_ALL_DATASETS. Idempotent for a stage
+    # that redefines neither.
+    _apply_top_level_image_size(merged)
+    _apply_top_level_crop(merged)
     return DotMap(merged)
 
 
@@ -423,6 +435,10 @@ def create_datasets_from_config(
         raise ValueError("no datasets listed under DATASETS")
 
     train_sets, val_sets = [], []
+    # Global per-epoch val clip fraction (0<f<1 keeps a representative slice; f<=0
+    # drops a dataset from per-epoch val; None/>=1 keeps all). A per-dataset
+    # VAL_SUBSAMPLE overrides this. Decoupled from VAL_FRACTION (the split ratio).
+    global_val_subsample = config.get("VAL_SUBSAMPLE", None)
     logger.info(f"building {len(names)} dataset(s): {names}")
 
     for name in names:
@@ -431,6 +447,14 @@ def create_datasets_from_config(
         merged.update(all_overrides)
         merged.update(_as_dict(datasets_cfg.get(name)))
         merged.update(forced_overrides)
+
+        # Hard disable: VAL_FRACTION < 0 removes the dataset entirely -- no clips
+        # go to train OR val. Combined with IS_EVAL_DATASET=False (the default for
+        # training datasets) the dataset is completely ignored. See
+        # select_eval_datasets, which drops it from benchmark eval too.
+        if float(merged.get("VAL_FRACTION", 0.1)) < 0:
+            logger.info(f"  {name}: VAL_FRACTION < 0 -- dataset disabled, skipping")
+            continue
 
         reader_cls = reader_class_for(name, merged)
         root = expand_path(merged.get("ROOT_DIR", f"$DATASET_DIR/{name}"))
@@ -464,12 +488,17 @@ def create_datasets_from_config(
             val_kw = dict(kw)
             if val_kw.get("point_sample_mode") == "random":
                 val_kw["point_sample_mode"] = "even"  # reproducible val metrics
+            vfrac = merged.get("VAL_SUBSAMPLE", global_val_subsample)  # per-dataset override < global
+            if vfrac is not None:
+                val_kw["subsample"] = float(vfrac)    # keep only a representative fraction in per-epoch val
             vl = reader_cls(root=root, include=val_seqs, **val_kw)
             vl.dataset_name = name                      # so the engine logs >=1 viz clip per dataset
-            val_sets.append(vl)
-            logger.info(
-                f"  ✓ {name} val:   {len(val_seqs)} seqs -> {len(val_sets[-1])} clips"
-            )
+            sfx = f"  (VAL_SUBSAMPLE={vfrac})" if vfrac is not None else ""
+            if len(vl) > 0:
+                val_sets.append(vl)
+                logger.info(f"  ✓ {name} val:   {len(val_seqs)} seqs -> {len(vl)} clips{sfx}")
+            else:
+                logger.info(f"  ✓ {name} val:   {len(val_seqs)} seqs -> 0 clips{sfx} -- excluded from per-epoch val")
 
     training = ConcatDataset(train_sets) if train_sets else None
     validation = ConcatDataset(val_sets) if val_sets else None
@@ -612,12 +641,16 @@ def create_model_from_config(config: "DotMap", device, verbose: bool = True):
         "patch_size": int(enc.get("PATCH_SIZE", 8)),          # used by cnn
         "freeze_backbone": bool(enc.get("FREEZE_BACKBONE", True)),
         "encoder_lr": encoder_lr,
+        # None = final hidden state (v1); int selects a mid-transformer layer as the
+        # dense feature map (precision lever; dino only).
+        "feature_layer": enc.get("FEATURE_LAYER", None),
     }
     encoder = models_module.FrozenFrameEncoder(encoder_cfg).to(device)
 
     obs = _as_dict(mc.get("OBSERVATION"))
     trans = _as_dict(mc.get("TRANSITION"))
     heads = _as_dict(mc.get("HEADS"))
+    ups = _as_dict(mc.get("FEATURE_UPSAMPLE"))   # learned finer feature grid (default OFF)
     model_class = getattr(models_module, mc.get("MODEL_CLASS", "TrackerWorldModel"))
     model = model_class(
         encoder=encoder,
@@ -640,6 +673,10 @@ def create_model_from_config(config: "DotMap", device, verbose: bool = True):
         uncertainty=bool(heads.get("UNCERTAINTY", True)),
         encode_chunk=int(mc.get("ENCODE_CHUNK", 32)),
         rollout_vel_decay=float(mc.get("ROLLOUT_VEL_DECAY", 1.0)),
+        # Learned finer feature grid (precision lever; default OFF = v1 architecture).
+        feat_upsample=bool(ups.get("ENABLED", False)),
+        feat_upsample_factor=int(ups.get("FACTOR", 2)),
+        feat_upsample_bottleneck=int(ups.get("BOTTLENECK", 256)),
         verbose=verbose,
     ).to(device)
 

@@ -612,3 +612,146 @@ def render_track_frames(
         buf = np.asarray(canvas.buffer_rgba())[..., :3]
         out.append(np.transpose(buf.copy(), (2, 0, 1)))
     return np.stack(out, axis=0)                         # (T,3,out,out) uint8
+
+
+# --------------------------------------------------------------------------- #
+# Filmstrip / "space-time" strip  (the CoTracker teaser layout)
+# --------------------------------------------------------------------------- #
+def render_filmstrip(
+    frames,                                  # (T,3,H,W) or (T,H,W,3)
+    tracks,                                  # (T, N, 2) x,y px
+    visibility=None,                         # (T, N) bool
+    *,
+    n_panels: int = 6,
+    panel_indices: Optional[np.ndarray] = None,
+    max_points: Optional[int] = None,
+    cmap: str = "rainbow",
+    linewidth: float = 1.0,
+    point_size: float = 12.0,
+    marker_edge_lw: float = 0.5,
+    line_alpha: float = 0.9,
+    dim_background: float = 0.0,
+    show_occluded: bool = True,
+    draw_panel_markers: bool = True,
+    occluded_coords_real: bool = True,
+    dpi: int = 100,
+    title: Optional[str] = None,
+) -> np.ndarray:
+    """Render a clip as a **space-time filmstrip** — the CoTracker teaser layout.
+
+    ``n_panels`` keyframes are tiled left-to-right into one wide canvas
+    (``H x n_panels*W``), and every point track is drawn as **one continuous line**
+    whose horizontal position slides rightward *in proportion to time*: a track
+    sampled at frame ``t`` is placed at ``x_global = x_local(t) + (t/(T-1))*(K-1)*W``,
+    ``y_global = y_local(t)``. At keyframe-``k``'s time the slide equals ``k*W`` exactly
+    (for evenly-spaced panels), so the line passes through — and a marker is dropped
+    in — panel ``k`` at the point's true in-frame position there.
+
+    **What the horizontal axis means.** It is *time*, realised as space. On a
+    **panning** camera (DAVIS/Kinetics) the subject genuinely translates across the
+    frame, so ``x_local`` grows with ``t`` and the lines fan out into long flowing
+    arcs — the "panorama" look. On a **static camera with non-rigid motion**
+    (surgical endoscopy) ``x_local`` barely moves: each line is then a near-horizontal
+    time-lapse streak whose vertical (and small horizontal) **wiggle is exactly the
+    tissue deformation** of that point. Same construction, honest either way — the
+    strip is a filmstrip, not a stitched geometric panorama.
+
+    Occlusion/padding is handled like :func:`animate_tracks`: sentinel/occluded slots
+    are NaN'd so a line never streaks into the ``(0,0)`` corner; visible panel markers
+    are filled, occluded ones are hollow rings (dropped if ``show_occluded=False``).
+    Colour is per-identity by initial x (the horizontal rainbow).
+
+    ``dim_background`` in ``[0,1]`` blends the panel images toward white so the tracks
+    pop (0 = untouched). Returns a single ``(H, n_panels*W, 3)`` uint8 image.
+
+    Shapes: frames (T,3,H,W)|(T,H,W,3), tracks (T,N,2), visibility (T,N).
+    """
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.collections import LineCollection
+    from matplotlib.figure import Figure
+
+    imgs = _frames_to_hwc_uint8(frames)                  # (T,H,W,3)
+    pos = _to_numpy(tracks).astype(np.float32)           # (T,N,2)
+    T, N = pos.shape[0], pos.shape[1]
+    vis = _to_numpy(visibility).astype(bool) if visibility is not None else np.ones((T, N), bool)
+    if max_points is not None and max_points < N:
+        sel = np.linspace(0, N - 1, max_points).round().astype(int)
+        pos, vis, N = pos[:, sel], vis[:, sel], max_points
+
+    H, W = imgs.shape[1], imgs.shape[2]
+
+    # choose the keyframe panels (evenly spaced by default)
+    if panel_indices is not None:
+        panels = np.asarray(panel_indices, dtype=int)
+    else:
+        k = int(min(max(1, n_panels), T))
+        panels = (np.linspace(0, T - 1, k).round().astype(int) if k > 1
+                  else np.array([0], dtype=int))
+    K = len(panels)
+
+    # tile the panel frames into one (H, K*W, 3) canvas
+    strip = np.concatenate([imgs[f] for f in panels], axis=1).astype(np.float32)  # (H,K*W,3)
+    if dim_background > 0.0:
+        strip = strip * (1.0 - dim_background) + 255.0 * dim_background
+    strip = np.clip(strip, 0, 255).astype(np.uint8)
+    total_W = K * W
+
+    # NaN out sentinel/padding slots so lines/markers never touch (0,0)
+    present = _present_mask(pos, vis, hw=(H, W),
+                            occluded_coords_real=occluded_coords_real)   # (T,N)
+    pos_draw = pos.copy()
+    pos_draw[~present] = np.nan
+    base_rgb = _point_colors(pos, cmap)[:, :3]           # (N,3)
+
+    # time -> horizontal slide (px). At t == panels[k] (evenly spaced) this equals k*W.
+    slide = (np.arange(T, dtype=np.float32) / max(1, T - 1)) * (K - 1) * W   # (T,)
+    gx = pos_draw[..., 0] + slide[:, None]               # (T,N) global x
+    gy = pos_draw[..., 1]                                # (T,N) global y
+
+    fig = Figure(figsize=(total_W / 100.0, H / 100.0), dpi=dpi)
+    canvas = FigureCanvasAgg(fig)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.imshow(strip, extent=(0, total_W, H, 0))
+    ax.set_xlim(0, total_W)
+    ax.set_ylim(H, 0)
+    ax.axis("off")
+
+    # one continuous polyline per point over all T samples (NaN vertices break it)
+    segs = [np.stack([gx[:, i], gy[:, i]], axis=1) for i in range(N)]     # list of (T,2)
+    line_rgba = np.concatenate([base_rgb, np.full((N, 1), line_alpha)], axis=1)
+    ax.add_collection(LineCollection(segs, linewidths=linewidth,
+                                     capstyle="round", colors=line_rgba))
+
+    # drop a marker in each panel at the point's true position in that frame
+    if draw_panel_markers:
+        for k, f in enumerate(panels):
+            mx = pos_draw[f, :, 0] + k * W               # (N,) land in panel k
+            my = pos_draw[f, :, 1]
+            _draw_markers(ax, np.stack([mx, my], axis=1), base_rgb, vis[f],
+                          marker="o", size=point_size, edge_lw=marker_edge_lw,
+                          show_occluded=show_occluded)
+    if title:
+        ax.text(0.005, 0.99, title, transform=ax.transAxes, va="top", ha="left",
+                color="white", fontsize=10,
+                bbox=dict(facecolor="black", alpha=0.4, pad=2, edgecolor="none"))
+
+    canvas.draw()
+    buf = np.asarray(canvas.buffer_rgba())[..., :3]
+    return buf.copy()                                    # (H, K*W, 3) uint8
+
+
+def render_sample_filmstrip(sample: dict, pred_tracks=None, pred_visibility=None,
+                            **kwargs) -> np.ndarray:
+    """:func:`render_filmstrip` for one dataset item.
+
+    Uses the item's GT tracks by default; pass ``pred_tracks``/``pred_visibility`` to
+    draw the model's predictions instead. Labels the strip with the clip identity.
+    """
+    title = kwargs.pop("title", None)
+    if title is None and "video" in sample:
+        ci = sample.get("clip_idx", 0)
+        ci = int(ci) if not hasattr(ci, "item") else int(ci)
+        title = f"{sample['video']} clip {ci}"
+    tracks = pred_tracks if pred_tracks is not None else sample["tracks"]
+    vis = pred_visibility if pred_tracks is not None else sample.get("visibility")
+    return render_filmstrip(sample["frames"], tracks, vis, title=title, **kwargs)

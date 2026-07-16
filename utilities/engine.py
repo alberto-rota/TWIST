@@ -44,7 +44,13 @@ from torch.utils.data import DataLoader
 
 from models import tracking_metrics
 from utilities.log import get_logger
-from utilities.runs import mark_stage_complete
+from utilities.runs import (
+    find_cross_run_checkpoint,
+    is_cross_run_resume,
+    mark_stage_complete,
+    parse_resume_value,
+    resolve_source_run_dir,
+)
 
 logger = get_logger(__name__).set_context("ENGINE")
 
@@ -256,9 +262,11 @@ class Engine:
         self.max_steps = int(config.get("MAX_STEPS_PER_EPOCH", 0))  # 0 -> all
         self.max_val_steps = int(config.get("MAX_VAL_STEPS", 0))    # 0 -> all (smoke caps this)
         self.patience = int(config.get("EARLY_STOP_PATIENCE", 0))
-        # checkpoint policy: "scratch" (ignore ckpts, fresh) | "last" (resume last.pt)
-        # | "best" (resume best.pt). Falls back to carrying the previous stage's weights.
-        self.resume_mode = str(config.get("RESUME", "last")).lower()
+        # checkpoint policy: "scratch" (ignore ckpts, fresh) | "last" | "best"
+        # | "<source-run>" | "<source-run>:last|best" (warm-start weights from another run)
+        self.resume_raw = str(config.get("RESUME", "last"))
+        self.resume_token, self.resume_ckpt_hint = parse_resume_value(self.resume_raw)
+        self.resume_mode = self.resume_token.lower()
         torch.manual_seed(int(config.get("SEED", 42)))
 
         # LR schedule
@@ -328,6 +336,27 @@ class Engine:
         # which only caps the per-epoch validation loop). Cap with EVAL_MAX_CLIPS /
         # EVAL_MAX_STEPS explicitly for a quick eval-path smoke.
         self.eval_max_steps = int(config.get("EVAL_MAX_STEPS", 0))
+
+        # pseudo-GT synthetic supervision (novel-view generation from single frames,
+        # dataset/pseudo_gt.py): when PSEUDO_GT.ENABLED, each TRAIN batch's real clips
+        # are REPLACED on-device by synthetic clips generated from their frame-0 source
+        # image (dense known tracks + visibility, through-occlusion coords). Default
+        # OFF -> real batches pass through unchanged, so existing runs are byte-
+        # identical. Generation runs MoGe + point-cloud warping on the training
+        # DEVICE (GPU); it is impractically slow on CPU, so enable only on GPU runs.
+        pg = config.get("PSEUDO_GT", None)
+        try:
+            pg = pg.toDict() if hasattr(pg, "toDict") else (dict(pg) if pg is not None else None)
+        except Exception:  # noqa: BLE001
+            pg = None
+        self._pseudo_gt_cfg: Dict[str, Any] = pg or {}
+        self.pseudo_gt_enabled = bool(self._pseudo_gt_cfg.get("ENABLED", False))
+        if self.pseudo_gt_enabled and self._rank == 0:
+            logger.info(
+                "PSEUDO_GT ENABLED: train batches replaced by synthetic novel-view "
+                f"clips (depth_source={self._pseudo_gt_cfg.get('DEPTH_SOURCE', 'moge')}, "
+                f"grid_size={self._pseudo_gt_cfg.get('GRID_SIZE', 32)})"
+            )
 
         # AMP: bf16 (no scaler) on A100-class GPUs, else fp16 + scaler, off on CPU
         self.amp = bool(config.get("AMP", True)) and device.type == "cuda"
@@ -441,6 +470,26 @@ class Engine:
                 tgt[k] = batch[k].to(d, non_blocking=True)
         return frames, queries, tgt
 
+    def _metric_point_mask(self, queries: torch.Tensor, tgt: Dict[str, torch.Tensor]
+                           ) -> torch.Tensor:
+        """``(B,N)`` bool mask of the points whose track is scoreable: GT-visible at
+        their own query frame (and real under ``point_mask``).
+
+        A point occluded at its query frame was queried at whatever coordinate the
+        reader stored there — on real-GT datasets the ``(0,0)`` occluded placeholder —
+        so its predicted track is garbage by construction, yet it would be scored at
+        the frames where it later becomes visible (the val-pollution mechanism: the
+        eval-registry datasets set MAX_POINTS None, which bypasses the
+        visible-at-query candidate filter in dataset.sampling). This mirrors the
+        TAP-Vid rule the benchmark evaluator already applies (query at a visible
+        frame); it guards the *metrics* only — the loss masks itself by ``pos_valid``.
+        """
+        vis = tgt["visibility"].bool()                              # (B,T,N)
+        qt = queries[..., 0].long().clamp(0, vis.shape[1] - 1)      # (B,N) per-point query frame
+        vis_at_q = vis.gather(1, qt.unsqueeze(1)).squeeze(1)        # (B,N)
+        pm = tgt.get("point_mask")
+        return vis_at_q & pm.bool() if pm is not None else vis_at_q
+
     def _autocast(self):
         return torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.amp)
 
@@ -452,7 +501,8 @@ class Engine:
     # -- train / validate ---------------------------------------------------- #
     @torch.no_grad()
     def _gate_by_visibility(self, out: Dict[str, torch.Tensor], tgt: Dict[str, torch.Tensor],
-                            qf: int) -> Tuple[float, float]:
+                            qf: int, point_mask: Optional[torch.Tensor] = None
+                            ) -> Tuple[float, float]:
         """Mean Kalman gate split by GT visibility — the gate-health diagnostic.
 
         A functioning gate should sit HIGH on visible points (trust the match) and
@@ -467,11 +517,13 @@ class Engine:
         g = torch.sigmoid(out["gate_logits"].float())        # (B,T,N)
         vis = tgt["visibility"].bool()
         b, t, n = vis.shape
+        if point_mask is None:
+            point_mask = tgt.get("point_mask")
         mask = torch.ones_like(vis)
         if tgt.get("time_mask") is not None:
             mask &= tgt["time_mask"].bool()[:, :, None]
-        if tgt.get("point_mask") is not None:
-            mask &= tgt["point_mask"].bool()[:, None, :]
+        if point_mask is not None:
+            mask &= point_mask.bool()[:, None, :]
         mask &= torch.arange(t, device=vis.device)[None, :, None] > qf   # post-query only
         if "observed" in out:
             mask &= out["observed"] > 0.5
@@ -512,6 +564,53 @@ class Engine:
         keep[:qf + 1] = True
         return keep
 
+    def _maybe_pseudo_gt(self, epoch: int, frames: torch.Tensor,
+                         queries: torch.Tensor, tgt: Dict[str, torch.Tensor]):
+        """When ``PSEUDO_GT.ENABLED``, REPLACE the real batch with synthetic
+        novel-view clips generated on-device from each clip's query-frame source
+        image; otherwise return ``(frames, queries, tgt)`` unchanged (exact no-op,
+        the default — so a disabled run is byte-identical to before this feature).
+
+        The synthetic batch matches :meth:`_prep`'s contract, so the rest of the
+        training step (model call, teacher forcing, rollout, loss) is source-
+        agnostic. ``pos_valid`` is the in-frame mask (the warped 3-D query carries a
+        real coordinate through occlusion). Generation runs under ``no_grad`` — the
+        clips are targets and the frozen encoder re-encodes the frames.
+        """
+        if not self.pseudo_gt_enabled:
+            return frames, queries, tgt
+        from dataset.pseudo_gt import (
+            assemble_pseudo_batch,
+            deformation_config_from_run_config,
+            generate_pseudo_tracks,
+            occluder_config_from_run_config,
+            trajectory_config_from_run_config,
+        )
+        pg = self._pseudo_gt_cfg
+        T = int(frames.shape[1])
+        qf = max(0, min(int(queries[0, 0, 0].item()), T - 1))   # source = query frame
+        traj = trajectory_config_from_run_config(
+            {"PSEUDO_GT_TRAJECTORY": pg.get("TRAJECTORY") or None}, n_frames=T)
+        deform = deformation_config_from_run_config(
+            {"PSEUDO_GT_DEFORMATION": pg.get("DEFORMATION") or None})
+        occ = occluder_config_from_run_config(
+            {"PSEUDO_GT_OCCLUDERS": pg.get("OCCLUDERS") or None})
+        grid_size = int(pg.get("GRID_SIZE", 32))
+        margin = float(pg.get("GRID_MARGIN_FRAC", 0.03))
+        depth_source = str(pg.get("DEPTH_SOURCE", "moge"))
+        moge_name = str(pg.get("MOGE_MODEL_NAME", "Ruicheng/moge-2-vits-normal"))
+        clips = [
+            generate_pseudo_tracks(
+                frames[b, qf], n_frames=T, grid_size=grid_size,
+                seed=int(epoch * 100003 + b * 17 + 1), device=self.device,
+                depth_source=depth_source, moge_model_name=moge_name,
+                trajectory=traj, deformation=deform, occluders=occ,
+                grid_margin_frac=margin,
+            )
+            for b in range(int(frames.shape[0]))
+        ]
+        return assemble_pseudo_batch(clips, self.device)
+
     def train_epoch(self, epoch: int, tf_prob: float, obs_dropout: float = 0.0) -> Dict[str, float]:
         loader = self.loaders.get("train")
         if loader is None:
@@ -540,14 +639,25 @@ class Engine:
         n = 0
         gn_sum, gn_cnt = 0.0, 0   # grad-norm aggregated separately (skip non-finite overflow steps)
         # --- compute-efficiency accounting (excludes dataloading + diagnostics) ---
-        compute_s = 0.0          # wall-clock of model fwd+bwd+step only
+        # Timed with CUDA events, which are enqueued on the stream and do NOT block
+        # the host: the old per-step torch.cuda.synchronize() pair drained the GPU
+        # twice every step, destroying CPU/GPU overlap (the CPU could not build the
+        # next batch while the GPU ran). We instead record a start/end event per step
+        # and read their elapsed times after a SINGLE synchronize at epoch end, so
+        # ms/image stays accurate with zero per-step serialization.
+        use_cuda = self.device.type == "cuda"
+        compute_s = 0.0          # model fwd+bwd+step only (filled from events at epoch end on CUDA)
+        cuda_spans: list = []    # (start_event, end_event) per step
         n_clips_done, n_frames = 0, 0
-        if self.device.type == "cuda":
+        if use_cuda:
             torch.cuda.reset_peak_memory_stats()
         for step, batch in enumerate(loader):
             if self.max_steps and step >= self.max_steps:
                 break
             frames, queries, tgt = self._prep(batch)
+            # pseudo-GT: replace the real batch with synthetic novel-view clips when
+            # PSEUDO_GT.ENABLED (default OFF -> unchanged pass-through).
+            frames, queries, tgt = self._maybe_pseudo_gt(epoch, frames, queries, tgt)
             # observation-dropout curriculum: per-point contiguous spans of dropped
             # frame corrections (simulated occlusion) — the loss there trains the
             # prior + the neighbour-carry attention directly.
@@ -565,8 +675,12 @@ class Engine:
             else:
                 rollout_observe = self.rollout_observe
             self.optimizer.zero_grad(set_to_none=True)
-            self._sync()
-            _t0 = time.perf_counter()
+            if use_cuda:
+                ev0 = torch.cuda.Event(enable_timing=True)
+                ev1 = torch.cuda.Event(enable_timing=True)
+                ev0.record()
+            else:
+                _t0 = time.perf_counter()
             with self._autocast():
                 out = self.model(frames, queries, point_mask=tgt.get("point_mask"),
                                  observe_mask=observe_mask,
@@ -574,30 +688,32 @@ class Engine:
                                  gt_tracks=tgt["tracks"] if tf_prob > 0.0 else None,
                                  rollout_observe=rollout_observe)
                 total, parts = self.loss_fn(out, tgt)
-            grad_norm = 0.0
+            # Gradient norm is computed ONCE, fused into the clip call (clip_grad_norm_
+            # returns the pre-clip global L2 norm), instead of a separate per-parameter
+            # Python-loop reduction that synced the device to host for every tensor.
             if self.use_scaler:
                 self.scaler.scale(total).backward()
                 self.scaler.unscale_(self.optimizer)
-                grad_norm = self._grad_norm()
-                if self.grad_clip > 0:
-                    nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                grad_norm = self._grad_norm_and_clip()
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 total.backward()
-                grad_norm = self._grad_norm()
-                if self.grad_clip > 0:
-                    nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                grad_norm = self._grad_norm_and_clip()
                 self.optimizer.step()
-            self._sync()
-            compute_s += time.perf_counter() - _t0
+            if use_cuda:
+                ev1.record()
+                cuda_spans.append((ev0, ev1))
+            else:
+                compute_s += time.perf_counter() - _t0
             n_clips_done += int(frames.shape[0])             # B clips
             n_frames += int(frames.shape[0] * frames.shape[1])  # B*T frames (= "images")
 
             # mean Kalman gate (diagnostic: now free to learn a low gain where the
             # observation is noisier than the motion; not pinned open as before)
             gate = float(torch.sigmoid(out["gate_logits"]).mean().detach()) if "gate_logits" in out else float("nan")
-            gate_vis, gate_occ = self._gate_by_visibility(out, tgt, qf0)
+            mpm = self._metric_point_mask(queries, tgt)      # scoreable points only (visible at query)
+            gate_vis, gate_occ = self._gate_by_visibility(out, tgt, qf0, point_mask=mpm)
             coarse_gate = (float(out["coarse_gate"].mean().detach())
                            if "coarse_gate" in out else float("nan"))
             # train motion_ratio: how far the model's OWN predictions travel vs GT
@@ -618,7 +734,7 @@ class Engine:
             # full TAP metrics on the train batch (recorded coords are ALWAYS the
             # model's own predictions, so this is valid even while teacher-forced)
             tm = tracking_metrics(out["coords"], tgt["tracks"], out["vis_logits"],
-                                  tgt["visibility"], tgt.get("time_mask"), tgt.get("point_mask"))
+                                  tgt["visibility"], tgt.get("time_mask"), mpm)
             tm = {**tm, "epe_occ": parts["epe_occ"], "gate_vis": gate_vis,
                   "gate_occ": gate_occ, "coarse_gate": coarse_gate}
             for k in m_keys:
@@ -676,6 +792,11 @@ class Engine:
         for k in m_keys:                                     # NaN-safe TAP metric means
             out[k] = m_sum[k] / m_cnt[k] if m_cnt[k] else float("nan")
         out["grad_norm"] = gn_sum / gn_cnt if gn_cnt else float("nan")
+        # Fold the per-step CUDA event timings into compute_s with ONE synchronize
+        # (the only host/device sync the timing path now costs per epoch).
+        if use_cuda and cuda_spans:
+            torch.cuda.synchronize(self.device)
+            compute_s = sum(s.elapsed_time(e) for s, e in cuda_spans) / 1e3  # ms -> s
         peak_mem_gb = (torch.cuda.max_memory_allocated() / 1e9) if self.device.type == "cuda" else float("nan")
         self._train_perf = self._compute_perf(compute_s, n_frames, n_clips_done, peak_mem_gb)
         return self._all_reduce_dict(out)
@@ -723,18 +844,25 @@ class Engine:
             "world_size": float(self._world_size),
         }
 
-    def _grad_norm(self) -> float:
-        """Global L2 norm of model gradients (assumes grads are already unscaled).
+    def _grad_norm_and_clip(self) -> float:
+        """Clip gradients to ``GRAD_CLIP`` and return their global pre-clip L2 norm
+        in a SINGLE pass (assumes grads are already unscaled).
+
+        ``torch.nn.utils.clip_grad_norm_`` already computes the total L2 norm with a
+        fused ``foreach`` kernel and returns it, so we reuse that value instead of a
+        second, separate reduction. The old ``_grad_norm`` looped over parameters
+        calling ``float(p.grad.norm(2))`` — a device->host sync for *every* tensor —
+        and then ``clip_grad_norm_`` recomputed the same norm; this collapses both
+        into one fused kernel and one host sync. With ``GRAD_CLIP <= 0`` we pass
+        ``max_norm=inf`` so nothing is clipped but the norm is still measured.
 
         Returns NaN if non-finite (a GradScaler overflow step on the fp16 path leaves
-        inf/NaN grads here, even though ``scaler.step`` then skips the update) so the
+        inf/NaN grads, even though ``scaler.step`` then skips the update) so the
         spurious value is dropped from the epoch aggregate rather than poisoning it.
         """
-        total = 0.0
-        for p in self.model.parameters():
-            if p.grad is not None:
-                total += float(p.grad.detach().norm(2)) ** 2
-        g = total ** 0.5
+        max_norm = self.grad_clip if self.grad_clip > 0 else float("inf")
+        total = nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
+        g = float(total)
         return g if math.isfinite(g) else float("nan")
 
     def _forecast_mask(self, queries: torch.Tensor, tgt: Dict[str, torch.Tensor], T: int) -> torch.Tensor:
@@ -764,10 +892,11 @@ class Engine:
             with self._autocast():
                 out = self.model(frames, queries, point_mask=tgt.get("point_mask"))
                 total, parts = self.loss_fn(out, tgt)
+            mpm = self._metric_point_mask(queries, tgt)      # scoreable points only (visible at query)
             m = tracking_metrics(out["coords"], tgt["tracks"], out["vis_logits"],
-                                 tgt["visibility"], tgt.get("time_mask"), tgt.get("point_mask"))
+                                 tgt["visibility"], tgt.get("time_mask"), mpm)
             qf0 = max(0, min(int(queries[0, 0, 0].item()), frames.shape[1] - 1))
-            gate_vis, gate_occ = self._gate_by_visibility(out, tgt, qf0)
+            gate_vis, gate_occ = self._gate_by_visibility(out, tgt, qf0, point_mask=mpm)
             m = {**m, "epe_occ": parts["epe_occ"], "gate_vis": gate_vis, "gate_occ": gate_occ}
             if "coarse_gate" in out:
                 m["coarse_gate"] = float(out["coarse_gate"].mean())
@@ -783,7 +912,7 @@ class Engine:
                                        observe_steps=self.rollout_observe)
                 fmask = self._forecast_mask(queries, tgt, frames.shape[1])
                 m_r = tracking_metrics(out_r["coords"], tgt["tracks"], out_r["vis_logits"],
-                                       tgt["visibility"], fmask, tgt.get("point_mask"))
+                                       tgt["visibility"], fmask, mpm)
                 for k, v in m_r.items():
                     rk = f"rollout/{k}"
                     if v == v:
@@ -865,10 +994,16 @@ class Engine:
         with self._autocast():
             out = model(frames, queries, point_mask=tgt.get("point_mask"))
         tf = min(self.viz_frames, frames.shape[1]) if self.viz_frames > 0 else frames.shape[1]
-        pred_vis = (torch.sigmoid(out["vis_logits"][b, :tf]) > 0.5).cpu()
-        gt_xy = tgt["tracks"][b, :tf].cpu()
-        pr_xy = out["coords"][b, :tf].float().cpu()
-        gt_vis = tgt["visibility"][b, :tf].cpu()
+        # Render only the scoreable points (GT-visible at their query frame): a point
+        # occluded at its query was queried at the reader's placeholder coord and its
+        # track is garbage by construction — hiding it matches what the metrics score.
+        keep = self._metric_point_mask(queries, tgt)[b].cpu()
+        if not bool(keep.any()):
+            keep = torch.ones_like(keep)
+        pred_vis = (torch.sigmoid(out["vis_logits"][b, :tf]) > 0.5).cpu()[:, keep]
+        gt_xy = tgt["tracks"][b, :tf].cpu()[:, keep]
+        pr_xy = out["coords"][b, :tf].float().cpu()[:, keep]
+        gt_vis = tgt["visibility"][b, :tf].cpu()[:, keep]
         src = batch["frames"][b, :tf]
         tag = (f"{label} " if label else "") + f"{self.stage_name} {split} ep{epoch}" \
             + (f" b{step}" if step is not None else "")
@@ -1132,10 +1267,11 @@ class Engine:
     def _maybe_resume(self) -> None:
         """Restore weights/optimizer per ``RESUME`` policy.
 
-        * ``"scratch"`` — ignore every checkpoint, train from epoch 0 (still a fresh
-          init; rename ``EXPERIMENT_NAME`` only if you also want a separate run dir).
-        * ``"last"`` (default) — in-stage resume from ``last.pt``.
-        * ``"best"``  — in-stage resume from ``best.pt`` (falls back to ``last.pt``).
+        * ``"scratch"`` — ignore every checkpoint, train from epoch 0.
+        * ``"last"`` / ``"best"`` — in-stage resume from this run's checkpoint.
+        * ``"<source-run>"`` or ``"<source-run>:last|best"`` — warm-start model
+          weights from another run (epoch 0, fresh optimizer). When the source run
+          dir equals this run dir, ``last``/``best`` in-run semantics apply.
 
         When no in-stage checkpoint applies, carry the previous stage's weights.
         """
@@ -1144,13 +1280,39 @@ class Engine:
             logger.info(f"RESUME=scratch -- training stage {self.stage_idx} from scratch "
                         "(checkpoints ignored)")
             return
+
+        cross_run = is_cross_run_resume(self.resume_raw)
+        if cross_run:
+            source_dir = resolve_source_run_dir(self.resume_token, create=False)
+            same_run = source_dir.resolve() == self.run_dir.resolve()
+            if not same_run:
+                which = self.resume_ckpt_hint or str(self.config.get("RESUME_CHECKPOINT", "best")).lower()
+                ckpt_path = find_cross_run_checkpoint(source_dir, self.stage_idx, which)
+                if ckpt_path is None:
+                    logger.warning(
+                        f"RESUME={self.resume_token!r}: no checkpoint in {source_dir}; "
+                        "training from scratch"
+                    )
+                    return
+                ck = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+                n_missing, n_unexpected, n_skipped = self._load_compatible(m, ck["model"])
+                logger.info(
+                    f"warm-started stage {self.stage_idx} from {source_dir.name}/{ckpt_path.parent.name}/{ckpt_path.name} "
+                    f"(cross-run; epoch 0; missing={n_missing}, unexpected={n_unexpected})"
+                )
+                if n_skipped:
+                    logger.warning(
+                        f"reinitialized {n_skipped} shape-mismatched param(s) on cross-run warm-start"
+                    )
+                return
+
         if self.resume_mode == "best":
             ckpt_path = self.dir / "best.pt"
             if not ckpt_path.exists():
                 ckpt_path = self.dir / "last.pt"
         else:                                            # "last" (default) or unknown
             if self.resume_mode not in ("last",):
-                logger.warning(f"unknown RESUME={self.resume_mode!r}; defaulting to 'last'")
+                logger.warning(f"unknown RESUME={self.resume_raw!r}; defaulting to 'last'")
             ckpt_path = self.dir / "last.pt"
         last = ckpt_path
         if last.exists():

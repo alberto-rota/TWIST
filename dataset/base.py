@@ -126,6 +126,7 @@ class BaseTracksDataset(torch.utils.data.Dataset):
         load_depths: bool = False,
         frames_as_float: bool = False,
         seed: int = 0,
+        subsample: Optional[float] = None,
     ):
         self.include = list(include) if include is not None else None
         self.exclude = list(exclude) if exclude is not None else None
@@ -150,6 +151,12 @@ class BaseTracksDataset(torch.utils.data.Dataset):
         self.load_depths = load_depths
         self.frames_as_float = frames_as_float
         self.seed = int(seed)
+        # Deterministic clip-index subsampling applied after the index is built
+        # (see the subclass ``_build_index``). ``None``/``>=1`` keeps everything;
+        # ``0 < f < 1`` keeps an evenly-spread fraction; ``<= 0`` keeps none.
+        # Used for a small, *representative* per-epoch val set (VAL_SUBSAMPLE),
+        # decoupled from VAL_FRACTION (the train/val split ratio).
+        self.subsample = subsample
 
         if crop is not None:
             x0, y0, x1, y1 = (int(v) for v in crop)
@@ -208,6 +215,12 @@ class BaseTracksDataset(torch.utils.data.Dataset):
         """
         th, tw = self.target_size
         ch, cw = cur_hw
+        # Fast path: the source is already exactly the target size (e.g. Kubric is
+        # stored at 512² and trains at 512²). Both geometries reduce to identity
+        # there (scale 1, no crop), so skip the ~300 ms CPU bilinear F.interpolate
+        # over (T,3,H,W) and the float<->uint8 round-trip — pure wasted work.
+        if (ch, cw) == (th, tw):
+            return frames, depths, tracks, queries, (th, tw)
         if self.resize_mode == "stretch":
             rh, rw = th, tw                                  # direct anisotropic resize
             oy = ox = 0                                      # no crop

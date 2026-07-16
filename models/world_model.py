@@ -57,6 +57,35 @@ from models.encoder import (
 LOGVAR_MIN, LOGVAR_MAX = -10.0, 2.0
 
 
+class FeatureUpsampler(nn.Module):
+    """Learned upsampler for the frozen encoder's dense feature map.
+
+    DINOv3 patch-16 yields a coarse ``Hf x Wf`` grid (32x32 @512) — the suspected
+    ceiling on sub-2px localization (bilinear feature sampling cannot resolve detail
+    the grid never carried). This trainable head lifts ``(B,C,Hf,Wf)`` to
+    ``(B,C,factor*Hf,factor*Wf)`` while **preserving the channel dim** ``C``, so every
+    downstream consumer (template sampling, local cost-volume, global match) sees a
+    finer grid with no other change — sampling is coordinate-based (normalized by the
+    pixel frame size, not the grid), so a denser grid is transparent. A channel
+    ``bottleneck`` keeps it cheap; the body is bilinear-upsample + a learned refine.
+    Never built when disabled (features pass through untouched = byte-identical v1).
+    """
+
+    def __init__(self, c: int, factor: int = 2, bottleneck: int = 256) -> None:
+        super().__init__()
+        self.factor = int(factor)
+        self.proj_in = nn.Conv2d(c, bottleneck, kernel_size=1)
+        self.refine = nn.Conv2d(bottleneck, bottleneck, kernel_size=3, padding=1)
+        self.proj_out = nn.Conv2d(bottleneck, c, kernel_size=1)
+        self.act = nn.GELU()
+
+    def forward(self, feats: torch.Tensor) -> torch.Tensor:  # (B,C,Hf,Wf)->(B,C,f*Hf,f*Wf)
+        y = self.act(self.proj_in(feats))
+        y = F.interpolate(y, scale_factor=self.factor, mode="bilinear", align_corners=False)
+        y = self.act(self.refine(y))
+        return self.proj_out(y)
+
+
 class ParticleState(TypedDict):
     pos: torch.Tensor        # (B, N, 2) pixel coordinates (x, y)
     vel: torch.Tensor        # (B, N, 2) last realized velocity (normalized units / frame)
@@ -349,12 +378,22 @@ class TrackerWorldModel(nn.Module):
         uncertainty: bool = True,
         encode_chunk: int = 32,
         rollout_vel_decay: float = 1.0,
+        feat_upsample: bool = False,
+        feat_upsample_factor: int = 2,
+        feat_upsample_bottleneck: int = 256,
         verbose: bool = True,
         **kwargs,
     ) -> None:
         super().__init__()
         self.encoder = encoder
         c = encoder.feature_dim
+        # Optional learned finer feature grid (precision lever; None = v1 behaviour).
+        # Lives here (not on the frozen encoder) so its params land in the trainable
+        # LR group, not the encoder group.
+        self.feat_upsampler = (
+            FeatureUpsampler(c, feat_upsample_factor, feat_upsample_bottleneck)
+            if feat_upsample else None
+        )
         self.transition = TransitionModel(c, token_dim, hidden_dim, trans_heads, trans_depth,
                                           max_step=trans_max_step, vis_input=trans_vis_input)
         self.observation = ObservationModel(c, token_dim, obs_heads, obs_k, obs_radius_px,
@@ -444,12 +483,20 @@ class TrackerWorldModel(nn.Module):
 
     # -- encoding ------------------------------------------------------------- #
     def _encode(self, frames: torch.Tensor) -> torch.Tensor:
-        """``frames (B,T,3,H,W)`` -> ``feats (B,T,C,Hf,Wf)`` (chunked)."""
+        """``frames (B,T,3,H,W)`` -> ``feats (B,T,C,Hf,Wf)`` (chunked).
+
+        With ``feat_upsampler`` enabled the frozen features are lifted to a finer
+        grid (larger Hf,Wf, same C) per chunk before returning; grads flow to the
+        upsampler even though the encoder output is detached (frozen).
+        """
         b, t = frames.shape[:2]
         flat = frames.reshape(b * t, *frames.shape[2:])
         outs: List[torch.Tensor] = []
         for i in range(0, flat.shape[0], self.encode_chunk):
-            outs.append(self.encoder(flat[i:i + self.encode_chunk]))
+            f = self.encoder(flat[i:i + self.encode_chunk])
+            if self.feat_upsampler is not None:
+                f = self.feat_upsampler(f)
+            outs.append(f)
         feats = torch.cat(outs, dim=0)
         return feats.reshape(b, t, *feats.shape[1:])
 

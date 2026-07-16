@@ -9,6 +9,11 @@ Recovery artifacts. Each method logs to W&B under its own **run name** tagged
 **`benchmark`** in `twisteam/twist`, and writes its CSVs to
 `$RESULTS_DIR/<run-name>/`.
 
+See **`INTEGRATION_NOTES.md`** for the full adapter/harness convention (the
+forward contract, `supports_query_times`, import isolation, config + weights
+layout) and **`SETUP_TRACKERS.md`** for the ordered, per-method install / weight /
+dataset commands (the heavy steps kept out of the jobs).
+
 ## Layout
 
 ```
@@ -54,6 +59,7 @@ Common flags (all methods, defined in `common.py`): `--datasets`, `--max-clips`,
 | CoTracker3 | ✅ `cotracker/` | online (scaled) | works as before; source moved to `methods/co-tracker` |
 | LocoTrack  | ✅ `locotrack/` | base (PyTorch) | clean |
 | TAPIR      | ✅ `tapir/`     | BootsTAPIR offline | clean (torch path, no JAX) |
+| TAPIR (online) | ✅ `tapir_online/` | Online BootsTAPIR (causal) | causal frame-by-frame (DeepMind live-demo loop); `supports_query_times=False`; needs the **causal** `causal_bootstapir_checkpoint.pt` (≠ offline ckpt); shared `.venv`; untested end-to-end — smoke-test first |
 | TAPNext    | ✅ `tapnext/`   | BootsTAPNext | online/causal only, needs a GPU **even to construct** the model (upstream hardcodes `device='cuda'`); frame-by-frame (no windowing), so the heaviest online baseline on long clips; needs `einops` (added to `pyproject.toml`); untested end-to-end (no GPU on the login node) — smoke-test first |
 | LiteTracker | ✅ `litetracker/` | LiteTracker (MICCAI'25) | training-free runtime re-opt of CoTracker3-online; loads CoTracker3's **exact** `scaled_online.pth` (0 missing/0 unexpected) so it reuses the cached `weights/cotracker/` ckpt (no separate download); online/causal frame-by-frame; runs on shared `.venv` (torch/einops/numpy/cv2). GPU-smoke-verified: DAVIS EPE 6.95/δ 0.494/AJ 0.391/OA 0.945 @ 12ms/frame (~3× faster than CoTracker/TAPNext) |
 | Track-On   | ✅ `trackon/`   | track_on_r | needs gated DINOv3 + mmcv (dedicated venv) |
@@ -87,6 +93,11 @@ mkdir -p weights/locotrack && \
 mkdir -p weights/tapir && \
   wget -O weights/tapir/bootstapir.pt \
   https://storage.googleapis.com/dm-tapnet/bootstap/bootstapir_checkpoint_v2.pt
+
+# --- Online BootsTAPIR (CAUSAL; used by tapir_online/ — a DIFFERENT file from the offline ckpt) ---
+mkdir -p weights/tapir && \
+  wget -O weights/tapir/causal_bootstapir.pt \
+  https://storage.googleapis.com/dm-tapnet/bootstap/causal_bootstapir_checkpoint.pt
 
 # --- BootsTAPNext (auto-downloads on first run; or fetch manually; public, no auth) ---
 mkdir -p weights/tapnext && \

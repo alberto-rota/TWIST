@@ -137,6 +137,11 @@ parameters:
   ###===========================================================================================================================
   VAL_EVERY:
     value: 1
+  VAL_SUBSAMPLE:
+    value: 0.15   # per-epoch val = this fraction of EACH dataset's val clips (evenly spread, deterministic).
+                  # Bounds validate() to minutes AND keeps it representative; applies across stages unless a
+                  # stage overrides it. Per-dataset override inside a DATASETS entry (0 = drop from val).
+                  # Surgical benchmarks are still scored in full by benchmark eval (eval/*).
   EARLY_STOP_PATIENCE:
     value: 20   # NB: on the surgical stage this monitors PSEUDO-val-epe (teacher agreement),
                 # not truth — patience >= EPOCHS effectively disables it; judge by eval/*.

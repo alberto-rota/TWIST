@@ -242,6 +242,11 @@ parameters:
   ###===========================================================================================================================
   VAL_EVERY:
     value: 1
+  VAL_SUBSAMPLE:
+    value: 0.15   # per-epoch val = this fraction of EACH dataset's val clips (evenly spread, deterministic),
+                  # decoupled from VAL_FRACTION (the split ratio). Bounds validate() to minutes AND keeps it
+                  # representative. Per-dataset override: set VAL_SUBSAMPLE inside a DATASETS entry (0 = drop
+                  # that set from per-epoch val). Full benchmarks are still scored by EVAL_AT_END.
   EARLY_STOP_PATIENCE:
     value: 20
   ROLLOUT_EVAL:

@@ -227,6 +227,14 @@ class FrozenFrameEncoder(nn.Module):
         freeze = bool(cfg.get("freeze_backbone", True)) or (encoder_lr in (0, 0.0, None))
         self.frozen = freeze
 
+        # Which transformer layer to read as the dense feature map. ``None`` = the
+        # final hidden state (v1, default). An int selects a mid-block hidden state
+        # (a precision lever: earlier DINOv3 layers can carry finer spatial detail
+        # than the semantics-tuned last block). Negative indexes from the end
+        # (-1 == last == None-equivalent, -4 == 4th-from-last). ``dino`` only.
+        fl = cfg.get("feature_layer", None)
+        self.feature_layer = None if fl in (None, "", "null") else int(fl)
+
         if self.variant == "cnn":
             self.backbone = _CNNBackbone(
                 feature_dim=int(cfg.get("feature_dim", 64)),
@@ -235,13 +243,22 @@ class FrozenFrameEncoder(nn.Module):
             self.feature_dim = self.backbone.feature_dim
             self.patch_size = self.backbone.patch_size
         elif self.variant in ("dino", "dinov3", "dinov2"):
-            self.backbone = DINOv3({
+            dino_cfg = {
                 "model_name": cfg.get("model_name", "facebook/dinov3-vitl16-pretrain-lvd1689m"),
                 "image_size": int(cfg.get("image_size", 256)),
                 "freeze_backbone": freeze,
-                "return_last_hidden_state": True,
                 "return_as_feature_maps": True,
-            })
+            }
+            if self.feature_layer is None:
+                dino_cfg["return_last_hidden_state"] = True
+            else:
+                # Return one mid-transformer hidden state as the feature map. NB:
+                # keep return_patch_tokens_only=False so the 5-token (CLS+4 reg)
+                # prefix is stripped exactly once — inside tokens_to_feature_maps.
+                dino_cfg["return_last_hidden_state"] = False
+                dino_cfg["return_selected_layers"] = [self.feature_layer]
+                dino_cfg["return_patch_tokens_only"] = False
+            self.backbone = DINOv3(dino_cfg)
             self.feature_dim = self.backbone.feature_dim
             self.patch_size = self.backbone.patch_size
         else:
@@ -291,4 +308,7 @@ class FrozenFrameEncoder(nn.Module):
             if self.variant == "cnn":
                 return self.backbone(x)
             x = self._preprocess_dino(x)                   # on-device resize + normalize
-            return self.backbone(x)["last_hidden_state"]   # (B, C, Hf, Wf)
+            out = self.backbone(x)
+            if self.feature_layer is None:
+                return out["last_hidden_state"]            # (B, C, Hf, Wf)
+            return out["selected_hidden_states"][0]        # (B, C, Hf, Wf)

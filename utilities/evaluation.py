@@ -146,6 +146,13 @@ RECOVERY_HEADERS = {
 }
 # Nested per-dataset structured recovery output (by_length / tho_by_length / drift_epe).
 RECOVERY_DETAIL_KEY = "_recovery_detail"
+# Per-dataset rendered eval videos (list of {kind, label, frames} dicts). Popped out
+# of the metrics dict by the reporting layer BEFORE caching/CSV (numpy arrays are not
+# JSON-serialisable); logged to W&B as eval/videos/* and saved as MP4s under the run
+# dir. Rendered from the SAME coords the metrics score (queried-first in "first"
+# mode), with each point hidden before its own first-visible (query) frame — the
+# honest visualization the training-val videos historically were not.
+EVAL_VIZ_KEY = "_viz"
 
 
 def _nanmean(xs: List[float]) -> float:
@@ -221,8 +228,16 @@ def select_eval_datasets(config: Any) -> List[str]:
     datasets_cfg = _as_dict(config.get("DATASETS"))
     reserved = {ALL_DATASETS_KEY, OVERRIDE_ALL_DATASETS_KEY}
     candidates = set(DATASET_DEFAULTS) | {n for n in datasets_cfg if n not in reserved}
-    selected = [n for n in sorted(candidates)
-                if bool(_merged_dataset_cfg(n, datasets_cfg).get(IS_EVAL_DATASET_KEY, False))]
+    selected = []
+    for n in sorted(candidates):
+        merged = _merged_dataset_cfg(n, datasets_cfg)
+        # Hard disable: VAL_FRACTION < 0 removes the dataset everywhere, eval
+        # included -- even if it carries IS_EVAL_DATASET (mirrors the skip in
+        # create_datasets_from_config).
+        if float(merged.get("VAL_FRACTION", 0.1)) < 0:
+            continue
+        if bool(merged.get(IS_EVAL_DATASET_KEY, False)):
+            selected.append(n)
     return selected
 
 
@@ -280,6 +295,82 @@ def _amp_settings(device: torch.device, amp: Optional[bool], amp_dtype):
 
 # Benchmark query protocols (how each GT point's query frame is chosen).
 QUERY_MODES = ("first", "frame0")
+
+
+@torch.no_grad()
+def _render_eval_clip(
+    batch,
+    coords: torch.Tensor,          # (B,T,N,2) the SCORED predictions
+    vis_logits: torch.Tensor,      # (B,T,N)
+    gt_tracks: torch.Tensor,
+    gt_vis: torch.Tensor,
+    point_mask,
+    *,
+    name: str,
+    viz_size: int,
+    viz_max_frames: int,
+    viz_max_points: int,
+    occluded_coords_real: bool,
+    b: int = 0,
+):
+    """Render one eval clip to its ``compare`` / ``pred_tracks`` video arrays.
+
+    Uses the same coords the metrics score, and hides every point before its own
+    first GT-visible frame (= its queried-first query frame): a prediction before a
+    point's query does not exist under the protocol, so drawing it (the old
+    train-val videos did, from a frame-0 query at the reader's ``(0,0)`` occluded
+    placeholder) shows garbage that the metrics never count. Points never visible
+    (or padded out by ``point_mask``) are dropped entirely.
+
+    Returns ``[{kind, label, frames}, ...]`` with ``frames`` ``(T,3,S,S)`` uint8,
+    or ``[]`` when nothing is renderable.
+    """
+    from utilities.visualization import render_comparison_frames, render_track_frames
+
+    vis_b = gt_vis[b].bool()                                     # (T,N)
+    keep = vis_b.any(0)                                          # visible somewhere
+    if point_mask is not None:
+        keep &= point_mask[b].bool()
+    if not bool(keep.any()):
+        return []
+    # active from each point's first-visible frame onward (cummax over visibility)
+    active = torch.cummax(vis_b.float(), dim=0)[0] > 0           # (T,N)
+    pred_vis = (torch.sigmoid(vis_logits[b].float()) > 0.5) & active
+
+    t_full = vis_b.shape[0]
+    t_idx = None
+    if viz_max_frames and t_full > viz_max_frames:               # stride-subsample long videos
+        t_idx = torch.linspace(0, t_full - 1, viz_max_frames).round().long()
+
+    def _sub(x):                                                 # (T,N,...) -> kept points/frames
+        x = x[:, keep]
+        return x if t_idx is None else x[t_idx]
+
+    frames_src = batch["frames"][b]                              # (T,3,H,W) uint8, CPU original
+    if t_idx is not None:
+        frames_src = frames_src[t_idx]
+    gt_xy = _sub(gt_tracks[b].float().cpu())
+    pr_xy = _sub(coords[b].float().cpu())
+    gv = _sub(vis_b.cpu())
+    pv = _sub(pred_vis.cpu())
+
+    video = batch.get("video")
+    label = f"{name} {video[b]}" if video is not None else name
+    compare = render_comparison_frames(
+        frames_src, gt_xy, pr_xy, gt_visibility=gv, pred_visibility=pv,
+        max_points=viz_max_points, out_size=viz_size,
+        title=f"{label} [queried-first]",
+        occluded_coords_real=occluded_coords_real,
+    )
+    tracks = render_track_frames(
+        frames_src, pr_xy, visibility=pv,
+        max_points=viz_max_points, out_size=viz_size,
+        title=f"{label} pred [queried-first]",
+    )
+    return [
+        {"kind": "compare", "label": label, "frames": compare},
+        {"kind": "pred_tracks", "label": label, "frames": tracks},
+    ]
 
 
 @torch.no_grad()
@@ -389,6 +480,10 @@ def evaluate_model_on_dataset(
     name: Optional[str] = None,
     log_every: int = 50,
     timing_batches: int = 10,
+    viz_clips: int = 0,
+    viz_size: int = 256,
+    viz_max_frames: int = 0,
+    viz_max_points: int = 48,
 ) -> Dict[str, float]:
     """Run ``model`` over ``dataset`` and return the reported metric means.
 
@@ -416,6 +511,13 @@ def evaluate_model_on_dataset(
     ``name`` (optional) tags the progress lines; ``log_every`` controls how often the
     ``processed X/Y clips`` line is emitted (every N clips; ``0`` disables it). Each
     progress line includes the latest batch ``frames`` / ``queries`` tensor shapes.
+
+    ``viz_clips`` > 0 renders the first that-many clips' scored predictions to video
+    arrays (see :func:`_render_eval_clip`) returned under ``result["_viz"]`` —
+    protocol-honest qualitative eval (each point drawn only from its own query frame
+    on). ``viz_max_frames`` stride-subsamples videos longer than that (0 = keep all
+    frames); ``viz_size`` / ``viz_max_points`` mirror the engine's VIZ knobs. The
+    rendering happens outside the timed section, so ``ms_per_frame`` is unaffected.
     """
     model.eval()
     if query_mode not in QUERY_MODES:
@@ -438,6 +540,7 @@ def evaluate_model_on_dataset(
     agg: Dict[str, float] = {k: 0.0 for k in _QUALITY_KEYS}
     cnt: Dict[str, int] = {k: 0 for k in _QUALITY_KEYS}
     rec_stats: Dict[str, float] = {}                     # POR sufficient stats, pooled over clips
+    viz_out: List[Dict[str, Any]] = []                   # rendered eval videos (first viz_clips clips)
     compute_s = 0.0
     timed_frames = 0
     n_clips = 0
@@ -531,6 +634,18 @@ def evaluate_model_on_dataset(
             rec_stats = merge_recovery_stats(rec_stats, recovery_metrics(
                 rec_coords, gt_tracks, rec_vislog, gt_vis, point_mask=point_mask,
                 has_occluded_gt=has_occluded_gt, window=recovery_window, **thr_kw))
+        # Protocol-honest qualitative viz from the SAME coords the metrics scored
+        # (best-effort; rendering must never fail an evaluation).
+        if len(viz_out) < 2 * viz_clips:
+            try:
+                viz_out += _render_eval_clip(
+                    batch, rec_coords, rec_vislog, gt_tracks, gt_vis, point_mask,
+                    name=name or "eval", viz_size=viz_size,
+                    viz_max_frames=viz_max_frames, viz_max_points=viz_max_points,
+                    occluded_coords_real=not visible_only,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"    {tag}eval viz skipped ({e})")
         n_clips += int(frames.shape[0])
         n_frames += nf
 
@@ -561,6 +676,8 @@ def evaluate_model_on_dataset(
         result[RECOVERY_DETAIL_KEY] = {
             kk: rec[kk] for kk in ("by_length", "tho_by_length", "drift_epe") if kk in rec
         }
+    if viz_out:
+        result[EVAL_VIZ_KEY] = viz_out
     return result
 
 
@@ -608,6 +725,12 @@ def evaluate(
     qm = (query_mode or str(config.get("EVAL_QUERY_MODE", "first"))).lower()
     compute_recovery = bool(config.get("EVAL_RECOVERY", True))
     recovery_window = int(config.get("EVAL_RECOVERY_WINDOW", 8))
+    # Protocol-honest qualitative videos per dataset (0 disables). Defaults follow
+    # the engine's VIZ_* knobs so eval videos match the training ones in look.
+    viz_clips = int(config.get("EVAL_VIZ_CLIPS", 1))
+    viz_size = int(config.get("EVAL_VIZ_SIZE", config.get("VIZ_SIZE", 256)))
+    viz_max_frames = int(config.get("EVAL_VIZ_MAX_FRAMES", 0))
+    viz_max_points = int(config.get("EVAL_VIZ_MAX_POINTS", config.get("VIZ_MAX_POINTS", 48)))
     datasets_cfg = _as_dict(config.get("DATASETS"))
     cached_results = cached_results or {}
     logger.info(f"evaluating on {len(names)} dataset(s) [query_mode={qm}, "
@@ -646,6 +769,8 @@ def evaluate(
             recovery_window=recovery_window, eval_thresholds=eval_thr,
             visible_only=vis_only, name=name,
             timing_batches=int(config.get("EVAL_TIMING_BATCHES", 10)),
+            viz_clips=viz_clips, viz_size=viz_size,
+            viz_max_frames=viz_max_frames, viz_max_points=viz_max_points,
         )
         results[name] = m
         rec_suffix = ""
@@ -917,6 +1042,52 @@ def log_recovery_wandb(
         logger.warning(f"W&B recovery table log skipped ({e})")
 
 
+def log_eval_videos(
+    name: str,
+    viz: Optional[List[Dict[str, Any]]],
+    wandb_run: Any,
+    run_dir: Any,
+    *,
+    tag: str = "",
+    epoch: Optional[int] = None,
+    fps: int = 8,
+) -> None:
+    """Publish one dataset's rendered eval clips (see :func:`_render_eval_clip`).
+
+    Two sinks, both best-effort (viz must never fail an evaluation):
+
+      * **W&B** — ``eval/videos/<kind>_<name>`` ``wandb.Video`` (mp4), the eval-time
+        sibling of the engine's ``val/videos/*`` — but rendered under the
+        queried-first protocol, so what you see is what the metrics scored.
+      * **Disk** — ``<run_dir>/eval_viz/<name>_<kind>[_<tag>].mp4`` via imageio, so
+        a no-W&B ``evaluate.py`` run still leaves inspectable videos.
+    """
+    if not viz:
+        return
+    sfx = f"_{tag}" if tag else ""
+    out_dir = Path(run_dir) / "eval_viz"
+    for i, item in enumerate(viz):
+        kind, frames = item["kind"], item["frames"]          # (T,3,S,S) uint8
+        multi = f"_{i // 2}" if len(viz) > 2 else ""          # >1 clip per dataset
+        if wandb_run is not None:
+            try:
+                import wandb
+                row = {f"eval/videos/{kind}_{name}{multi}": wandb.Video(frames, fps=fps, format="mp4")}
+                if epoch is not None:
+                    row["eval/epoch"] = epoch
+                wandb_run.log(row)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"W&B eval video log skipped for {name} ({e})")
+        try:
+            import imageio
+            out_dir.mkdir(parents=True, exist_ok=True)
+            path = out_dir / f"{name}{multi}_{kind}{sfx}.mp4"
+            imageio.mimwrite(path, frames.transpose(0, 2, 3, 1), fps=fps,
+                             codec="libx264", quality=7)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"eval video save skipped for {name} ({e})")
+
+
 # --------------------------------------------------------------------------- #
 # Orchestrator (used by the engine + the standalone CLI)
 # --------------------------------------------------------------------------- #
@@ -966,6 +1137,11 @@ def evaluate_and_report(
     partial: Dict[str, Dict[str, Any]] = {}
 
     def _on_dataset_done(name: str, metrics: Dict[str, Any], from_cache: bool) -> None:
+        # Pop the rendered videos FIRST: numpy arrays must never reach the JSON eval
+        # state or the CSV writer. Cached datasets carry no videos (not re-rendered).
+        viz = metrics.pop(EVAL_VIZ_KEY, None)
+        log_eval_videos(name, viz, wandb_run, run_dir, tag=tag, epoch=epoch,
+                        fps=int(config.get("EVAL_VIZ_FPS", config.get("VIZ_FPS", 8))))
         partial[name] = metrics
         log_dataset_wandb(name, metrics, wandb_run, epoch=epoch)
         if not from_cache:
