@@ -13,6 +13,7 @@ DATA/
 co-tracker/
 .env
 .sbatch_scripts/
+.claude/
 assets/
 # Run artifacts
 results/

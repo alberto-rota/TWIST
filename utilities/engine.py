@@ -329,6 +329,10 @@ class Engine:
         # Both default off, so existing runs are unaffected.
         self.eval_at_end = bool(config.get("EVAL_AT_END", False))
         self.eval_every = int(config.get("EVAL_EVERY", 0))
+        # EVAL_EVERY_EXCLUDE: dataset name(s) to skip in the per-epoch monitoring eval
+        # only (still scored at EVAL_AT_END) -- e.g. an expensive benchmark whose long
+        # clips would slow every epoch. Passed to evaluate_and_report on periodic calls.
+        self.eval_every_exclude = config.get("EVAL_EVERY_EXCLUDE", None)
         self.eval_max_clips = config.get("EVAL_MAX_CLIPS", None)
         self.eval_batch_size = int(config.get("EVAL_BATCH_SIZE", 1))
         self.eval_workers = int(config.get("EVAL_WORKERS", 0))
@@ -617,6 +621,13 @@ class Engine:
             return {}
         if self._train_sampler is not None:
             self._train_sampler.set_epoch(epoch)
+        # Advance per-epoch point resampling on the train readers (no-op unless
+        # RESAMPLE_POINTS_PER_EPOCH is on). ConcatDataset -> each sub-reader; val
+        # readers are deliberately never advanced (fixed val point set).
+        _tds = getattr(loader, "dataset", None)
+        for _reader in (getattr(_tds, "datasets", None) or ([_tds] if _tds is not None else [])):
+            if hasattr(_reader, "set_epoch"):
+                _reader.set_epoch(epoch)
         self.model.train()
         if getattr(self.model, "encoder", None) is not None and getattr(self.model.encoder, "frozen", False):
             self.model.encoder.eval()                    # keep the frozen backbone in eval
@@ -932,9 +943,13 @@ class Engine:
 
     # -- benchmark evaluation ------------------------------------------------ #
     @torch.no_grad()
-    def _run_evaluation(self, epoch: int, tag: str) -> None:
-        """Run the standalone benchmark evaluation on the IS_EVAL_DATASET datasets
+    def _run_evaluation(self, epoch: int, tag: str, periodic: bool = False) -> None:
+        """Run the standalone benchmark evaluation on the selected eval datasets
         (rank-0 only, on the unwrapped model) and write its CSV + W&B table.
+
+        ``periodic`` marks the per-epoch monitoring call (``EVAL_EVERY``): it forwards
+        ``EVAL_EVERY_EXCLUDE`` so an expensive dataset is dropped from the every-epoch
+        pass while the end-of-stage (``EVAL_AT_END``) pass still scores it.
 
         Other ranks wait at the trailing barrier so they don't race into the next
         gradient all-reduce while rank 0 evaluates. Never raises into the loop.
@@ -950,6 +965,7 @@ class Engine:
                 max_clips=self.eval_max_clips, batch_size=self.eval_batch_size,
                 num_workers=self.eval_workers, amp=self.amp, amp_dtype=self.amp_dtype,
                 max_steps=self.eval_max_steps,
+                exclude_datasets=(self.eval_every_exclude if periodic else None),
             )
         except Exception as e:  # noqa: BLE001 -- eval must never crash training
             logger.warning(f"benchmark evaluation skipped ({e})")
@@ -1417,7 +1433,7 @@ class Engine:
             # the IS_EVAL_DATASET datasets every EVAL_EVERY epochs. Its own CSV /
             # W&B table snapshot, tagged with the epoch.
             if self.eval_every and epoch % self.eval_every == 0:
-                self._run_evaluation(epoch, tag=f"{self.stage_name}_ep{epoch + 1}")
+                self._run_evaluation(epoch, tag=f"{self.stage_name}_ep{epoch + 1}", periodic=True)
 
             if self.patience and self._bad_epochs >= self.patience:
                 if self._is_main_process():

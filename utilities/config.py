@@ -476,6 +476,15 @@ def create_datasets_from_config(
         )
 
         kw = _reader_kwargs(merged, reader_cls)
+        # Per-epoch point resampling only varies the seeded "random" sampler; the
+        # deterministic modes ("even"/"grid"/"first") ignore the seed, so the flag
+        # would silently do nothing. Warn rather than fail (harmless no-op).
+        if kw.get("resample_points_per_epoch") and kw.get("point_sample_mode") != "random":
+            logger.warning(
+                f"  {name}: RESAMPLE_POINTS_PER_EPOCH is on but POINT_SAMPLE_MODE="
+                f"{kw.get('point_sample_mode')!r} is deterministic (ignores the seed) — "
+                "per-epoch resampling has NO effect; set POINT_SAMPLE_MODE: random to use it"
+            )
         if train_seqs:
             tr = reader_cls(root=root, include=train_seqs, **kw)
             tr.dataset_name = name                      # for per-dataset viz / logging
@@ -488,6 +497,11 @@ def create_datasets_from_config(
             val_kw = dict(kw)
             if val_kw.get("point_sample_mode") == "random":
                 val_kw["point_sample_mode"] = "even"  # reproducible val metrics
+            # Val point set must be fixed across epochs (else val/epe wobbles from
+            # a moving target, not the model). set_epoch is train-only, but disable
+            # resampling here too so the val reader never allocates the counter.
+            if val_kw.get("resample_points_per_epoch"):
+                val_kw["resample_points_per_epoch"] = False
             vfrac = merged.get("VAL_SUBSAMPLE", global_val_subsample)  # per-dataset override < global
             if vfrac is not None:
                 val_kw["subsample"] = float(vfrac)    # keep only a representative fraction in per-epoch val
@@ -520,6 +534,12 @@ def create_datasets_from_config(
 def _collate_for(dataset):
     """Default collate when clips are fixed-shape; padding collate otherwise."""
     sets = dataset.datasets if isinstance(dataset, ConcatDataset) else [dataset]
+    # Each set may be individually fixed-shape yet carry a different N across a
+    # concat (e.g. Kubric MAX_POINTS 512 + PointOdyssey 384) -> a mixed batch is
+    # variable-N and needs padding.
+    max_pts = {getattr(s, "max_points", None) for s in sets}
+    if len(max_pts) > 1:
+        return pad_collate
     return None if all(is_fixed_shape(s) for s in sets) else pad_collate
 
 
@@ -633,6 +653,19 @@ def create_model_from_config(config: "DotMap", device, verbose: bool = True):
     encoder_name = enc.get("ENCODER", "facebook/dinov3-vitl16-pretrain-lvd1689m")
     encoder_lr = enc.get("RGB_ENCODER_LR", 0.0)
     variant = "cnn" if str(encoder_name).lower() == "cnn" else "dino"
+
+    # Multi-layer feature fusion (MODEL.FEATURE_FUSE; default OFF = single-layer
+    # architecture, checkpoint-compatible). dino only — force OFF on the cnn
+    # fallback (boot/smoke) so the world model gets a single map, not a list.
+    fuse = _as_dict(mc.get("FEATURE_FUSE"))
+    fuse_layers = [int(x) for x in fuse.get("LAYERS", [])]
+    fuse_enabled = bool(fuse.get("ENABLED", False)) and variant == "dino" and len(fuse_layers) > 0
+    if fuse_enabled:
+        anchor = fuse.get("ANCHOR", fuse_layers[0])
+        fuse_anchor_pos = fuse_layers.index(int(anchor)) if int(anchor) in fuse_layers else 0
+    else:
+        fuse_layers, fuse_anchor_pos = None, 0
+
     encoder_cfg = {
         "variant": variant,
         "model_name": encoder_name,
@@ -644,6 +677,9 @@ def create_model_from_config(config: "DotMap", device, verbose: bool = True):
         # None = final hidden state (v1); int selects a mid-transformer layer as the
         # dense feature map (precision lever; dino only).
         "feature_layer": enc.get("FEATURE_LAYER", None),
+        # list of layers -> multi-layer fusion (takes precedence over feature_layer;
+        # the encoder returns K maps, fused in the world model). None = off.
+        "feature_layers": fuse_layers,
     }
     encoder = models_module.FrozenFrameEncoder(encoder_cfg).to(device)
 
@@ -677,6 +713,11 @@ def create_model_from_config(config: "DotMap", device, verbose: bool = True):
         feat_upsample=bool(ups.get("ENABLED", False)),
         feat_upsample_factor=int(ups.get("FACTOR", 2)),
         feat_upsample_bottleneck=int(ups.get("BOTTLENECK", 256)),
+        # Multi-layer DINOv3 feature fusion (precision + re-acquisition lever; default
+        # OFF). Pass-through-initialized to the anchor layer (== single-layer at init).
+        feat_fuse=fuse_enabled,
+        feat_fuse_n_layers=(len(fuse_layers) if fuse_enabled else 1),
+        feat_fuse_anchor_pos=fuse_anchor_pos,
         verbose=verbose,
     ).to(device)
 

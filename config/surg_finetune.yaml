@@ -204,13 +204,19 @@ parameters:
   EVAL_AT_END:
     value: true
   EVAL_EVERY:
-    value: 5
+    value: 1
   EVAL_MAX_CLIPS:
-    value: 30
+    value: null
+  EVAL_DATASETS:
+    value: [SURGICALMOTION, ENDOTAPP_GT, VLSURGPT, STIR_CHALLENGE]
+  EVAL_EVERY_EXCLUDE:
+    value: [STIR_CHALLENGE]
   EVAL_BATCH_SIZE:
     value: 1
   EVAL_WORKERS:
     value: 4
+  EVAL_VISUALIZE:
+    value: false
 
   ###===========================================================================================================================
   ### LOGGING & VISUALIZATION
@@ -219,3 +225,19 @@ parameters:
     value: 25
   VIZ_EVERY:
     value: 5
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NOTES — benchmark-eval monitoring (2026-07-20)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Goal: track the reportable surgical-benchmark metrics (W&B eval/*) EVERY epoch
+# during training, without spending the 24h SLURM wall on it.
+#   EVAL_EVERY 1 + EVAL_MAX_CLIPS null: score the WHOLE (small) surgical datasets each
+#       epoch, so per-epoch eval/* equals the numbers you'll report (uncapped). NB:
+#       val/epoch/* is a DIFFERENT protocol (frame-0 query, 24-frame clips) and cannot
+#       be made equal to eval/* by dataset choice.
+#   EVAL_DATASETS: allowlist — eval runs EXACTLY these, ignoring IS_EVAL_DATASET flags.
+#       Surgical only; general TAP sets (DAVIS/RoboTAP/Kinetics/RGB) are run offline on
+#       checkpoints (a config without EVAL_DATASETS falls back to the IS_EVAL scan).
+#   EVAL_EVERY_EXCLUDE: drop STIR from the per-epoch monitor (clips up to 2006 frames ->
+#       slow); STIR is still scored once by EVAL_AT_END.
+#   EVAL_VISUALIZE false: metrics only — skip the CPU-bound render/mp4-encode/upload.

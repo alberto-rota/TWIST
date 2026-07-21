@@ -38,6 +38,15 @@ def is_fixed_shape(dataset) -> bool:
     max_points = getattr(dataset, "max_points", None)
     if max_points is None:
         return False  # keep-all -> N follows each clip's own point count
+    # ``num_points`` in the index is the clip's *stored* point count, but the
+    # reader returns only points that pass the query-visibility filter in
+    # ``select_point_indices`` (``require_visible_at_query`` / ``min_visible_frames``).
+    # When either filter is active the selectable pool is data-dependent and can
+    # fall below ``max_points`` even for clips that store more (PointOdyssey
+    # routinely selects < max_points) -> N varies across clips, so we must pad.
+    if getattr(dataset, "require_visible_at_query", False) or \
+            int(getattr(dataset, "min_visible_frames", 1)) > 1:
+        return False
     # N == max_points only if no clip is smaller than max_points; if any clip
     # stores fewer points, that clip yields N < max_points (variable shape).
     nums = [e.get("num_points") for e in index if isinstance(e, dict)]

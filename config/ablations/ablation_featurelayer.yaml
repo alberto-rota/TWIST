@@ -1,0 +1,232 @@
+parameters:
+
+  ###===========================================================================================================================
+  ### RUN / GENERAL   —  file default is the CONTROL cell (FEATURE_LAYER null = last DINOv3 block).
+  ###                    Each experimental cell overrides FEATURE_LAYER *and* EXPERIMENT_NAME on the CLI (see bottom).
+  ###===========================================================================================================================
+  EXPERIMENT_NAME:
+    value: abl_flayer_last        # control cell; every other cell overrides this + FEATURE_LAYER
+  RESUME:
+    value: last                   # continue THIS cell from last.pt after a wall-hit (names are distinct per cell)
+  WORKERS:
+    value: 8
+  PIN_MEMORY:
+    value: true
+  NO_WANDB:
+    value: false
+  WANDB_PROJECT:
+    value: twist
+  SEED:
+    value: 42
+
+  LR_SCALING:
+    value: none                   # single-GPU cells => LR invariant (DDP LR-scaling footgun)
+
+  ###===========================================================================================================================
+  ### MODEL — verbatim from train_pretrain.yaml (upsample-on base). THE ONLY LEVER = RGB_ENCODER.FEATURE_LAYER.
+  ###          feature_dim is 1024 for EVERY ViT-L/16 layer, so a layer swap adds no params / changes no shape
+  ###          (checkpoint-shape-compatible); it only changes WHICH transformer block feeds the cost volume + template.
+  ###===========================================================================================================================
+  MODEL:
+    value:
+      MODEL_CLASS: TrackerWorldModel
+      MODEL_MODULE: models
+      HIDDEN_DIM: 256
+      TOKEN_DIM: 256
+      RGB_ENCODER:
+        ENCODER: facebook/dinov3-vitl16-pretrain-lvd1689m
+        IMAGE_SIZE: 512
+        FREEZE_BACKBONE: true
+        RGB_ENCODER_LR: 0.0
+        FEATURE_LAYER: null       # <-- THE LEVER. null = last block (control). Override per cell: -3 / -6 / -9 / -12
+      OBSERVATION:
+        K: 9
+        RADIUS_PX: 24
+        HEADS: 4
+        MAX_CORR: 0.0
+      TRANSITION:
+        DEPTH: 2
+        HEADS: 4
+        MAX_STEP: 0.12
+      ROLLOUT_VEL_DECAY: 1.0
+      HEADS:
+        UNCERTAINTY: true
+      FEATURE_UPSAMPLE:
+        ENABLED: true             # kept ON — the validated base; layer choice is tested in its presence
+        FACTOR: 2
+        BOTTLENECK: 256
+
+  ###===========================================================================================================================
+  ### DATA — same sources/geometry as train_pretrain (Kubric + PointOdyssey), but CLIPS CAPPED for a fast ranking run.
+  ###        Caps are applied identically to every cell, so they never confound the FEATURE_LAYER comparison.
+  ###===========================================================================================================================
+  DATASETS:
+    value:
+      OVERRIDE_ALL_DATASETS:
+        SPLIT_SEED: 42
+        TARGET_SIZE: [512, 512]
+        CLIP_LEN: 24
+        LOAD_FRAMES: true
+        LOAD_DEPTHS: false
+        FRAMES_AS_FLOAT: false
+        MARK_OFFSCREEN_INVISIBLE: true
+        POINT_SAMPLE_MODE: random         
+        RESAMPLE_POINTS_PER_EPOCH: true   
+        QUERY_FRAME: 0
+        CLIP_STRIDE: null
+        FRAME_STRIDE: 1
+        REQUIRE_VISIBLE_AT_QUERY: true
+        MIN_VISIBLE_FRAMES: 1
+        RESIZE_MODE: cover
+
+      KUBRIC:
+        MAX_CLIPS: 2000           # capped for ranking (flagship is uncapped 5251)
+        VAL_FRACTION: 0.05
+        MAX_POINTS: 320
+
+      POINTODYSSEY:
+        MAX_CLIPS: 1500           # capped for ranking (flagship is uncapped 4436); HAS_OCCLUDED_GT
+        VAL_FRACTION: 0.05
+        MAX_POINTS: 256
+
+      # ---- eval-only benchmarks: scored by EVAL_EVERY/AT_END, held OUT of per-epoch val (VAL_SUBSAMPLE 0) ----
+      TAPVID_DAVIS:
+        VAL_FRACTION: 1.0
+        IS_EVAL_DATASET: true
+        VAL_SUBSAMPLE: 0
+      TAPVID_RGB_STACKING:
+        VAL_FRACTION: 1.0
+        IS_EVAL_DATASET: true
+        VAL_SUBSAMPLE: 0
+      ROBOTAP:
+        VAL_FRACTION: 1.0
+        IS_EVAL_DATASET: true
+        VAL_SUBSAMPLE: 0
+      SURGICALMOTION:
+        VAL_FRACTION: 1.0
+        IS_EVAL_DATASET: true
+        VAL_SUBSAMPLE: 0
+      ENDOTAPP_GT:
+        VAL_FRACTION: 1.0
+        IS_EVAL_DATASET: true
+        VAL_SUBSAMPLE: 0
+
+  ###===========================================================================================================================
+  ### TRAINING (ENGINE) — train_pretrain schedule; EPOCHS 20 for a ranking run.
+  ###===========================================================================================================================
+  BATCH_SIZE:
+    value: 6
+  EPOCHS:
+    value: 20
+  LR:
+    value: 3.0e-4
+  WEIGHT_DECAY:
+    value: 1.0e-4
+  OPTIMIZER:
+    value: adamw
+  GRAD_CLIP:
+    value: 1.0
+  AMP:
+    value: true
+  LR_SCHEDULER:
+    value: cosine
+  WARMUP_EPOCHS:
+    value: 3
+  MIN_LR_RATIO:
+    value: 0.05
+  KL_WEIGHT_START:
+    value: 0.0
+  KL_ANNEAL_EPOCHS:
+    value: 5
+  TEACHER_FORCING_EPOCHS:
+    value: 3
+  OBS_DROPOUT:
+    value: 0.3
+  OBS_DROPOUT_EPOCHS:
+    value: 5
+  LOSS:
+    value:
+      POS_WEIGHT: 10.0
+      VIS_WEIGHT: 0.5
+      KL_WEIGHT: 0.05
+      KL_FREE_BITS: 0.02
+      KL_BALANCE_ALPHA: 0.8
+      HUBER_DELTA: 0.2
+      UNC_WEIGHT: 0.0
+      PRIOR_WEIGHT: 0.5
+      ROLLOUT_WEIGHT: 2.0
+
+  ###===========================================================================================================================
+  ### VALIDATION
+  ###===========================================================================================================================
+  VAL_EVERY:
+    value: 1
+  VAL_SUBSAMPLE:
+    value: 0.15
+  EARLY_STOP_PATIENCE:
+    value: 20
+  ROLLOUT_EVAL:
+    value: true
+  ROLLOUT_OBSERVE_STEPS:
+    value: 4
+
+  ###===========================================================================================================================
+  ### BENCHMARK EVALUATION — cheap periodic monitor + full pass at end. TAP sets carry the delta-precision signal.
+  ###===========================================================================================================================
+  EVAL_QUERY_MODE:
+    value: first
+  EVAL_AT_END:
+    value: true
+  EVAL_EVERY:
+    value: 10
+  EVAL_MAX_CLIPS:
+    value: 30
+  EVAL_BATCH_SIZE:
+    value: 1
+  EVAL_WORKERS:
+    value: 4
+  EVAL_VISUALIZE:
+    value: false
+
+  ###===========================================================================================================================
+  ### LOGGING & VISUALIZATION
+  ###===========================================================================================================================
+  LOG_EVERY:  
+    value: 25
+  VIZ_EVERY:
+    value: 10
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+# ablation_featurelayer.yaml — WHICH DINOv3 LAYER feeds correspondence? (Law 2: ONE block flipped = RGB_ENCODER.FEATURE_LAYER)
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+# Provenance: forked from config/train_pretrain.yaml (the upsample-on base). Deltas, applied IDENTICALLY to every cell so
+#   they cannot confound the layer comparison: EPOCHS 200 -> 20 (ranking run, not a quotable long run); KUBRIC/POINTODYSSEY
+#   MAX_CLIPS uncapped -> 2000/1500; periodic eval capped (EVERY 10, MAX_CLIPS 30). FEATURE_UPSAMPLE stays ENABLED — the
+#   validated base — so this ranks layers as they will actually be deployed (upsampler on top of the chosen layer).
+#
+# The lever (models/encoder.py:235-260, :312-314):
+#   FEATURE_LAYER null  — encoder returns outputs.last_hidden_state = the LAST transformer block (block 24 of ViT-L/16).
+#                         This is v1 / current behaviour: the most semantics-abstracted features, which are INVARIANT in
+#                         ways that can smear the sharp cost-volume peak fine localization needs.
+#   FEATURE_LAYER <int> — returns ONE mid-transformer hidden state as the dense map instead. Negative indexes from the end
+#                         (clean: outputs.hidden_states has the embedding at index 0, so -1 == last == null-equivalent);
+#                         feature_dim stays 1024, so NOTHING downstream changes shape. dino only.
+#   Hypothesis: upper-middle ViT layers (~75-90% depth) carry stronger LOCAL geometric/correspondence signal than the
+#   semantics-tuned final block (standard DINO-correspondence finding), which is the suspected true delta-precision
+#   bottleneck the fine-loc sweep 0kg2atga could not move (playbook FALSIFIED + OPEN "mid-layer DINOv3 features").
+#
+# THE 5 CELLS — launch each on its own A100-80 GPU (up to 8 available; these 5 run fully in parallel). MUST override BOTH
+# FEATURE_LAYER and EXPERIMENT_NAME on every non-control cell (distinct name => distinct run dir => RESUME:last stays safe):
+# sbatch .sbatch_scripts/train_A100_80_single.sbatch config/ablation_featurelayer.yaml                                          # control: last (null)
+# sbatch .sbatch_scripts/train_A100_80_single.sbatch config/ablation_featurelayer.yaml --MODEL.RGB_ENCODER.FEATURE_LAYER=-3  --EXPERIMENT_NAME=abl_flayer_n3
+# sbatch .sbatch_scripts/train_A100_80_single.sbatch config/ablation_featurelayer.yaml --MODEL.RGB_ENCODER.FEATURE_LAYER=-6  --EXPERIMENT_NAME=abl_flayer_n6
+# sbatch .sbatch_scripts/train_A100_80_single.sbatch config/ablation_featurelayer.yaml --MODEL.RGB_ENCODER.FEATURE_LAYER=-9  --EXPERIMENT_NAME=abl_flayer_n9
+# sbatch .sbatch_scripts/train_A100_80_single.sbatch config/ablation_featurelayer.yaml --MODEL.RGB_ENCODER.FEATURE_LAYER=-12 --EXPERIMENT_NAME=abl_flayer_n12
+# (Coercion note utilities/config.py:95-99: a CLI int lands cleanly on the null base via ast.literal_eval.)
+#
+# Judge at MATCHED epochs (playbook "is this good?"): PRIMARY = delta_1px / delta_2px and per-dataset delta_avg/AJ on the
+#   TAP sets (DAVIS especially) — this lever targets the sub-2px precision wall. SECONDARY / watch for regressions: val/epe,
+#   val/rollout/epe, gate separation (gate_vis high, gate_occ low), and POR snap/sustained + coarse_gate — mid-layer features
+#   may localize better but be WEAKER for long-range global re-acquisition (semantic invariance helps the COARSE re-detect).
+#   Winner (best precision with no re-acquisition regression) merges back into train_pretrain.yaml for a 50-ep quotable run.
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════

@@ -145,10 +145,10 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "REQUIRE_VISIBLE_AT_QUERY": False,
         "VAL_FRACTION": 1.0,       # eval-only
         "SPLIT_SEED": 42,
-        "IS_EVAL_DATASET": True,
         "EVAL_THRESHOLDS": [4, 8, 16, 32, 64],  # official STIR 2D-accuracy thresholds
         "EVAL_VISIBLE_ONLY": True,
         "EVAL_EXCLUDE_FROM_MEAN": ["average_jaccard", "occlusion_accuracy"],
+        "IS_EVAL_DATASET": True,
     },
     # This is the full non-annotated STIR dataset. Do not use.
     # "STIR_FULL": {                           
@@ -164,17 +164,19 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
     #     "IS_EVAL_DATASET": True,
     #     "EVAL_THRESHOLDS": [4, 8, 16, 32, 64],
     # },
-    "SURGT": {
-        "ROOT_DIR": "$DATASET_DIR/SurgT/cotracker_tracks",
-        "READER": _COTRACKER_READER,
-        "CLIP_LEN": 24,
-        "FRAME_STRIDE": 1,
-        "MAX_POINTS": 256,
-        "POINT_SAMPLE_MODE": "even",
-        "QUERY_FRAME": 0,
-        "VAL_FRACTION": 0.1,
-        "SPLIT_SEED": 42,
-    },
+    # "SURGT": {
+    #     "ROOT_DIR": "$DATASET_DIR/SurgT/cotracker_tracks",
+    #     "READER": _COTRACKER_READER,
+    #     "CLIP_LEN": 24,
+    #     "FRAME_STRIDE": 1,
+    #     "MAX_POINTS": 256,
+    #     "POINT_SAMPLE_MODE": "even",
+    #     "QUERY_FRAME": 0,
+    #     "VAL_FRACTION": 0.1,
+    #     "SPLIT_SEED": 42,
+    #     "IS_EVAL_DATASET": False,
+
+    # },
 
 
     # --- Evaluation-only benchmarks (ground-truth point tracks) -----------
@@ -206,7 +208,7 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "REQUIRE_VISIBLE_AT_QUERY": False,
         "VAL_FRACTION": 1.0,
         "SPLIT_SEED": 42,
-        "IS_EVAL_DATASET": True,
+        "IS_EVAL_DATASET": False,
     },
     "TAPVID_KINETICS": {
         "ROOT_DIR": "$DATASET_DIR/tapvid_kinetics/gt_tracks",
@@ -230,7 +232,7 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "REQUIRE_VISIBLE_AT_QUERY": False,
         "VAL_FRACTION": 1.0,
         "SPLIT_SEED": 42,
-        "IS_EVAL_DATASET": True,
+        "IS_EVAL_DATASET": False,
     },
     # EndoTAPP dataset processed by cotracker. We use EndoTAPP_gt because it contains the real tracks from the ground truth.
     # "ENDOTAPP": {

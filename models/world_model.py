@@ -86,6 +86,45 @@ class FeatureUpsampler(nn.Module):
         return self.proj_out(y)
 
 
+class MultiLayerFusion(nn.Module):
+    """Fuse K frozen DINOv3 layer maps into one ``(B,C,Hf,Wf)`` descriptor.
+
+    The ablation (2026-07-21) showed a strong inverted-U over encoder depth: the
+    mid block (16/24) wins localization while the semantics-tuned late blocks lose
+    it — but late-block invariance is exactly what helps long-range re-acquisition.
+    A single layer cannot have both. This head lets the model **mix channels across
+    layers**: the encoder returns several blocks' dense maps (each ``(B,C,Hf,Wf)``,
+    same ``C``), we concatenate along channels and project ``K*C -> C`` with a 1x1
+    conv (a learned per-output-channel linear mix over every layer's channels).
+
+    **Pass-through init (the safety floor).** The projection is initialized as the
+    identity on the ANCHOR layer's channel slice and zero everywhere else (zero
+    bias), so at init the fused map is *exactly* the anchor single layer. The module
+    therefore STRICTLY GENERALIZES the single-layer choice ``FEATURE_LAYER=anchor``
+    and starts equivalent to it; training only ever *adds* signal from the other
+    blocks (e.g. late-block semantics on top of the mid-block localization anchor),
+    it cannot start worse. Backbone stays frozen — this is the only new trainable
+    head, and it lives in the world model so its params land in the main-LR
+    optimizer group (exactly like :class:`FeatureUpsampler`). Runs BEFORE the
+    upsampler, so the two levers compose (fuse ``K*C->C``, then upsample ``C->C``).
+    """
+
+    def __init__(self, c: int, n_layers: int, anchor_pos: int = 0) -> None:
+        super().__init__()
+        self.c, self.n_layers, self.anchor_pos = int(c), int(n_layers), int(anchor_pos)
+        self.proj = nn.Conv2d(self.n_layers * self.c, self.c, kernel_size=1)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+        with torch.no_grad():                          # identity on the anchor layer's slice
+            base = self.anchor_pos * self.c
+            eye = torch.arange(self.c)
+            self.proj.weight[eye, base + eye, 0, 0] = 1.0
+
+    def forward(self, feats) -> torch.Tensor:          # list[K] of (B,C,Hf,Wf) OR (B,K*C,Hf,Wf)
+        x = torch.cat(list(feats), dim=1) if isinstance(feats, (list, tuple)) else feats
+        return self.proj(x)                            # (B, C, Hf, Wf)
+
+
 class ParticleState(TypedDict):
     pos: torch.Tensor        # (B, N, 2) pixel coordinates (x, y)
     vel: torch.Tensor        # (B, N, 2) last realized velocity (normalized units / frame)
@@ -381,12 +420,24 @@ class TrackerWorldModel(nn.Module):
         feat_upsample: bool = False,
         feat_upsample_factor: int = 2,
         feat_upsample_bottleneck: int = 256,
+        feat_fuse: bool = False,
+        feat_fuse_n_layers: int = 1,
+        feat_fuse_anchor_pos: int = 0,
         verbose: bool = True,
         **kwargs,
     ) -> None:
         super().__init__()
         self.encoder = encoder
         c = encoder.feature_dim
+        # Optional multi-layer feature fusion (precision + re-acquisition lever; None =
+        # single-layer behaviour). Consumes the encoder's list of K per-layer maps and
+        # projects K*C -> C; pass-through-initialized to the anchor layer. Runs BEFORE
+        # the upsampler. Lives here (not on the frozen encoder) so its params land in
+        # the trainable LR group, not the frozen encoder group.
+        self.feat_fusion = (
+            MultiLayerFusion(c, feat_fuse_n_layers, feat_fuse_anchor_pos)
+            if feat_fuse else None
+        )
         # Optional learned finer feature grid (precision lever; None = v1 behaviour).
         # Lives here (not on the frozen encoder) so its params land in the trainable
         # LR group, not the encoder group.
@@ -485,15 +536,19 @@ class TrackerWorldModel(nn.Module):
     def _encode(self, frames: torch.Tensor) -> torch.Tensor:
         """``frames (B,T,3,H,W)`` -> ``feats (B,T,C,Hf,Wf)`` (chunked).
 
-        With ``feat_upsampler`` enabled the frozen features are lifted to a finer
-        grid (larger Hf,Wf, same C) per chunk before returning; grads flow to the
-        upsampler even though the encoder output is detached (frozen).
+        With ``feat_fusion`` enabled the encoder returns a *list* of K per-layer maps
+        which are fused to one ``(B,C,Hf,Wf)`` map first. With ``feat_upsampler``
+        enabled the (fused) features are then lifted to a finer grid (larger Hf,Wf,
+        same C) per chunk before returning; grads flow to both learned heads even
+        though the encoder output is detached (frozen).
         """
         b, t = frames.shape[:2]
         flat = frames.reshape(b * t, *frames.shape[2:])
         outs: List[torch.Tensor] = []
         for i in range(0, flat.shape[0], self.encode_chunk):
             f = self.encoder(flat[i:i + self.encode_chunk])
+            if self.feat_fusion is not None:
+                f = self.feat_fusion(f)
             if self.feat_upsampler is not None:
                 f = self.feat_upsampler(f)
             outs.append(f)

@@ -34,6 +34,13 @@ is skipped and its cached metrics are reused rather than re-run -- so a
 benchmark job that gets pre-empted or crashes partway through resumes without
 redoing the datasets it already finished.
 
+Qualitative eval videos (rendered predictions per dataset) are gated by
+``EVAL_VISUALIZE`` (default True): set it False to skip the whole CPU-bound
+render/encode/upload path and report only the key metrics -- the fast mode for
+in-training monitoring (``EVAL_EVERY`` / ``EVAL_AT_END``) on wall-clock-capped
+jobs, where rendering + mp4 encode steal time from the training budget.
+``EVAL_VIZ_CLIPS`` still tunes how many clips are rendered when it is on.
+
 Alongside, unless ``EVAL_RECOVERY`` is off, the **Post-Occlusion Recovery** (POR)
 metric is reported in its *own* artifacts (so the table above stays
 CoTracker-comparable): ``recovery.csv`` (headline POR/THO scalars),
@@ -112,6 +119,19 @@ EVAL_SKIP_COMPLETED_KEY = "EVAL_SKIP_COMPLETED"
 # silently deflating everyone's mean. The excluded values still appear on the
 # dataset's own row.
 EVAL_EXCLUDE_FROM_MEAN_KEY = "EVAL_EXCLUDE_FROM_MEAN"
+# Top-level config key (default None -> evaluate every IS_EVAL_DATASET dataset).
+# An explicit ALLOWLIST of dataset names: when non-empty, evaluation runs EXACTLY
+# these datasets (in this order), regardless of their IS_EVAL_DATASET flag -- the
+# clean way to scope eval to, say, the surgical benchmarks only, without flipping
+# IS_EVAL_DATASET off on every other registry dataset. Unknown / hard-disabled
+# (VAL_FRACTION < 0) names are warned-and-skipped. See select_eval_datasets.
+EVAL_DATASETS_KEY = "EVAL_DATASETS"
+# Top-level config key (default None). Dataset names to DROP from the periodic
+# (EVAL_EVERY) monitoring eval only -- they are still scored by the end-of-stage
+# EVAL_AT_END pass. Lets the every-epoch monitor skip an expensive dataset (e.g.
+# STIR's very long clips) while keeping the full reportable set at the end. Threaded
+# from the engine as select_eval_datasets(..., exclude=...); a no-op for at-end.
+EVAL_EVERY_EXCLUDE_KEY = "EVAL_EVERY_EXCLUDE"
 
 # Reported metrics: machine key -> human header (CSV / W&B table columns).
 # Order here is the column order everywhere.
@@ -158,6 +178,19 @@ EVAL_VIZ_KEY = "_viz"
 def _nanmean(xs: List[float]) -> float:
     xs = [x for x in xs if x is not None and x == x]  # drop None / NaN
     return sum(xs) / len(xs) if xs else float("nan")
+
+
+def _as_name_list(v: Any) -> List[str]:
+    """Coerce a config value (None / str / list / DotMap list) to a list of dataset
+    name strings. A bare string is treated as a single name (not iterated char-wise)."""
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [v]
+    try:
+        return [str(x) for x in v]
+    except TypeError:
+        return [str(v)]
 
 
 # --------------------------------------------------------------------------- #
@@ -215,28 +248,60 @@ def _merged_dataset_cfg(name: str, datasets_cfg: dict) -> dict:
     return merged
 
 
-def select_eval_datasets(config: Any) -> List[str]:
-    """Names of datasets to evaluate: any whose merged config has
-    ``IS_EVAL_DATASET`` truthy.
+def select_eval_datasets(config: Any, exclude: Any = None) -> List[str]:
+    """Names of datasets to evaluate.
 
-    Candidates are the registry datasets (``DATASET_DEFAULTS``) plus any extra
-    datasets named under ``config.DATASETS`` -- so the eval-only benchmarks are
-    picked up by default (they carry the flag in the registry), and a config can
-    additionally flag a training dataset, or turn one off with
-    ``IS_EVAL_DATASET: False``.
+    Two selection modes:
+
+      * **Allowlist** -- when ``EVAL_DATASETS`` is set (non-empty), evaluation runs
+        EXACTLY those datasets, in the listed order, *regardless* of their
+        ``IS_EVAL_DATASET`` flag. This is the clean way to scope eval to a subset
+        (e.g. the surgical benchmarks) without having to flip ``IS_EVAL_DATASET``
+        off on every other registry dataset. Names that are unknown, or
+        hard-disabled by ``VAL_FRACTION < 0``, are warned-and-skipped.
+      * **Flag scan** (default, no ``EVAL_DATASETS``) -- every candidate dataset
+        whose merged config has ``IS_EVAL_DATASET`` truthy. Candidates are the
+        registry datasets (``DATASET_DEFAULTS``) plus any extra datasets named
+        under ``config.DATASETS`` -- so the eval-only benchmarks are picked up by
+        default (they carry the flag in the registry), and a config can
+        additionally flag a training dataset, or turn one off with
+        ``IS_EVAL_DATASET: False``.
+
+    ``exclude`` (name or list of names) is dropped from the result in *either*
+    mode -- used by the engine to keep an expensive dataset out of the per-epoch
+    ``EVAL_EVERY`` monitor (``EVAL_EVERY_EXCLUDE``) while still scoring it at
+    ``EVAL_AT_END``. A ``VAL_FRACTION < 0`` dataset is always dropped (hard disable,
+    mirrors ``create_datasets_from_config``).
     """
     datasets_cfg = _as_dict(config.get("DATASETS"))
     reserved = {ALL_DATASETS_KEY, OVERRIDE_ALL_DATASETS_KEY}
     candidates = set(DATASET_DEFAULTS) | {n for n in datasets_cfg if n not in reserved}
+    exclude_set = set(_as_name_list(exclude))
+
+    def _hard_disabled(n: str) -> bool:
+        return float(_merged_dataset_cfg(n, datasets_cfg).get("VAL_FRACTION", 0.1)) < 0
+
+    allow = _as_name_list(config.get(EVAL_DATASETS_KEY))
+    if allow:
+        selected = []
+        for n in allow:                              # preserve the config's order
+            if n in exclude_set:
+                continue
+            if n not in candidates:
+                logger.warning(f"EVAL_DATASETS lists unknown dataset {n!r} -- skipping")
+                continue
+            if _hard_disabled(n):
+                logger.warning(f"EVAL_DATASETS lists {n!r} but it is hard-disabled "
+                               f"(VAL_FRACTION < 0) -- skipping")
+                continue
+            selected.append(n)
+        return selected
+
     selected = []
     for n in sorted(candidates):
-        merged = _merged_dataset_cfg(n, datasets_cfg)
-        # Hard disable: VAL_FRACTION < 0 removes the dataset everywhere, eval
-        # included -- even if it carries IS_EVAL_DATASET (mirrors the skip in
-        # create_datasets_from_config).
-        if float(merged.get("VAL_FRACTION", 0.1)) < 0:
+        if n in exclude_set or _hard_disabled(n):
             continue
-        if bool(merged.get(IS_EVAL_DATASET_KEY, False)):
+        if bool(_merged_dataset_cfg(n, datasets_cfg).get(IS_EVAL_DATASET_KEY, False)):
             selected.append(n)
     return selected
 
@@ -699,6 +764,7 @@ def evaluate(
     max_steps: int = 0,
     query_frame: int = 0,
     query_mode: Optional[str] = None,
+    exclude_datasets: Any = None,
     cached_results: Optional[Dict[str, Dict[str, Any]]] = None,
     on_dataset_done: Optional[Callable[[str, Dict[str, Any], bool], None]] = None,
 ) -> Dict[str, Dict[str, float]]:
@@ -717,24 +783,42 @@ def evaluate(
     fires right after each dataset's metrics are available (fresh or cached) --
     this is how :func:`evaluate_and_report` logs each dataset to W&B / persists
     the eval state as soon as it finishes, instead of waiting for every dataset.
+
+    ``exclude_datasets`` (name or list) is passed to :func:`select_eval_datasets`
+    to drop datasets from the auto-selection -- the engine uses it for
+    ``EVAL_EVERY_EXCLUDE`` (keep an expensive dataset out of the per-epoch monitor
+    but still score it at ``EVAL_AT_END``). Ignored when ``dataset_names`` is given
+    explicitly.
     """
-    names = dataset_names if dataset_names is not None else select_eval_datasets(config)
+    names = (dataset_names if dataset_names is not None
+             else select_eval_datasets(config, exclude=exclude_datasets))
     if not names:
-        logger.warning("no datasets flagged IS_EVAL_DATASET -- nothing to evaluate")
+        logger.warning("no datasets selected for evaluation "
+                       "(check EVAL_DATASETS / IS_EVAL_DATASET / EVAL_EVERY_EXCLUDE) -- nothing to evaluate")
         return {}
     qm = (query_mode or str(config.get("EVAL_QUERY_MODE", "first"))).lower()
     compute_recovery = bool(config.get("EVAL_RECOVERY", True))
     recovery_window = int(config.get("EVAL_RECOVERY_WINDOW", 8))
-    # Protocol-honest qualitative videos per dataset (0 disables). Defaults follow
-    # the engine's VIZ_* knobs so eval videos match the training ones in look.
-    viz_clips = int(config.get("EVAL_VIZ_CLIPS", 1))
+    # Protocol-honest qualitative videos per dataset. EVAL_VISUALIZE (default True)
+    # is the master on/off switch for the ENTIRE eval-viz path -- per-clip rendering
+    # (matplotlib, CPU-bound), mp4 encode (libx264, CPU-bound) and W&B upload. On the
+    # wall-clock-capped SLURM jobs those steps are pure overhead on the training
+    # budget, so EVAL_VISUALIZE: False makes evaluation compute/report ONLY the key
+    # metrics (EPE / delta / AJ / OA / ms-per-frame, plus POR unless EVAL_RECOVERY is
+    # off) with no rendering at all -- the fast mode for in-training monitoring.
+    # EVAL_VIZ_CLIPS still tunes HOW MANY clips are rendered when viz is on (0 also
+    # disables, same as EVAL_VISUALIZE: False). Sizes default to the engine's VIZ_*
+    # knobs so eval videos match the training ones in look.
+    visualize = bool(config.get("EVAL_VISUALIZE", True))
+    viz_clips = int(config.get("EVAL_VIZ_CLIPS", 1)) if visualize else 0
     viz_size = int(config.get("EVAL_VIZ_SIZE", config.get("VIZ_SIZE", 256)))
     viz_max_frames = int(config.get("EVAL_VIZ_MAX_FRAMES", 0))
     viz_max_points = int(config.get("EVAL_VIZ_MAX_POINTS", config.get("VIZ_MAX_POINTS", 48)))
     datasets_cfg = _as_dict(config.get("DATASETS"))
     cached_results = cached_results or {}
     logger.info(f"evaluating on {len(names)} dataset(s) [query_mode={qm}, "
-                f"recovery={'on' if compute_recovery else 'off'}]: {names}")
+                f"recovery={'on' if compute_recovery else 'off'}, "
+                f"viz={'on' if visualize else 'off'}]: {names}")
     if cached_results:
         already = [n for n in names if n in cached_results]
         if already:
@@ -897,8 +981,14 @@ def log_wandb_table(
     key: str = "eval/metrics",
     epoch: Optional[int] = None,
 ) -> None:
-    """Log a ``wandb.Table`` (rows = datasets, cols = metrics) plus per-dataset
-    and mean scalars (``eval/<dataset>/<metric>``) for time-series tracking.
+    """Log a ``wandb.Table`` (rows = datasets, cols = metrics) plus the ``MEAN``
+    row scalars (``eval/MEAN/<metric>``) for time-series tracking.
+
+    Per-dataset scalars are intentionally NOT re-logged here: they are already
+    emitted once by :func:`log_dataset_wandb` as each dataset finishes. Re-logging
+    them here would put a second, identical point on every ``eval/<dataset>/*``
+    chart at a different auto-incremented step (this ran once, so it must be one
+    value). Only ``MEAN`` (which has no per-dataset "done" event) is logged here.
 
     No-op when ``wandb_run`` is None. Logged without an explicit step (W&B
     auto-increments), with an ``eval/epoch`` field to align with training.
@@ -913,6 +1003,8 @@ def log_wandb_table(
         for name, m in results.items():
             cells = [m.get(k, float("nan")) for k in METRIC_KEYS]
             table.add_data(name, *[round(c, 5) if c == c else None for c in cells])
+            if name != "MEAN":
+                continue  # per-dataset scalars already logged by log_dataset_wandb
             for k in METRIC_KEYS:
                 v = m.get(k, float("nan"))
                 if v == v:
@@ -1015,8 +1107,13 @@ def log_recovery_wandb(
     key: str = "eval/recovery",
     epoch: Optional[int] = None,
 ) -> None:
-    """Log a recovery ``wandb.Table`` plus per-dataset/mean scalars
-    (``eval/<dataset>/por_epe_w8`` ...). No-op when ``wandb_run`` is None."""
+    """Log a recovery ``wandb.Table`` plus the ``MEAN`` row scalars
+    (``eval/MEAN/por_epe_w8`` ...). No-op when ``wandb_run`` is None.
+
+    As in :func:`log_wandb_table`, per-dataset POR scalars are already emitted by
+    :func:`log_dataset_wandb` (it covers ``RECOVERY_QUALITY_KEYS``); re-logging
+    them here would double every ``eval/<dataset>/por_*`` chart, so only ``MEAN``
+    is logged here."""
     if wandb_run is None or not results:
         return
     try:
@@ -1030,6 +1127,8 @@ def log_recovery_wandb(
                 v = m.get(k, float("nan"))
                 cells.append((int(v) if k in RECOVERY_COUNT_KEYS else round(v, 5)) if v == v else None)
             table.add_data(name, *cells)
+            if name != "MEAN":
+                continue  # per-dataset scalars already logged by log_dataset_wandb
             for k in RECOVERY_QUALITY_KEYS:
                 v = m.get(k, float("nan"))
                 if v == v:
@@ -1109,6 +1208,7 @@ def evaluate_and_report(
     max_steps: int = 0,
     query_frame: int = 0,
     query_mode: Optional[str] = None,
+    exclude_datasets: Any = None,
     csv_name: Optional[str] = None,
 ) -> Dict[str, Dict[str, float]]:
     """Evaluate then emit all reports: CSV under ``run_dir``, a console table, and
@@ -1117,6 +1217,11 @@ def evaluate_and_report(
     ``tag`` differentiates monitoring snapshots: the CSV is ``evaluation.csv`` by
     default, ``evaluation_<tag>.csv`` when a tag is given; the per-run eval state
     (see below) is likewise scoped to ``tag``.
+
+    ``exclude_datasets`` (name or list) is forwarded to :func:`evaluate` /
+    :func:`select_eval_datasets` -- the engine passes ``EVAL_EVERY_EXCLUDE`` here on
+    the periodic monitoring call so an expensive dataset is skipped every epoch but
+    still scored by the end-of-stage pass.
 
     Each dataset is logged to W&B (``eval/<dataset>/<metric>`` scalars) and
     written into the CSV **as soon as it finishes**, rather than all at once
@@ -1152,6 +1257,7 @@ def evaluate_and_report(
         model, config, device, dataset_names=dataset_names, max_clips=max_clips,
         batch_size=batch_size, num_workers=num_workers, amp=amp, amp_dtype=amp_dtype,
         max_steps=max_steps, query_frame=query_frame, query_mode=query_mode,
+        exclude_datasets=exclude_datasets,
         cached_results=cached, on_dataset_done=_on_dataset_done,
     )
     if not results:

@@ -235,6 +235,16 @@ class FrozenFrameEncoder(nn.Module):
         fl = cfg.get("feature_layer", None)
         self.feature_layer = None if fl in (None, "", "null") else int(fl)
 
+        # Multi-layer fusion: a LIST of transformer layers to read as separate dense
+        # maps (fused downstream in the world model). When set it takes precedence
+        # over the single ``feature_layer`` and ``forward`` returns a *list* of K
+        # ``(B,C,Hf,Wf)`` maps instead of one. ``dino`` only. Negative indexes from
+        # the end (like ``feature_layer``).
+        fls = cfg.get("feature_layers", None)
+        self.feature_layers = (
+            None if fls in (None, "", "null") or len(fls) == 0 else [int(x) for x in fls]
+        )
+
         if self.variant == "cnn":
             self.backbone = _CNNBackbone(
                 feature_dim=int(cfg.get("feature_dim", 64)),
@@ -249,7 +259,15 @@ class FrozenFrameEncoder(nn.Module):
                 "freeze_backbone": freeze,
                 "return_as_feature_maps": True,
             }
-            if self.feature_layer is None:
+            if self.feature_layers is not None:
+                # Return K mid-transformer hidden states as separate feature maps
+                # (fused downstream). return_patch_tokens_only=False so the 5-token
+                # (CLS+4 reg) prefix is stripped exactly once inside
+                # tokens_to_feature_maps.
+                dino_cfg["return_last_hidden_state"] = False
+                dino_cfg["return_selected_layers"] = list(self.feature_layers)
+                dino_cfg["return_patch_tokens_only"] = False
+            elif self.feature_layer is None:
                 dino_cfg["return_last_hidden_state"] = True
             else:
                 # Return one mid-transformer hidden state as the feature map. NB:
@@ -309,6 +327,8 @@ class FrozenFrameEncoder(nn.Module):
                 return self.backbone(x)
             x = self._preprocess_dino(x)                   # on-device resize + normalize
             out = self.backbone(x)
+            if self.feature_layers is not None:
+                return out["selected_hidden_states"]       # list[K] of (B, C, Hf, Wf)
             if self.feature_layer is None:
                 return out["last_hidden_state"]            # (B, C, Hf, Wf)
             return out["selected_hidden_states"][0]        # (B, C, Hf, Wf)

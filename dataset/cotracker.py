@@ -95,6 +95,7 @@ class CoTrackerTracksDataset(BaseTracksDataset):
         frames_as_float: bool = False,
         seed: int = 0,
         subsample: Optional[float] = None,
+        resample_points_per_epoch: bool = False,
     ):
         super().__init__(
             include=include,
@@ -120,6 +121,7 @@ class CoTrackerTracksDataset(BaseTracksDataset):
             frames_as_float=frames_as_float,
             seed=seed,
             subsample=subsample,
+            resample_points_per_epoch=resample_points_per_epoch,
         )
         self.root = Path(root)
         self._raw_index = _read_index(self.root)

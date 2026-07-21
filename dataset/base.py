@@ -40,6 +40,7 @@ A concrete subclass returns from :meth:`_load_raw_clip` a *point-major* bundle
 
 from __future__ import annotations
 
+import multiprocessing as mp
 from typing import Optional, Sequence, Tuple
 
 import numpy as np
@@ -47,6 +48,12 @@ import torch
 import torch.nn.functional as F
 
 from dataset.sampling import select_point_indices
+
+# Seed stride between epochs when ``resample_points_per_epoch`` is on. A large
+# prime so consecutive epochs draw well-decorrelated point subsets. Only the
+# seeded ``random`` sampler consumes it; the deterministic modes ("even"/"grid"/
+# "first") ignore the seed and are unaffected by resampling.
+_EPOCH_SEED_STRIDE = 1_000_003
 
 
 class BaseTracksDataset(torch.utils.data.Dataset):
@@ -100,6 +107,16 @@ class BaseTracksDataset(torch.utils.data.Dataset):
     seed : int
         Base seed for ``point_sample_mode="random"`` (combined with the clip
         index so different clips get different -- but reproducible -- samples).
+    resample_points_per_epoch : bool
+        When ``True``, fold the current epoch (set via :meth:`set_epoch`) into
+        the per-clip sampling seed, so each epoch draws a *different* ``N``-point
+        subset from the same clip's candidate pool -- effectively a mild data
+        augmentation that, over training, exposes the model to far more of the
+        stored trajectories than any single ``max_points`` snapshot, at no extra
+        per-batch memory. Only meaningful with ``point_sample_mode="random"``
+        (the deterministic modes ignore the seed). Default ``False`` reproduces
+        the historical fixed-per-clip sampling exactly. The engine advances only
+        the *train* readers, so validation metrics stay on a fixed point set.
     """
 
     def __init__(
@@ -127,6 +144,7 @@ class BaseTracksDataset(torch.utils.data.Dataset):
         frames_as_float: bool = False,
         seed: int = 0,
         subsample: Optional[float] = None,
+        resample_points_per_epoch: bool = False,
     ):
         self.include = list(include) if include is not None else None
         self.exclude = list(exclude) if exclude is not None else None
@@ -158,6 +176,17 @@ class BaseTracksDataset(torch.utils.data.Dataset):
         # decoupled from VAL_FRACTION (the train/val split ratio).
         self.subsample = subsample
 
+        # Per-epoch point resampling (train-only augmentation; see the class
+        # docstring). The epoch lives in a shared-memory int so that set_epoch()
+        # -- called once per epoch in the MAIN process -- is visible inside the
+        # DataLoader's *persistent* worker processes: those are forked ONCE (at
+        # first iteration) and would never see a plain-attribute update. Fork
+        # start method assumed (Linux/SLURM default; verified for this repo).
+        # Allocated only when the feature is on, so default readers are unchanged
+        # (the seed stays exactly ``self.seed + i`` -- see ``_sample_seed``).
+        self.resample_points_per_epoch = bool(resample_points_per_epoch)
+        self._epoch = mp.Value("i", 0, lock=False) if self.resample_points_per_epoch else None
+
         if crop is not None:
             x0, y0, x1, y1 = (int(v) for v in crop)
             if not (x1 > x0 and y1 > y0):
@@ -180,6 +209,32 @@ class BaseTracksDataset(torch.utils.data.Dataset):
 
     def __len__(self) -> int:
         return len(self.index)
+
+    # ------------------------------------------------------------------ #
+    # Per-epoch point resampling (train-only; no-op unless enabled)
+    # ------------------------------------------------------------------ #
+    def set_epoch(self, epoch: int) -> None:
+        """Set the current training epoch for per-epoch point resampling.
+
+        No-op unless ``resample_points_per_epoch`` is on. The engine calls this
+        on every *train* reader at the start of each epoch; validation readers
+        are never advanced, so val metrics are scored on a fixed point set.
+        Writes a shared-memory int so the new epoch reaches already-forked
+        persistent DataLoader workers.
+        """
+        if self._epoch is not None:
+            self._epoch.value = int(epoch)
+
+    def _sample_seed(self, i: int) -> int:
+        """Per-clip RNG seed for point sampling.
+
+        Adds an epoch term ONLY when per-epoch resampling is on, so each epoch
+        draws a different subset in the ``random`` sampler; with the feature off
+        this is exactly ``self.seed + i`` (historical behaviour). Deterministic
+        sample modes ignore the seed and are unaffected either way.
+        """
+        epoch = int(self._epoch.value) if self._epoch is not None else 0
+        return self.seed + i + epoch * _EPOCH_SEED_STRIDE
 
     # ------------------------------------------------------------------ #
     # Geometry: crop -> resize (coords transformed to match)
@@ -264,7 +319,7 @@ class BaseTracksDataset(torch.utils.data.Dataset):
             mode=self.point_sample_mode,
             require_visible_at_query=self.require_visible_at_query,
             min_visible_frames=self.min_visible_frames,
-            seed=self.seed + i,
+            seed=self._sample_seed(i),
         )
         tracks = torch.from_numpy(np.asarray(tracks_nt[sel])).float().permute(1, 0, 2)   # (T, N, 2)
         visibility = torch.from_numpy(np.asarray(vis_nt[sel])).bool().permute(1, 0)      # (T, N)
