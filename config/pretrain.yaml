@@ -60,7 +60,7 @@ parameters:
         BOTTLENECK: 256
       FEATURE_FUSE:
         ENABLED: true
-        LAYERS: [-12, -9, -6]    
+        LAYERS: [-12, -9, -1]    
         ANCHOR: -9               # block 16 won the ablation
 
   ###===========================================================================================================================

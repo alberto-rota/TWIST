@@ -1289,6 +1289,48 @@ def evaluate_and_report(
 # --------------------------------------------------------------------------- #
 # Standalone: load a checkpoint and evaluate it
 # --------------------------------------------------------------------------- #
+def resolve_run_checkpoint(run_name: str, prefer: str = "best") -> Optional[Path]:
+    """Find ``best.pt`` (else ``last.pt``) of the highest stage in a run dir.
+
+    ``run_name`` is an ``EXPERIMENT_NAME`` under ``$RESULTS_DIR`` or a direct path
+    to a run dir. Returns the checkpoint path, or ``None`` if none is found.
+    Prefer ``"best"`` (default) or ``"last"``.
+    """
+    cand = Path(run_name)
+    if not cand.is_dir():
+        results = os.environ.get("RESULTS_DIR") or str(Path.cwd() / "results")
+        cand = Path(expand_path(results)) / run_name
+    if not cand.is_dir():
+        return None
+    order = ("best.pt", "last.pt") if prefer == "best" else ("last.pt", "best.pt")
+    # highest stage first (carries the most-trained weights)
+    for stage_dir in sorted(cand.glob("stage*"), reverse=True):
+        for fn in order:
+            if (stage_dir / fn).exists():
+                return stage_dir / fn
+    return None
+
+
+@torch.no_grad()
+def predict_sample(model, sample: Dict[str, Any], device: Optional[torch.device] = None):
+    """Run ``model`` on one dataset item; return predicted tracks + visibility.
+
+    Uses the sample's stored ``queries`` (typically all at frame 0) — the same
+    single-query-frame forward the engine uses for training/val. Returns
+    ``(coords, visibility)`` with shapes ``(T, N, 2)`` and ``(T, N)`` bool, on CPU,
+    ready to pass as ``pred_tracks`` / ``pred_visibility`` to
+    :func:`utilities.visualization.render_sample_filmstrip`.
+    """
+    device = device or next(model.parameters()).device
+    frames = sample["frames"].unsqueeze(0).to(device)              # (1,T,3,H,W)
+    queries = sample["queries"].float().unsqueeze(0).to(device)     # (1,N,3)
+    model.eval()
+    out = model(frames, queries)
+    coords = out["coords"][0].detach().float().cpu()               # (T,N,2)
+    vis = (torch.sigmoid(out["vis_logits"][0].float()) > 0.5).cpu()  # (T,N)
+    return coords, vis
+
+
 def load_model_from_checkpoint(
     ckpt_path: Any,
     device: Optional[torch.device] = None,

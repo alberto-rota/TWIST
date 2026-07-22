@@ -632,6 +632,7 @@ def render_filmstrip(
     line_alpha: float = 0.9,
     dim_background: float = 0.0,
     show_occluded: bool = True,
+    draw_tracks: bool = True,
     draw_panel_markers: bool = True,
     occluded_coords_real: bool = True,
     dpi: int = 100,
@@ -640,21 +641,27 @@ def render_filmstrip(
     """Render a clip as a **space-time filmstrip** — the CoTracker teaser layout.
 
     ``n_panels`` keyframes are tiled left-to-right into one wide canvas
-    (``H x n_panels*W``), and every point track is drawn as **one continuous line**
-    whose horizontal position slides rightward *in proportion to time*: a track
-    sampled at frame ``t`` is placed at ``x_global = x_local(t) + (t/(T-1))*(K-1)*W``,
-    ``y_global = y_local(t)``. At keyframe-``k``'s time the slide equals ``k*W`` exactly
-    (for evenly-spaced panels), so the line passes through — and a marker is dropped
-    in — panel ``k`` at the point's true in-frame position there.
+    (``H x n_panels*W``). With ``draw_tracks=True`` (default) every point track is
+    drawn as **one continuous line** whose horizontal position slides rightward *in
+    proportion to time*: a track sampled at frame ``t`` is placed at
+    ``x_global = x_local(t) + (t/(T-1))*(K-1)*W``, ``y_global = y_local(t)``. At
+    keyframe-``k``'s time the slide equals ``k*W`` exactly (for evenly-spaced
+    panels), so the line passes through — and a marker is dropped in — panel ``k``
+    at the point's true in-frame position there.
 
-    **What the horizontal axis means.** It is *time*, realised as space. On a
-    **panning** camera (DAVIS/Kinetics) the subject genuinely translates across the
-    frame, so ``x_local`` grows with ``t`` and the lines fan out into long flowing
-    arcs — the "panorama" look. On a **static camera with non-rigid motion**
-    (surgical endoscopy) ``x_local`` barely moves: each line is then a near-horizontal
-    time-lapse streak whose vertical (and small horizontal) **wiggle is exactly the
-    tissue deformation** of that point. Same construction, honest either way — the
-    strip is a filmstrip, not a stitched geometric panorama.
+    With ``draw_tracks=False`` only the per-panel markers are drawn (no polylines):
+    panel 0 shows the (typically dense, rainbow-coloured) query grid, and later
+    panels show those same points at their tracked positions — the motion readout
+    without trajectory streaks.
+
+    **What the horizontal axis means** (track mode). It is *time*, realised as
+    space. On a **panning** camera (DAVIS/Kinetics) the subject genuinely
+    translates across the frame, so ``x_local`` grows with ``t`` and the lines fan
+    out into long flowing arcs — the "panorama" look. On a **static camera with
+    non-rigid motion** (surgical endoscopy) ``x_local`` barely moves: each line is
+    then a near-horizontal time-lapse streak whose vertical (and small horizontal)
+    **wiggle is exactly the tissue deformation** of that point. Same construction,
+    honest either way — the strip is a filmstrip, not a stitched geometric panorama.
 
     Occlusion/padding is handled like :func:`animate_tracks`: sentinel/occluded slots
     are NaN'd so a line never streaks into the ``(0,0)`` corner; visible panel markers
@@ -662,7 +669,7 @@ def render_filmstrip(
     Colour is per-identity by initial x (the horizontal rainbow).
 
     ``dim_background`` in ``[0,1]`` blends the panel images toward white so the tracks
-    pop (0 = untouched). Returns a single ``(H, n_panels*W, 3)`` uint8 image.
+    / points pop (0 = untouched). Returns a single ``(H, n_panels*W, 3)`` uint8 image.
 
     Shapes: frames (T,3,H,W)|(T,H,W,3), tracks (T,N,2), visibility (T,N).
     """
@@ -703,11 +710,6 @@ def render_filmstrip(
     pos_draw[~present] = np.nan
     base_rgb = _point_colors(pos, cmap)[:, :3]           # (N,3)
 
-    # time -> horizontal slide (px). At t == panels[k] (evenly spaced) this equals k*W.
-    slide = (np.arange(T, dtype=np.float32) / max(1, T - 1)) * (K - 1) * W   # (T,)
-    gx = pos_draw[..., 0] + slide[:, None]               # (T,N) global x
-    gy = pos_draw[..., 1]                                # (T,N) global y
-
     fig = Figure(figsize=(total_W / 100.0, H / 100.0), dpi=dpi)
     canvas = FigureCanvasAgg(fig)
     ax = fig.add_axes([0, 0, 1, 1])
@@ -716,11 +718,15 @@ def render_filmstrip(
     ax.set_ylim(H, 0)
     ax.axis("off")
 
-    # one continuous polyline per point over all T samples (NaN vertices break it)
-    segs = [np.stack([gx[:, i], gy[:, i]], axis=1) for i in range(N)]     # list of (T,2)
-    line_rgba = np.concatenate([base_rgb, np.full((N, 1), line_alpha)], axis=1)
-    ax.add_collection(LineCollection(segs, linewidths=linewidth,
-                                     capstyle="round", colors=line_rgba))
+    # optional continuous polylines (NaN vertices break them) — space-time track mode
+    if draw_tracks:
+        slide = (np.arange(T, dtype=np.float32) / max(1, T - 1)) * (K - 1) * W   # (T,)
+        gx = pos_draw[..., 0] + slide[:, None]               # (T,N) global x
+        gy = pos_draw[..., 1]                                # (T,N) global y
+        segs = [np.stack([gx[:, i], gy[:, i]], axis=1) for i in range(N)]     # list of (T,2)
+        line_rgba = np.concatenate([base_rgb, np.full((N, 1), line_alpha)], axis=1)
+        ax.add_collection(LineCollection(segs, linewidths=linewidth,
+                                         capstyle="round", colors=line_rgba))
 
     # drop a marker in each panel at the point's true position in that frame
     if draw_panel_markers:
@@ -745,7 +751,11 @@ def render_sample_filmstrip(sample: dict, pred_tracks=None, pred_visibility=None
     """:func:`render_filmstrip` for one dataset item.
 
     Uses the item's GT tracks by default; pass ``pred_tracks``/``pred_visibility`` to
-    draw the model's predictions instead. Labels the strip with the clip identity.
+    draw the model's predictions instead (from
+    :func:`utilities.evaluation.predict_sample` after loading a run with
+    :func:`utilities.evaluation.resolve_run_checkpoint` +
+    :func:`utilities.evaluation.load_model_from_checkpoint`). Labels the strip
+    with the clip identity.
     """
     title = kwargs.pop("title", None)
     if title is None and "video" in sample:

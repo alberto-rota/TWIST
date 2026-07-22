@@ -29,34 +29,11 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from utilities.env import expand_path, load_env
-from utilities.evaluation import evaluate_checkpoint
+from utilities.env import load_env
+from utilities.evaluation import evaluate_checkpoint, resolve_run_checkpoint
 from utilities.log import get_logger
 
 logger = get_logger(__name__).set_context("EVAL")
-
-
-def _resolve_run_checkpoint(run_name: str, prefer: str = "best") -> Optional[Path]:
-    """Find ``best.pt`` (else ``last.pt``) of the highest stage in a run dir.
-
-    ``run_name`` is an EXPERIMENT_NAME under ``$RESULTS_DIR`` or a direct path to
-    a run dir. Returns the checkpoint path, or None if none is found.
-    """
-    import os
-
-    cand = Path(run_name)
-    if not cand.is_dir():
-        results = os.environ.get("RESULTS_DIR") or str(Path.cwd() / "results")
-        cand = Path(expand_path(results)) / run_name
-    if not cand.is_dir():
-        return None
-    order = ("best.pt", "last.pt") if prefer == "best" else ("last.pt", "best.pt")
-    # highest stage first (carries the most-trained weights)
-    for stage_dir in sorted(cand.glob("stage*"), reverse=True):
-        for fn in order:
-            if (stage_dir / fn).exists():
-                return stage_dir / fn
-    return None
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -94,7 +71,7 @@ def main() -> int:
 
     ckpt = args.checkpoint
     if ckpt is None and args.run:
-        resolved = _resolve_run_checkpoint(args.run, prefer=args.prefer)
+        resolved = resolve_run_checkpoint(args.run, prefer=args.prefer)
         if resolved is None:
             logger.error(f"no checkpoint found for run '{args.run}'")
             return 1
